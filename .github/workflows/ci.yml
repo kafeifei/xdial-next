@@ -1,0 +1,46 @@
+name: CI
+
+# 跑的是 PR 自己的代码和这份工作流，所以改了工作流的 PR，这里的绿灯不能当证据，要看工作流的 diff。
+# 这类 PR 都是高风险，由用户批准。见 docs/agent/loop.md。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GOWORK: "off"
+
+jobs:
+  go:
+    name: go
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: go test
+        run: go test -race ./...
+      - name: dependency gate
+        run: bash scripts/check-deps.sh
+      - name: public content
+        env:
+          PUBLIC_CONTENT_RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || '' }}
+        run: bash scripts/check-public-content.sh

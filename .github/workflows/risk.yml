@@ -1,0 +1,57 @@
+name: Risk
+
+# 风险关卡：定档、打标签，维护 PR head 提交上的 risk-gate 状态、批准记录和自动合并。规则见 docs/agent/loop.md。
+# 用 pull_request_target：工作流、程序和规则都取自 main，PR 改不了自己的档。
+# PR 的 head 只检出到 pr-head/ 当数据读，不执行其中的任何代码。
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled, auto_merge_enabled, edited]
+
+permissions: {}
+
+concurrency:
+  group: risk-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  risk:
+    name: risk
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          fetch-depth: 0
+          persist-credentials: false
+      - name: risk gate
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          SENDER: ${{ github.event.sender.login }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+        run: bash scripts/risk-gate.sh
+      - name: mark failure
+        if: failure()
+        run: bash scripts/set-status.sh "$HEAD_SHA" risk-gate failure "风险关卡没跑完，见运行日志"

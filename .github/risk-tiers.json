@@ -1,0 +1,31 @@
+{
+  "description": "PR 风险定档：任一路径（含重命名前的旧路径）命中 high 即为高；全部命中 low 才为低；其余为 default。匹配不区分大小写。改这个文件属于高风险。规则见 docs/agent/loop.md。",
+  "default": "medium",
+  "high": [
+    ".github/**",
+    "scripts/**",
+    "tools/**",
+    "**/AGENTS.md",
+    "**/AGENTS.override.md",
+    "**/CLAUDE.md",
+    "**/CLAUDE.local.md",
+    "**/.claude/**",
+    ".codex/**",
+    ".mcp.json",
+    "docs/agent/**",
+    "docs/plan.md",
+    "**/go.mod",
+    "**/go.sum",
+    "go.work",
+    "go.work.sum",
+    "Makefile",
+    ".golangci.yml",
+    ".gitattributes"
+  ],
+  "low": [
+    "docs/**",
+    "README.md",
+    "**/*_test.go",
+    "**/testdata/**"
+  ]
+}
