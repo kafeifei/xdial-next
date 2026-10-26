@@ -101,6 +101,8 @@ agent 不加 `owner-approved` 和 `allow-more-rounds`，不开自动合并，也
    - 它只能读材料、发行内意见，没有写状态的权限。
 3. **finish**：写最终结论。它发本轮总结、更新审核记录，最后写 `ai-review` 和 `security-review`。scope 只会把状态标成审核中、草稿或失败，从不写通过。
 
+**审核失败时**：finish 会在状态说明里写明原因。最常见的是 Claude 订阅用量到上限（HTTP 429）：claude-code-action 本身不打印原因，审核会在初始化后立刻结束，所以由 [review-diagnose.sh](../../scripts/review-diagnose.sh) 从执行记录里取出状态码。遇到它就等用量重置，再在 Actions 里重跑失败的任务。
+
 **审核分三步**：
 
 - **发现**：是否达成 issue 的目标；和现有代码、AGENTS.md 的边界是否一致；会不会影响别处；PR 证据和改动是否对得上。

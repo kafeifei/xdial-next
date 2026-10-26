@@ -112,6 +112,7 @@ jobs:
     outputs:
       ai_result: ${{ steps.ai.outputs.structured_output }}
       security_result: ${{ steps.security.outputs.structured_output }}
+      api_status: ${{ steps.diagnose.outputs.api_status }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -217,6 +218,11 @@ jobs:
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
             --disallowedTools "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Read(./.git/**)"
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","changes-requested"]},"issues":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["verdict","issues","summary"]}'
+      # action 不打印失败原因，这里从执行记录里取出 API 状态码，交给 finish 写进状态说明。
+      - name: diagnose
+        id: diagnose
+        if: failure()
+        run: bash scripts/review-diagnose.sh
 
   finish:
     name: review-finish
@@ -246,6 +252,7 @@ jobs:
           EVENT_LABEL: ${{ github.event.label.name }}
           SCOPE_RESULT: ${{ needs.scope.result }}
           CLAUDE_RESULT: ${{ needs.claude.result }}
+          API_STATUS: ${{ needs.claude.outputs.api_status }}
           ACTION: ${{ needs.scope.outputs.action }}
           TIER: ${{ needs.scope.outputs.tier }}
           ROUND: ${{ needs.scope.outputs.round }}
