@@ -104,7 +104,7 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 ### 4.3 数据面
 
 - 用 sing-box 的 `tun` 入站加 `auto_route`，路由规则 `hijack-dns` 接管 DNS，direct 出站跟随系统默认接口。stack 和 strict_route 怎么选，M2 实测后再定。
-- 构建 tag 至少要有 `with_gvisor`、`with_openconnect` 和 `with_tailscale`。上游源码里，这两个 endpoint 都受 tag 控制。
+- 构建 tag 至少要有 `with_gvisor`、`with_openconnect` 和 `with_tailscale`。上游源码里，这两个 endpoint 都受 tag 控制。tailscale 还要加上去掉 peerapi、C2N 等能力的 `ts_omit_*` tag，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.5。
 - 场景切换时，daemon 重新编译配置并重载 sing-box。组内切线路走 selector，不重载。
 - 断开、卸载或 daemon 异常退出之后，不能留下路由、DNS 或接口残留。M2 在虚拟机里逐项检查。
 
@@ -277,8 +277,8 @@ jev 那种"观察、生成问题卡、出修复 Draft PR"的闭环，等事件�
 | 里程碑 | 内容 | 完成标准 |
 |---|---|---|
 | M0 循环骨架 | 新仓库和分支规则；CI 门禁；AI 审核和安全审核；风险定档；PR 证据模板；测试虚拟机和 e2e 骨架 | 一个示例 PR 走完全部关卡并自动合并 |
-| M1 CLI 与配置 | 配置格式、校验、编译成 sing-box 配置；`--json` 约定、错误码；`xdial schema` 和 `config apply --dry-run` | 架构样板经用户审过；编译出的配置全部通过 `sing-box check` |
-| M2 daemon 与 TUN | daemon 注册和本地 API；连接、断开、状态、卸载 | 在虚拟机里连接后，流量和 DNS 都进入 sing-box；断开和卸载后没有残留 |
+| M1 CLI 与配置 | 配置格式、校验、编译成 sing-box 配置；`--json` 约定、错误码；`xdial schema` 和离线的 `xdial config check <文件>`（与 daemon 同一份校验和编译代码，不改任何状态） | 架构样板经用户审过；编译出的配置全部通过 `sing-box check` |
+| M2 daemon 与 TUN | daemon 注册和本地 API；`config apply`（含 `--dry-run`）和凭据命令；连接、断开、状态、卸载 | 在虚拟机里连接后，流量和 DNS 都进入 sing-box；断开和卸载后没有残留 |
 | M3 线路 | 代理协议和订阅导入；AnyConnect；Tailscale | 用户在真实环境验证过 AnyConnect 和 Tailnet |
 | M4 场景与诊断 | 规则集、场景、线路组；重载切换和 selector；`explain`、`doctor`、事件日志、测速 | 场景切换和诊断用例在虚拟机里通过 |
 | M5 菜单栏 App | 按核心功能重新设计界面，只调用本地 API | 用户确认界面 |
