@@ -156,7 +156,8 @@
   - hysteria2、tuic、http、socks、ssh、wireguard 等以后按需加。
   - **依赖没有源码的库的字段，先禁止**：有些可选字段的语义只在本地没有源码的库里才能确认，例如 openconnect 的 `csd`、`hip`、`tncc`、`fortinet_host_check`、`mobile`、`form_entries`，以及 `token` 除 `totp` 以外的模式。这些先禁止，核实之后再开放。
 - **构建 tag**：
-  - 不用 `include` 之后，`with_quic`、`with_openconnect`、`with_tailscale` 只控制 `include/` 下的文件，管不到 XDial 自己的 registry。
+  - 不用 `include` 之后，`with_openconnect`、`with_tailscale` 只控制 `include/` 下的文件，管不到 XDial 自己的 registry。
+  - `with_quic` 还控制 QUIC 传输层和 HTTP/3。第一版不加它，也就不支持 QUIC 类的传输。
   - 真正起作用的有：
     - `with_gvisor`：tailscale 和 gVisor 栈需要；
     - `with_utls`：reality 和 uTLS 需要；
@@ -293,7 +294,11 @@
 - **内容是远端输入**：
   - 下载大小、规则条数、正则数量和长度都有上限。
   - source 格式由 XDial 解析、限额。
-  - binary 格式先在一次性的子进程里解码成 source，再按 source 处理。sing-box 解析 binary 时，按文件里声明的长度直接分配内存；畸形的匹配结构能通过构造，到匹配流量时才 panic。
+  - binary 格式要先过 XDial 自己的有界预检，再在一次性的子进程里解码成 source，然后按 source 处理。
+    - sing-box 解析 binary 时，按文件里声明的长度直接分配内存，几十字节的文件就能声明巨大的长度。子进程隔离得了 panic，限不住内存。所以预检要在解码之前做：解压后的大小有上限，每个声明的长度都不能超过剩下的字节数和各自的上限。
+    - 转换子进程限时运行，同一时间只跑一个。
+    - 畸形的匹配结构能通过构造，到匹配流量时才 panic。转换在子进程里做，最多带走那个子进程。
+    - 含 AdGuard 条件的 binary 一律拒绝，报确定的错误：这类条件在 source 格式里表达不了，转换会丢掉它。
   - 结果编成 inline 规则集交给 sing-box，不经过 sing-box 的 binary 解析，也不经过它对本地文件的监视重载。
 - **没缓存又下载失败**：连接失败，不悄悄换成直连。
 - **编译 PR 定**：更新之后怎么生效。
