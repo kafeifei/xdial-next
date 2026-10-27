@@ -299,7 +299,7 @@ jev 那种"观察、生成问题卡、出修复 Draft PR"的闭环，等事件�
 - 现在依赖的是 sing-box 的 beta 版（v1.14.0-beta.2），1.14 正式版发布后跟进。
 - 新版和其他全局 VPN 客户端会冲突，安装或连接时要给出明确提示。
 - daemon 注册需要用户在系统设置里批准，首次安装的体验在 M2 验证。
-- 【推断】导入旧配置需要访问用户的 Keychain，不能放在 root daemon 里做。
+- 导入旧配置需要访问用户的 Keychain，由用户身份的 CLI 做，不放在 root daemon 里（已定，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.6）。
 
 ## 10. 旧仓库怎么处理
 
