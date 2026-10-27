@@ -104,7 +104,7 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 ### 4.3 数据面
 
 - 用 sing-box 的 `tun` 入站加 `auto_route`，路由规则 `hijack-dns` 接管 DNS，direct 出站跟随系统默认接口。stack 和 strict_route 怎么选，M2 实测后再定。
-- 构建 tag 至少要有 `with_gvisor`、`with_openconnect` 和 `with_tailscale`。上游源码里，这两个 endpoint 都受 tag 控制。tailscale 还要加上去掉 peerapi、C2N 等能力的 `ts_omit_*` tag，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.5。
+- 不用上游的 `include`，由 XDial 自己的 registry 决定注册哪些类型。构建 tag 要有 `with_gvisor`、`with_utls`，以及去掉 tailscale peerapi、C2N 等能力的 `ts_omit_*`，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.3 和 2.6。
 - 场景切换时，daemon 重新编译配置并重载 sing-box。组内切线路走 selector，不重载。
 - 断开、卸载或 daemon 异常退出之后，不能留下路由、DNS 或接口残留。M2 在虚拟机里逐项检查。
 
@@ -122,9 +122,10 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 
 ### 4.5 配置与凭据
 
-2026-10-27 与用户对齐，定稿见 [ARCHITECTURE.md](../ARCHITECTURE.md) 的"配置"和"凭据"两节。要点：
+2026-10-27 与用户对齐，定稿见 [ARCHITECTURE.md](../ARCHITECTURE.md)。要点：
 
 - **配置格式**：一个 JSON 文件。线路、线路组、规则集直接写 sing-box 的原生对象，`tag` 换成 `id`；XDial 只增加场景、凭据引用和少量全局项。会让 root daemon 读文件、执行程序或改系统网络的字段一律拒绝。
+- **进程结构**：sing-box 跑在 daemon 监管的子进程里（同一个 `xdial` 二进制），panic、远端让进程退出、日志里的敏感信息都止于进程边界。
 - **凭据**：和配置分开，只写不读，存在 daemon 的 root 专属文件里，并排除出 Time Machine。
 - **订阅**：拉下来的节点放在 daemon 的缓存里，不进配置。
 - **导入旧配置**：首次启动时只读导入。
@@ -299,7 +300,7 @@ jev 那种"观察、生成问题卡、出修复 Draft PR"的闭环，等事件�
 - 现在依赖的是 sing-box 的 beta 版（v1.14.0-beta.2），1.14 正式版发布后跟进。
 - 新版和其他全局 VPN 客户端会冲突，安装或连接时要给出明确提示。
 - daemon 注册需要用户在系统设置里批准，首次安装的体验在 M2 验证。
-- 导入旧配置需要访问用户的 Keychain，由用户身份的 CLI 做，不放在 root daemon 里（已定，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.6）。
+- 导入旧配置需要访问用户的 Keychain，由用户身份的 CLI 做，不放在 root daemon 里（已定，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 4.8）。
 
 ## 10. 旧仓库怎么处理
 
