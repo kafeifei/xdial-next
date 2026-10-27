@@ -1,8 +1,9 @@
 # xdial-next
 
-XDial 的下一代：macOS 网络分流工具，CLI 是核心，只用上游 sing-box。现在处于 M0（搭项目循环骨架），还没有产品功能。
+XDial 的下一代：macOS 网络分流工具，CLI 是核心，只用上游 sing-box。M0（项目循环骨架）已完成，现在处于 M1（CLI 与配置），还没有产品功能。
 
 - 方案：[docs/plan.md](docs/plan.md)
+- 已定的架构（配置格式、凭据）：[ARCHITECTURE.md](ARCHITECTURE.md)
 - 项目循环的完整规则：[docs/agent/loop.md](docs/agent/loop.md)
 - 测试虚拟机与 e2e：[docs/agent/e2e.md](docs/agent/e2e.md)
 

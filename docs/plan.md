@@ -2,7 +2,7 @@
 
 **目标：** 在新仓库重写 XDial，要求核心功能明确、只依赖上游 sing-box、以 CLI 为核心且对 AI 友好，再按核心功能重新设计界面。新版达标后接管 XDial 的名字和更新源。
 
-状态：方向和项目循环已于 2026-10-25 对齐，M0 进行中。
+状态：方向和项目循环已于 2026-10-25 对齐；M0 于 2026-10-27 完成，M1 进行中。
 
 > 本文从 kafeifei/XDial 的 `docs/plans/rewrite.md`（#56）迁来，之后以本仓库为准。
 
@@ -122,12 +122,15 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 
 ### 4.5 配置与凭据
 
-- **配置格式**：纯文本、可以 diff，沿用 Line / RuleSet / Scenario / 线路组的划分。具体格式是 M1 的架构样板，第一版由用户审。
+2026-10-27 与用户对齐，定稿见 [ARCHITECTURE.md](../ARCHITECTURE.md) 的"配置"和"凭据"两节。要点：
+
+- **配置格式**：一个 JSON 文件。线路、线路组、规则集直接写 sing-box 的原生对象，`tag` 换成 `id`；XDial 只增加场景、凭据引用和少量全局项。会让 root daemon 读文件、执行程序或改系统网络的字段一律拒绝。
+- **凭据**：和配置分开，只写不读，存在 daemon 的 root 专属文件里，并排除出 Time Machine。
+- **订阅**：拉下来的节点放在 daemon 的缓存里，不进配置。
 - **导入旧配置**：首次启动时只读导入。
   - 旧库在 `~/.xdial/configuration/profiles.enc`，用 AES-256-GCM 加密，密钥放在用户的 Keychain 里，见 [Profile 配置库](https://github.com/kafeifei/XDial/blob/main/docs/agent/profiles.md)。
-  - 【推断】导入应该以用户身份由 CLI 或 App 执行，而不是让 root daemon 去读用户 Keychain。
+  - 由用户身份的 CLI 读旧库，再通过本地 API 交给 daemon；root daemon 不读用户 Keychain。
   - 旧文件不写回，也不删除。
-- **凭据**：线路密码和 auth key 怎么存是高风险设计，在 M1 定。
 - **种子配置**：保留"构建时注入首次启动配置"这个通用能力。公司版的配置内容仍然只放在独立的私有仓库，不进主仓库。
 
 ### 4.6 安装、更新、卸载
