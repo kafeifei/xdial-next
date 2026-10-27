@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # 配置 GitHub 仓库：合并方式、标签、main 的分支保护和审核环境。可以重复执行。
 # 需要仓库管理员的 gh 登录。规则见 docs/agent/loop.md 的"仓库设置"。
-# 审核用的订阅 token 不在这里设置，由用户自己执行：
-#   gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo kafeifei/xdial-next --env review
+# 审核用的订阅 token 不在这里设置，由用户按 docs/agent/loop.md 的"仓库设置"自己设置。
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

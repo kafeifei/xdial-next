@@ -189,6 +189,10 @@ jobs:
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
             --disallowedTools "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Read(./.git/**)"
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","changes-requested"]},"important":{"type":"integer","minimum":0},"minor":{"type":"integer","minimum":0},"existing":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["verdict","important","minor","existing","summary"]}'
+      # 两次审核共用一个执行记录文件。安全审核在写记录前就失败时，diagnose 不能读到 AI 审核留下的那份。
+      - name: clear execution record
+        if: needs.scope.outputs.run_security == 'true'
+        run: rm -f "$RUNNER_TEMP/claude-execution-output.json"
       - name: security review
         id: security
         if: needs.scope.outputs.run_security == 'true'
@@ -221,10 +225,10 @@ jobs:
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
             --disallowedTools "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Read(./.git/**)"
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","changes-requested"]},"issues":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["verdict","issues","summary"]}'
-      # action 不打印失败原因，这里从执行记录里取出 API 状态码，交给 finish 写进状态说明。
+      # action 不打印失败原因，这里从执行记录里取出 API 状态码，交给 finish 写进状态说明。缺 token 时原因已经清楚，不用再取。
       - name: diagnose
         id: diagnose
-        if: failure()
+        if: failure() && steps.credentials.outputs.missing != 'true'
         run: bash scripts/review-diagnose.sh
 
   finish:
