@@ -3,7 +3,8 @@
 # ai-review 和 security-review 状态。由 review.yml 的 finish 任务运行，只有这个任务能写状态。
 # 规则见 docs/agent/loop.md 的"AI 审核"。
 # 输入环境变量：GH_TOKEN REPO PR HEAD_SHA RUN_URL EVENT_LABEL
-#   SCOPE_RESULT CLAUDE_RESULT：scope 和 claude 两个任务的结果；API_STATUS：claude 失败时的 API 状态码
+#   SCOPE_RESULT CLAUDE_RESULT：scope 和 claude 两个任务的结果；API_STATUS：claude 失败时的 API 状态码；
+#   TOKEN_MISSING：review 环境里没有订阅 token 时为 true
 #   以及 scope 的输出：ACTION TIER ROUND RUN_AI RUN_SECURITY AI SECURITY RECORD SYNC RECORD_COMMENT_ID
 #   claude 的输出：AI_RESULT SECURITY_RESULT（结构化结论）
 
@@ -54,11 +55,16 @@ case "$ACTION" in
     ;;
 esac
 if [[ "$ACTION" == review && "$CLAUDE_RESULT" != success ]]; then
-  case "${API_STATUS:-}" in
-    429) mark failure "Claude 订阅用量到上限：等重置后，在 Actions 里重跑失败的任务" ;;
-    "") mark failure "审核没跑完，见运行日志" ;;
-    *) mark failure "审核调用 Claude 失败（HTTP $API_STATUS），见运行日志" ;;
-  esac
+  if [[ "${TOKEN_MISSING:-}" == true ]]; then
+    mark failure "review 环境里没有订阅 token：按 docs/agent/loop.md 设置后重跑失败的任务"
+  else
+    case "${API_STATUS:-}" in
+      429) mark failure "Claude 订阅用量到上限：等重置后，在 Actions 里重跑失败的任务" ;;
+      401) mark failure "订阅 token 无效或已过期：按 docs/agent/loop.md 重新生成并设置后重跑" ;;
+      "") mark failure "审核没跑完，见运行日志" ;;
+      *) mark failure "审核调用 Claude 失败（HTTP $API_STATUS），见运行日志" ;;
+    esac
+  fi
   drop_recheck_label
   exit 0
 fi

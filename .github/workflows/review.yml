@@ -113,6 +113,7 @@ jobs:
       ai_result: ${{ steps.ai.outputs.structured_output }}
       security_result: ${{ steps.security.outputs.structured_output }}
       api_status: ${{ steps.diagnose.outputs.api_status }}
+      token_missing: ${{ steps.credentials.outputs.missing }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -140,10 +141,12 @@ jobs:
           SINCE: ${{ needs.scope.outputs.since }}
         run: bash scripts/review-context.sh
       - name: require credentials
+        id: credentials
         env:
           TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           if [ -z "$TOKEN" ]; then
+            echo "missing=true" >> "$GITHUB_OUTPUT"
             echo "::error::review 环境里没有 CLAUDE_CODE_OAUTH_TOKEN，AI 审核不能跳过。见 docs/agent/loop.md。"
             exit 1
           fi
@@ -253,6 +256,7 @@ jobs:
           SCOPE_RESULT: ${{ needs.scope.result }}
           CLAUDE_RESULT: ${{ needs.claude.result }}
           API_STATUS: ${{ needs.claude.outputs.api_status }}
+          TOKEN_MISSING: ${{ needs.claude.outputs.token_missing }}
           ACTION: ${{ needs.scope.outputs.action }}
           TIER: ${{ needs.scope.outputs.tier }}
           ROUND: ${{ needs.scope.outputs.round }}
