@@ -112,6 +112,8 @@ jobs:
     outputs:
       ai_result: ${{ steps.ai.outputs.structured_output }}
       security_result: ${{ steps.security.outputs.structured_output }}
+      api_status: ${{ steps.diagnose.outputs.api_status }}
+      token_missing: ${{ steps.credentials.outputs.missing }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -139,10 +141,12 @@ jobs:
           SINCE: ${{ needs.scope.outputs.since }}
         run: bash scripts/review-context.sh
       - name: require credentials
+        id: credentials
         env:
           TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           if [ -z "$TOKEN" ]; then
+            echo "missing=true" >> "$GITHUB_OUTPUT"
             echo "::error::review 环境里没有 CLAUDE_CODE_OAUTH_TOKEN，AI 审核不能跳过。见 docs/agent/loop.md。"
             exit 1
           fi
@@ -185,6 +189,10 @@ jobs:
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
             --disallowedTools "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Read(./.git/**)"
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","changes-requested"]},"important":{"type":"integer","minimum":0},"minor":{"type":"integer","minimum":0},"existing":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["verdict","important","minor","existing","summary"]}'
+      # 两次审核共用一个执行记录文件。安全审核在写记录前就失败时，diagnose 不能读到 AI 审核留下的那份。
+      - name: clear execution record
+        if: needs.scope.outputs.run_security == 'true'
+        run: rm -f "$RUNNER_TEMP/claude-execution-output.json"
       - name: security review
         id: security
         if: needs.scope.outputs.run_security == 'true'
@@ -217,6 +225,11 @@ jobs:
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
             --disallowedTools "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Read(./.git/**)"
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","changes-requested"]},"issues":{"type":"integer","minimum":0},"summary":{"type":"string"}},"required":["verdict","issues","summary"]}'
+      # action 不打印失败原因，这里从执行记录里取出 API 状态码，交给 finish 写进状态说明。缺 token 时原因已经清楚，不用再取。
+      - name: diagnose
+        id: diagnose
+        if: failure() && steps.credentials.outputs.missing != 'true'
+        run: bash scripts/review-diagnose.sh
 
   finish:
     name: review-finish
@@ -246,6 +259,8 @@ jobs:
           EVENT_LABEL: ${{ github.event.label.name }}
           SCOPE_RESULT: ${{ needs.scope.result }}
           CLAUDE_RESULT: ${{ needs.claude.result }}
+          API_STATUS: ${{ needs.claude.outputs.api_status }}
+          TOKEN_MISSING: ${{ needs.claude.outputs.token_missing }}
           ACTION: ${{ needs.scope.outputs.action }}
           TIER: ${{ needs.scope.outputs.tier }}
           ROUND: ${{ needs.scope.outputs.round }}

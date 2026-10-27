@@ -44,13 +44,15 @@
   - 管理员也不例外；
   - 禁止强推和删除。
 - **标签**：`risk:low`、`risk:medium`、`risk:high`、`owner-approved`、`needs-rethink`、`allow-more-rounds`、`re-review`。`risk.yml` 每次运行也会补建。
-- **`review` 环境**：审核用的订阅 token 放在这里，部署分支规则明确只允许 main，PR 自己的工作流读不到。由用户执行 `claude setup-token` 生成 token，再执行：
+- **`review` 环境**：审核用的订阅 token 放在这里，部署分支规则明确只允许 main，PR 自己的工作流读不到。由用户执行 `claude setup-token` 生成 token，把它完整复制下来，再执行：
 
   ```sh
-  gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo kafeifei/xdial-next --env review
+  T=$(pbpaste | tr -d '[:space:]'); echo "读到 ${#T} 个字符"; [ -n "$T" ] && CLAUDE_CODE_OAUTH_TOKEN="$T" claude -p "回复 ok" && printf '%s' "$T" | gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo kafeifei/xdial-next --env review; unset T; pbcopy < /dev/null
   ```
 
-  没有 token 时，审核直接失败，不会跳过。
+  - `claude setup-token` 打印的 token 会折成两行。用 `read` 或 `gh secret set` 的输入提示粘贴，都只会读到第一行，所以这里从剪贴板读，再去掉空白。
+  - 先用这个 token 让 Claude 回复一次，通过了才写进 GitHub。
+  - 没有 token 时，审核直接失败，不会跳过。
 
 紧急情况下要绕开关卡，只能由用户临时关掉分支保护里的"管理员也不例外"，合并后再打开。
 
@@ -100,6 +102,12 @@ agent 不加 `owner-approved` 和 `allow-more-rounds`，不开自动合并，也
    - 它要看的 diff 和材料都提前生成好。PR 的检出放在工作区外，经设置里的 `additionalDirectories` 授权读取；这样其中的 CLAUDE.md、AGENTS.md、`.claude/` 不会被当成指令或配置加载（`--add-dir` 会加载 skills、commands 和 subagents，所以不用它）。
    - 它只能读材料、发行内意见，没有写状态的权限。
 3. **finish**：写最终结论。它发本轮总结、更新审核记录，最后写 `ai-review` 和 `security-review`。scope 只会把状态标成审核中、草稿或失败，从不写通过。
+
+**审核失败时**：finish 会在状态说明里写明原因。claude-code-action 本身不打印失败原因，审核会在初始化后立刻结束，所以由 [review-diagnose.sh](../../scripts/review-diagnose.sh) 从执行记录里取出 API 状态码：
+
+- 没有 token：按上面“仓库设置”里的命令设置，再在 Actions 里重跑失败的任务。
+- token 无效或已过期（HTTP 401）：重新执行 `claude setup-token`，同样设置后重跑。
+- 订阅用量到上限（HTTP 429）：等用量重置，再重跑。
 
 **审核分三步**：
 
