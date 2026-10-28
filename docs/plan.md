@@ -104,7 +104,7 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 ### 4.3 数据面
 
 - 用 sing-box 的 `tun` 入站加 `auto_route`，路由规则 `hijack-dns` 接管 DNS，direct 出站跟随系统默认接口。stack 和 strict_route 怎么选，M2 实测后再定。
-- 不用上游的 `include`，由 XDial 自己的 registry 决定注册哪些类型。构建 tag 要有 `with_gvisor`、`with_utls`，以及去掉 tailscale peerapi、C2N 等能力的 `ts_omit_*`，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.3 和 2.6。
+- 不用上游的 `include`，由 XDial 自己的 registry 决定注册哪些类型。构建 tag 要有 `with_gvisor`、`with_utls`、`with_dhcp`，以及去掉 tailscale peerapi、C2N 等能力的 `ts_omit_*`，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.3、2.6 和 3.3。
 - 场景切换时，daemon 重新编译配置并重载 sing-box。组内切线路走 selector，不重载。
 - 断开、卸载或 daemon 异常退出之后，不能留下路由、DNS 或接口残留。M2 在虚拟机里逐项检查。
 
