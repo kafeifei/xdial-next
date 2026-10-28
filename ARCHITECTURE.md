@@ -293,8 +293,9 @@
   | 代理线路和线路组 | `https`，服务器 `1.1.1.1`，`detour` 指向这条线路或组 |
   | openconnect、tailscale 线路 | 对应的 `openconnect`、`tailscale` 类型，只用来解析 VPN 推送的域名和 Tailnet 名字（下面第 2 条）。它们不当通用解析器：没有下发默认解析器时，未匹配的域名一律返回 NXDOMAIN。被场景规则或 `final` 选中 endpoint 线路的其余域名，第一版用 `local` 解析。这样功能可用，代价是这些查询经本地网络发出；全隧道 VPN 和 exit node 下怎么让它们也走隧道，M3 实测后再定 |
 
+- **系统 DNS**：连接期间由 daemon 把系统 DNS 指到 TUN 里，否则查询可能根本不进 TUN，见 6.4。
 - **DNS 规则的顺序**：
-  1. 从 endpoint 进来的查询一律拒绝（2.6）。
+  1. 从 endpoint 进来的查询一律拒绝（2.6）；`_dns.resolver.arpa` 一律返回 NXDOMAIN，挡住加密 DNS 的自动升级（6.4）。
   2. 场景规则：从每个规则集里只取纯域名条件的规则（`domain`、`domain_suffix`、`domain_keyword`、`domain_regex`，以及只由它们组成的逻辑规则），编成 DNS 专用的规则集，交给这条场景规则所选线路对应的 DNS server。
      - DNS 规则从不拒绝，选 `block` 的场景规则不生成 DNS 规则，拒绝只在路由阶段做。DNS 阶段看不到前面那些靠 IP、端口、进程或取反决定的规则，在这里提前拒绝，会抢在本该先命中的规则前面，让 `resolve` 失败。
      - 不能把规则集整个拿来用：sing-box 的 DNS 规则遇到 IP 条件会进入旧的匹配方式，预匹配时忽略目的 IP 条件，纯 IP 的那条分支就直接算命中，选 `block` 时会把无关域名一起拒掉。
@@ -547,14 +548,101 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
 - 配置格式里线路部分的字段，从分类表和 sing-box 自带的 schema 生成器裁出来，只含允许的类型和字段。
 - AI 不读文档，先跑 `xdial schema --json` 就能知道怎么用。
 
-## 6. 留给后面的
+## 6. daemon 与本地 API（M2）
+
+本节是 M2 的架构样板，第一版由用户审。标"实测"的结论，来自 2026-10-28 在 mbp64k 一次性测试虚拟机（macOS 26.6.2，NAT 网络，网关兼 DNS 服务器是 192.168.64.1）里的测量。
+
+### 6.1 进程和身份
+
+| 进程 | 身份 | 负责 |
+|---|---|---|
+| `xdial daemon` | root，launchd 的 LaunchDaemon | 配置、凭据、状态、事件日志、本地 API；监管引擎子进程；连接期间设置系统 DNS（6.4） |
+| `xdial __engine` | root，daemon 的子进程 | 只跑 sing-box（2.2）。配置经 stdin 传入，日志写 stderr，交给 daemon 脱敏 |
+| `xdial` CLI、菜单栏 App | 调用者自己 | 只通过本地 API 调用 daemon |
+
+- **两个身份**：正式版的标识是 `com.kafeifei.xdial`，Debug 是 `com.kafeifei.xdial.debug`。下面路径里的 `<id>` 指其中之一，两套互不相干，可以同时安装，但同一时刻只能有一个连着（都会接管默认路由）。
+- **路径**：
+
+  | 路径 | 内容 | 权限 |
+  |---|---|---|
+  | `/Library/LaunchDaemons/<id>.plist` | launchd 配置 | root:wheel 0644 |
+  | `/Library/Application Support/<id>/bin/xdial` | daemon 运行的二进制，安装时从调用者给的二进制拷贝过来 | root:wheel 0755，所在目录 0755 |
+  | `/Library/Application Support/<id>/config.json`、`state.json` | 配置和运行状态（4.1） | root 0600 |
+  | `/Library/Application Support/<id>/private/` | 凭据、订阅和规则集缓存、tailscale 状态、daemon 自己的日志（launchd 的 stdout 和 stderr）、事件日志 | root 0700，排除出 Time Machine |
+  | `/var/run/<id>/api.sock` | 本地 API | 目录 root:admin 0750，socket 0660 |
+
+- **二进制为什么要拷贝**：daemon 以 root 运行，它执行的文件必须只有 root 能改。直接跑用户目录里的 `xdial`，等于让用户进程改 root 执行的代码。
+- **安装**：`sudo xdial daemon install` 拷贝二进制、写 plist、`launchctl bootstrap`。菜单栏 App 以后改用 `SMAppService` 注册同一个 daemon，两条路径怎么衔接在 M5 定。
+- **卸载**：`sudo xdial daemon uninstall [--purge]` 先断开（清掉系统 DNS、停掉引擎），再 `launchctl bootout`，删掉 plist、二进制和 socket 目录；`--purge` 连数据目录一起删。
+
+### 6.2 本地 API
+
+- **传输**：Unix socket 上的 JSON Lines。一个请求一行，一个响应一行。
+- **请求**：`{"v": 1, "id": 1, "method": "config.apply", "params": {...}}`。
+- **响应**：和 CLI 的 `--json` 输出完全相同的信封（5.2），外加 `id`。CLI 收到什么就打印什么，不在 CLI 里重新组装。持续输出的方法（`logs`）对同一个 `id` 回多行，最后一行带 `"done": true`。
+- **版本**：`v` 是协议的大版本，daemon 拒绝不认识的版本，报 `api.version`。方法和字段只增不改，变更属于高风险。
+- **调用方身份**：
+  - socket 只有 root 和 admin 组能连（目录 0750 root:admin，socket 0660）。
+  - daemon 对每个连接再用 `LOCAL_PEERCRED` 核对一次对端的 uid 和组：只接受 root 或 admin 组成员，其他一律关闭连接。不靠 socket 文件权限这一层。
+  - 第一版只有一个授权级别。提交配置等于能使用凭据（4.3），所以配置和凭据的写操作、连接与断开都是同一级。没有只读的低权限入口。
+- **限额**：一个请求最大 8 MiB；同时最多 16 个连接；读请求和写响应各有超时。
+- **凭据只走 API**：`secret.set` 的值在请求里传，不进命令行参数和环境变量（4.3）。
+- **第一批方法**：`version`、`status`、`config.export`、`config.apply`（`dry_run`、`if_match`）、`secret.set`、`secret.list`、`secret.rm`、`connect`、`disconnect`、`scenario.use`、`logs`（`follow`）。
+- **新增的错误码**：
+
+  | 错误码 | 退出码 | 说明 |
+  |---|---|---|
+  | `daemon.unreachable` | 3 | daemon 没在运行，或者连不上 socket |
+  | `api.permission` | 4 | 调用方不是 root 或 admin 组成员 |
+  | `api.version` | 1 | 请求的协议版本 daemon 不认识 |
+  | `config.conflict` | 5 | `--if-match` 的 revision 已经过时 |
+  | `secret.missing` | 1 | 连接用到的凭据还没设置 |
+  | `secret.in_use` | 5 | 删除仍被引用的凭据 |
+  | `engine.failed` | 1 | 引擎没能启动，或者启动后很快退出 |
+
+### 6.3 连接与断开
+
+- **连接**：编译当前场景（凭据用真值、带 TUN），启动 `xdial __engine`，经 stdin 交配置，等它报告就绪，再设置系统 DNS（6.4）。
+- **断开**：先撤掉系统 DNS，再给引擎 `SIGTERM`，5 秒没退出就 `SIGKILL`。
+- **TUN**：stack 用上游默认的 `mixed`，不开 `strict_route`；地址 `172.19.0.1/30` 和 `fdfe:dcba:9876::1/126`，`auto_route`。实测 `gvisor`、`system`、`mixed` 三种 stack 和打开 `strict_route` 都能正常上网。
+- **不留残留**：实测引擎正常退出和被 `kill -9` 两种情况下，utun 接口和它的路由都随之消失，默认路由回到物理网卡，DNS 和 HTTPS 恢复正常。
+- **引擎崩溃**：daemon 立即撤掉系统 DNS，然后按 1、2、4、8、16 秒退避重启。5 分钟内连续失败 5 次就停下，状态里写明原因，不再重连。
+- **daemon 自己被杀**：launchd 会重新拉起它。daemon 启动时先撤掉上一次可能留下的系统 DNS 设置，再看 `state.json`，上次是连着的就重连。
+- **网络变化**：交给 sing-box（`auto_detect_interface`，`local` DNS 重新向 DHCP 取服务器），daemon 不因此重启引擎。
+
+### 6.4 系统 DNS
+
+**为什么要动系统 DNS**：实测只靠 TUN 加 hijack-dns 接管不了 DNS。
+
+- 家用网络里，DNS 服务器常常就是网关，在本机所在的子网里。它的路由比 TUN 的路由更具体，DNS 查询根本不进 TUN。
+  - 后果：查询以明文发给路由器；公司 VPN 的分割 DNS（例如 `corp.example` 只能由 VPN 的服务器解析）到不了 sing-box，域名解析失败。
+- 把 DNS 服务器的 /32 路由进 TUN 也不行：服务器就是网关时，绑在物理接口上的直连出站找不到下一跳，实测整机断网。
+- sing-box 的 `dns_mode` 在 Apple 平台上靠 NetworkExtension 设置接口 DNS，root 进程直接起 utun 时用不上，实测没有效果。
+
+**做法**：连接期间，daemon 在 configd 的动态存储里写一个解析器 `State:/Network/Service/<id>/DNS`。
+
+- 内容：服务器 `172.19.0.2`（TUN 网段里，查询会进 TUN，被 hijack-dns 接管），匹配所有域名（`SupplementalMatchDomains` 为空串），`SearchOrder` 最靠前。
+- 实测它成为系统的第一解析器，查询全部进了 sing-box。删掉之后第一解析器恢复原样。
+- 它在动态存储里，不写进持久的网络设置，重启自然消失；daemon 被杀时由下次启动清掉（6.3）。
+- 只有 daemon 写这个键，配置里不能控制它，所以不违反 2.1。
+
+**挡住加密 DNS 的自动升级**：
+
+- 实测系统会查询 `_dns.resolver.arpa`，发现上游的加密 DNS（DDR）。一旦升级成 DoT 或 DoH，查询就会绕开 sing-box。
+- 所以编译时在 DNS 规则最前面加一条：`_dns.resolver.arpa` 一律返回 NXDOMAIN。
+
+### 6.5 事件日志
+
+- **文件**：`private/events.jsonl`，一行一个事件，带时间、类型、相关的线路和场景，超过 10 MB 轮转，保留 3 份。
+- **记录什么**：连接与断开、引擎启动、退出和崩溃、系统 DNS 的设置与撤销、配置 apply 与 revision、凭据的设置与删除（只记名字）、VPN 推送内容的变化（3.2）。
+- **怎么读**：`xdial logs` 和 `xdial doctor` 经本地 API 读（M4），返回前一样要脱敏（4.3）。
+
+## 7. 留给后面的
 
 - **M2**：
-  - 数据目录的具体路径，Debug 和正式版怎么分开；
-  - 子进程的启动方式和管道协议；
-  - 本地 API 怎么核验调用方身份，提交配置和设置凭据同级，凭据流向的强约束也在这时设计；
-  - launchd 的 stdout 和 stderr 放在 root 专属位置；
-  - TUN 残留、Time Machine 排除和迁移助理的实测。
+  - 凭据流向的强约束（4.3），在本地 API 有了之后设计；
+  - Time Machine 排除和迁移助理的实测；
+  - DHCP 拿不到 DNS 服务器、只有 IPv6、手动配置 DNS 这几种网络下，`local` DNS 和系统 DNS 设置的行为。
 - **M3**：
   - 订阅节点怎么被线路组和场景引用；
   - VPN 推送内容的形态，以及要不要由 XDial 过滤、限额后改写成普通规则；
