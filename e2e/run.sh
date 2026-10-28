@@ -83,7 +83,10 @@ check m2-apply "jq -e '.ok and .result.applied' <<< '$out' > /dev/null" "$out"
 out="$(printf 'mixed-pass\n' | "$xdial" secret set mixed --json 2>&1)"
 check m2-secret "jq -e '.ok and .result.set' <<< '$out' > /dev/null" "$out"
 out="$("$xdial" connect --scenario s --json 2>&1)"
-check m2-connect "jq -e '.ok and .result.state == \"connected\" and .result.system_dns' <<< '$out' > /dev/null" "$out"
+if ! jq -e '.ok' <<< "$out" > /dev/null 2>&1; then
+  out="$out | engine.log: $(sudo tail -n 15 "$data/private/engine.log" 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | tr '\n' ';') | daemon.log: $(sudo tail -n 5 "$data/private/daemon.log" 2> /dev/null | tr '\n' ';')"
+fi
+check m2-connect "jq -e '.ok and .result.state == \"connected\" and .result.system_dns' <<< '${out%% |*}' > /dev/null" "$out"
 sleep 2
 during="$(facts)"
 check m2-connected-facts "jq -e --argjson b '$base' '.utun != \$b.utun and (.route | startswith(\"utun\")) and .resolver == \"172.19.0.2\" and .dns != \"\" and .http == \"200\"' <<< '$during' > /dev/null" "$during"
