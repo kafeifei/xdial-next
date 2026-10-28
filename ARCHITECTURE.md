@@ -285,17 +285,19 @@
 
   | 给谁用 | 类型 |
   |---|---|
-  | `direct`，以及线路自己服务器的域名 | `local`。在 macOS 上有 TUN 入站时，sing-box 改用 DHCP 下发的 DNS 服务器，从物理接口直接查询，不经过 TUN，这要构建 tag `with_dhcp`。没有这个 tag，或者 DHCP 拿不到服务器（没有 DHCPv4、超时、手动配置的 DNS），都会退回 mDNSResponder，查询可能被 TUN 再截回来。这几种情况都在 M2 实测 |
+  | `direct`，以及线路自己服务器的域名 | `local`。在 macOS 上有 TUN 入站时，sing-box 改用 DHCP 下发的 DNS 服务器，从物理接口直接查询，不经过 TUN，这要构建 tag `with_dhcp`。没有这个 tag，或者还没从 DHCP 拿到可用的服务器（没有 DHCPv4、超时），都会退回 mDNSResponder，查询可能被 TUN 再截回来。另外，它会主动发 DHCP 请求，用户手动配置的 DNS 可能因此被忽略。这几种情况都在 M2 实测 |
   | 代理线路和线路组 | `https`，服务器 `1.1.1.1`，`detour` 指向这条线路或组 |
   | openconnect、tailscale 线路 | 对应的 `openconnect`、`tailscale` 类型 |
 
 - **DNS 规则的顺序**：
   1. 从 endpoint 进来的查询一律拒绝（2.6）。
   2. VPN 推送的域名：`preferred_by` 匹配 endpoint 的 DNS server，交给它解析。
-  3. 场景规则：从每个规则集里只取纯域名条件的规则（`domain`、`domain_suffix`、`domain_keyword`、`domain_regex`，以及只由它们组成的逻辑规则），编成 DNS 专用的规则集，交给这条场景规则所选线路对应的 DNS server；选 `block` 的，拒绝。
+  3. 场景规则：从每个规则集里只取纯域名条件的规则（`domain`、`domain_suffix`、`domain_keyword`、`domain_regex`，以及只由它们组成的逻辑规则），编成 DNS 专用的规则集，交给这条场景规则所选线路对应的 DNS server。
+     - DNS 规则从不拒绝，选 `block` 的场景规则不生成 DNS 规则，拒绝只在路由阶段做。DNS 阶段看不到前面那些靠 IP、端口、进程或取反决定的规则，在这里提前拒绝，会抢在本该先命中的规则前面，让 `resolve` 失败。
      - 不能把规则集整个拿来用：sing-box 的 DNS 规则遇到 IP 条件会进入旧的匹配方式，预匹配时忽略目的 IP 条件，纯 IP 的那条分支就直接算命中，选 `block` 时会把无关域名一起拒掉。
      - 混有端口、进程等条件的规则，在 DNS 阶段判断不了，不进 DNS 规则。
-     - 带 `invert` 的场景规则不生成 DNS 规则：对只有 IP 条件的规则集取反，DNS 阶段会命中所有域名。
+     - 带 `invert` 的场景规则：规则集里全是纯域名条件时，DNS 专用规则集和原规则集等价，`invert` 原样保留；否则不生成 DNS 规则，因为对取出来的一部分条件取反，会命中本不该命中的域名。
+     - 同样因为 DNS 阶段看不到那些前置规则，个别情况下解析用的线路会和实际走的线路不同，例如前面一条按进程把连接送去了代理，后面一条域名规则却决定了它经哪个 DNS 解析。
   4. 其余的，交给 `final` 线路对应的 DNS server；`final` 是 `block` 时交给 `local`（见上面的原则）。
 - **线路自己服务器的域名**：线路的 `domain_resolver` 由 XDial 生成，统一用 `local`。有 `detour` 的线路也一样：本机解析出地址，再经 `detour` 拨过去。
 - **私有地址和局域网**：编译不加"私有地址直连"这类规则，公司网段多半也是私有地址。【推断】本机所在子网的路由比 TUN 的路由更具体，局域网流量本来就不进 TUN；其他私有地址按场景走。M2 实测。
