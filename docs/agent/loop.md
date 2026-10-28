@@ -67,7 +67,7 @@
 | 档 | 当前范围 | 怎么合并 |
 |---|---|---|
 | 低 | 文档（`docs/agent` 和 `docs/plan.md` 除外）、README、测试文件、testdata | 关卡全过后自动合并 |
-| 中 | 其余文件，包括 `e2e/` | 用户批准后自动合并 |
+| 中 | 其余文件，包括 `e2e/` | 关卡全过后自动合并（2026-10-28 用户决定，原为用户批准） |
 | 高 | 工作流与 `.github` 下的配置；脚本；`tools/`；任意目录下的 AGENTS.md、AGENTS.override.md、CLAUDE.md、CLAUDE.local.md 和 `.claude/`；`.codex/`、`.mcp.json`；`docs/agent`、`docs/plan.md`；任意目录下的 go.mod、go.sum，以及 go.work；Makefile、lint 配置、`.gitattributes` | 用户批准后自动合并；另需不同模型的复审和 e2e 证据 |
 
 以后新增这几类包时，把路径加进 high（这个改动本身也是高风险）：daemon 本地 API、TUN / 路由 / DNS、凭据、安装更新卸载、CLI JSON schema、配置格式。
@@ -83,14 +83,16 @@
 
 ## 批准
 
-中、高风险的 PR，由仓库所有者加 `owner-approved` 标签来批准：
+高风险的 PR，由仓库所有者加 `owner-approved` 标签来批准：
+
+- 所有者也可以给中风险的 PR 加这个标签，效果一样，只是不加也会合并。
 
 - 加标签的那一刻，风险工作流在 PR 上记下当时的提交和风险档（"批准记录"评论）。
 - 之后每次运行都核对，不看是什么事件触发的：作者有改动、风险档升高，或者标签最近一次不是所有者本人加的，就撤掉标签，`risk-gate` 回到等待。只同步 main 不撤销。
 - 批准有效时，`risk-gate` 通过并开启自动合并，其余关卡一过就合并。
 - 没有有效批准时，`risk-gate` 停在等待，自动合并保持关闭；关不掉时 `risk-gate` 失败。
 
-agent 不加 `owner-approved` 和 `allow-more-rounds`，不开自动合并，也不直接合并中、高风险的 PR。
+agent 不加 `owner-approved` 和 `allow-more-rounds`，不开自动合并，也不直接合并高风险的 PR。
 
 ## AI 审核
 
@@ -162,8 +164,8 @@ gh api graphql -F id=<thread-id> -f query='mutation($id:ID!){resolveReviewThread
 
 ## 合并
 
-- **低风险**：risk 工作流开启自动合并。PR 落后 main 时，执行 `gh pr update-branch <PR>`；只同步 main 不会重新审核，CI 重跑通过后就合并。
-- **中、高风险**：agent 把证据写全后，在 PR 里说明"等用户批准"，然后停手。
+- **低、中风险**：risk 工作流开启自动合并。PR 落后 main 时，执行 `gh pr update-branch <PR>`；只同步 main 不会重新审核，CI 重跑通过后就合并。
+- **高风险**：agent 把证据写全后，在 PR 里说明"等用户批准"，然后停手。
 - 由 GITHUB_TOKEN 完成的自动合并不会触发 main 上的 `ci.yml`。分支保护要求合并前与 main 同步，所以合并后的代码和测过的一样。以后在 push main 上挂发版之类的任务时要注意这一点。
 
 ## 公开内容

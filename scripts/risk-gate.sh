@@ -101,20 +101,23 @@ for t in low medium high; do
   fi
 done
 
-if [[ "$tier" == low || "$approved" == true ]]; then
+# 低、中风险关卡全过就合并；高风险要有效的批准。
+if [[ "$tier" != high || "$approved" == true ]]; then
   if [[ "$DRAFT" != true ]]; then
     gh pr merge "$PR" --repo "$REPO" --auto --merge ||
       echo "::warning::开不了自动合并，关卡结论不受影响，可以手动合并"
   fi
-  if [[ "$tier" == low ]]; then
+  if [[ "$approved" == true ]]; then
+    status success "$tier 风险：仓库所有者已批准（$short）"
+  elif [[ "$tier" == low ]]; then
     status success "低风险：其余关卡通过后自动合并（$short）"
   else
-    status success "$tier 风险：仓库所有者已批准（$short）"
+    status success "中风险：其余关卡通过后自动合并（$short）"
   fi
   exit 0
 fi
 
-# 中、高风险且没有有效的批准：自动合并必须是关着的，关不掉就失败，不能放行。
+# 高风险且没有有效的批准：自动合并必须是关着的，关不掉就失败，不能放行。
 gh pr merge "$PR" --repo "$REPO" --disable-auto > /dev/null 2>&1 || true
 auto_merge="$(gh pr view "$PR" --repo "$REPO" --json autoMergeRequest --jq '.autoMergeRequest != null')"
 if [[ "$auto_merge" != false ]]; then
