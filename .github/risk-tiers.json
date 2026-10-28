@@ -1,6 +1,6 @@
 {
-  "description": "PR 风险定档：任一路径（含重命名前的旧路径）命中 high 即为高；全部命中 low 才为低；其余为 default。匹配不区分大小写。改这个文件属于高风险。规则见 docs/agent/loop.md。",
-  "default": "medium",
+  "description": "PR 风险定档：任一路径（含重命名前的旧路径）命中 high 即为高；其余路径全部命中 low 才为低，全部命中 low 或 medium 且有 medium 才为中；其余为 default（高）。low 和 medium 都是白名单，漏列的路径落到高风险，由所有者批准。匹配不区分大小写。改这个文件属于高风险。规则见 docs/agent/loop.md。",
+  "default": "high",
   "high": [
     ".github/**",
     "scripts/**",
@@ -25,6 +25,7 @@
     ".golangci.yml",
     ".gitattributes"
   ],
+  "medium": [],
   "low": [
     "docs/**",
     "README.md",
