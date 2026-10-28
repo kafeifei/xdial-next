@@ -26,7 +26,7 @@
 ```jsonc
 {
   "version": 1,
-  "mixed_port": 7890,
+  "mixed": { "port": 7890, "username": "me", "password": { "secret": "mixed" } },
   "lines": [
     { "id": "hk", "name": "香港", "type": "trojan",
       "server": "hk.example.com", "server_port": 443,
@@ -69,13 +69,18 @@
 | 部分 | 写法 | XDial 额外规则 |
 |---|---|---|
 | `version` | 整数，现在是 1 | 必填 |
-| `mixed_port` | 本机 SOCKS / HTTP 入口的端口，即 sing-box 的 `mixed` 入站；不写或写 0 表示不开 | 只监听回环地址，端口不小于 1024 |
+| `mixed` | 本机 SOCKS / HTTP 入口，即 sing-box 的 `mixed` 入站：`port`、`username`、`password`；不写就不开 | 只监听回环地址，端口不小于 1024；用户名和密码必填，密码是凭据引用；`set_system_proxy` 等其余字段由 XDial 生成 |
 | `lines` | sing-box 的出站或 endpoint 对象，类型必须在线路允许清单里（2.3） | `detour` 只能指向线路或线路组 |
 | `groups` | sing-box 的 `selector` 或 `urltest` | `outbounds` 只能指向线路或线路组；selector 的 `default` 必须是自己 `outbounds` 里的成员 |
 | `rule_sets` | `inline`，或 `remote` | 不允许 `local`（读本机文件），本地规则写成 `inline`。`remote` 由 daemon 自己下载（3.4）：`url` 只能是 https，可以是凭据引用；`download_via` 指定经哪条线路下载，不写则走 `direct` |
 | `scenarios` | `rules`：有序的规则列表，每条是 `{"rule_set", "line", "invert"?}`；`final`：其余流量走的线路 | 场景里不能写匹配条件，匹配只写在规则集里；`final` 必填 |
 | `subscriptions` | 订阅来源：`url`，以及 `download_via` | `url` 必须是凭据引用，只能是 https；其余字段在 M3 定 |
 
+- **`mixed` 为什么必须带认证**：
+  - 它和 TUN 一样走当前场景，包括 VPN 和 tailnet 线路。连接时 TUN 本来就接管整机所有进程的流量，所以对本机进程来说，`mixed` 没有多给网络位置。
+  - 它多出来的是一个按请求里的主机名转发的代理入口。【推断】网页经 DNS 重绑定，可以让浏览器把请求发到它这里，再由它解析出内网地址、经 VPN 转发，网页还能读到响应。
+  - 必填的认证挡住这条路：网页的请求不能自己加 `Proxy-` 开头的头（Fetch 规范禁止），也说不了 SOCKS；本机其他用户不知道密码也连不上。
+  - 用户名和密码由用户自己设置，所以"只写不读"不妨碍用户把它们配进要用代理的程序。
 - **XDial 自己的键**：`id`、`name`、`download_via`、`invert`、凭据引用。
   - 它们在交给 sing-box 之前就被剥离，永远不进入原生选项。
   - 和这些键同名的原生字段（如 openconnect、wireguard 的系统接口名 `name`）因此无法设置，它们本来就属于禁止类。
@@ -118,7 +123,7 @@
 不可信的输入有两类：
 
 - **提交配置的人**：
-  - 能提交配置，不等于能让 root daemon 读写本机文件或 socket、执行程序、开固定端口或提供未认证的入站服务（`mixed_port` 是明确的例外）、创建或修改系统接口/路由/DNS/系统代理、改动网关（端口映射）、使用 root 专属的能力，或者把本机暴露给远端。
+  - 能提交配置，不等于能让 root daemon 读写本机文件或 socket、执行程序、开固定端口或提供未认证的入站服务（带认证、只监听回环的 `mixed` 入口是明确的例外，见 1.3）、创建或修改系统接口/路由/DNS/系统代理、改动网关（端口映射）、使用 root 专属的能力，或者把本机暴露给远端。
   - 凭据是例外：能提交配置的人能使用凭据，见 4.3。
 - **远端输入**：
   - 包括规则集内容、订阅内容、tailscale 控制端，以及 VPN 服务端推送的配置。
@@ -257,7 +262,7 @@
 
 - **只编译当前场景用得到的对象**：只编译当前场景能到达的线路、组和规则集。场景用不到的线路不会被实例化，例如 tailscale 线路，没被用到就不会上线。
 - **检查时编译全部**：每个场景单独编译检查一次，所有对象再整体检查一次，保证用不到的线路也经过检查。
-- **入站**：TUN（M2）和 `mixed`（只监听回环）。
+- **入站**：TUN（M2）和 `mixed`（只监听回环、带认证，见 1.3）。
 
 ### 3.2 路由规则的顺序
 
