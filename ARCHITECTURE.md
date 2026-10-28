@@ -269,7 +269,7 @@
 
 1. endpoint 的入站请求一律拒绝（2.6）。
 2. 嗅探，然后接管 DNS（hijack-dns）。
-3. 解析域名目的地（`resolve` 动作）。它只处理目的地是域名的连接，例如来自 `mixed` 入口的；TUN 进来的连接目的地已经是 IP，不受影响。解析按 3.3 的 DNS 规则走，所以和场景选的线路一致。这样 IP 类规则集对域名目的地也能命中，`invert` 的语义也不会被"没解析"带偏。
+3. 解析域名目的地（`resolve` 动作）。它只处理目的地是域名的连接，例如来自 `mixed` 入口的；TUN 进来的连接目的地已经是 IP，不受影响。解析按 3.3 的 DNS 规则走。这样 IP 类规则集对域名目的地也能命中，`invert` 的语义也不会被"没解析"带偏。解析失败（例如域名不存在）时连接直接失败。
 4. VPN 推送的网段和域名，用 `preferred_by` 匹配对应的 endpoint。第一版放在场景规则之前：这些网段和域名是 VPN 自己声明的，场景规则不该把它们拉走。M3 实测后再定是否调整。
 5. 场景规则，然后是 `final`。`block` 编译成 `action: reject`。
 
@@ -277,6 +277,7 @@
 
 - **不能配置**。
 - **原则**：先按场景确定目标走哪条线路，再经这条线路解析。
+  - 只对靠域名条件决定线路的流量成立。靠 IP 条件决定的流量，要先解析才知道走哪条线，解析只能发生在决定之前：用 `final` 线路对应的 DNS server；`final` 是 `block` 时用 `local`，否则 IP 放行规则永远轮不到。
   - `direct` 用系统 DNS。
   - 代理线路经它自己解析；线路自己服务器的域名，经系统 DNS 或它的 `detour` 链解析。
   - endpoint 线路用它对应的 DNS server 类型（`openconnect` / `tailscale`），解析 VPN 推送的域名和 Tailnet 名字。
@@ -284,15 +285,18 @@
 
   | 给谁用 | 类型 |
   |---|---|
-  | `direct`，以及线路自己服务器的域名 | `local`。在 macOS 上有 TUN 入站时，sing-box 改用 DHCP 下发的 DNS 服务器，从物理接口直接查询，不经过 TUN，这要构建 tag `with_dhcp`；没有它就退回 mDNSResponder，查询可能被 TUN 再截回来。M2 实测 |
+  | `direct`，以及线路自己服务器的域名 | `local`。在 macOS 上有 TUN 入站时，sing-box 改用 DHCP 下发的 DNS 服务器，从物理接口直接查询，不经过 TUN，这要构建 tag `with_dhcp`。没有这个 tag，或者 DHCP 拿不到服务器（没有 DHCPv4、超时、手动配置的 DNS），都会退回 mDNSResponder，查询可能被 TUN 再截回来。这几种情况都在 M2 实测 |
   | 代理线路和线路组 | `https`，服务器 `1.1.1.1`，`detour` 指向这条线路或组 |
   | openconnect、tailscale 线路 | 对应的 `openconnect`、`tailscale` 类型 |
 
 - **DNS 规则的顺序**：
   1. 从 endpoint 进来的查询一律拒绝（2.6）。
   2. VPN 推送的域名：`preferred_by` 匹配 endpoint 的 DNS server，交给它解析。
-  3. 场景规则：规则集里有域名条件的，交给这条规则所选线路对应的 DNS server；选 `block` 的，拒绝。只有 IP 条件的规则集不进 DNS 规则。
-  4. 其余的，交给 `final` 线路对应的 DNS server。
+  3. 场景规则：从每个规则集里只取纯域名条件的规则（`domain`、`domain_suffix`、`domain_keyword`、`domain_regex`，以及只由它们组成的逻辑规则），编成 DNS 专用的规则集，交给这条场景规则所选线路对应的 DNS server；选 `block` 的，拒绝。
+     - 不能把规则集整个拿来用：sing-box 的 DNS 规则遇到 IP 条件会进入旧的匹配方式，预匹配时忽略目的 IP 条件，纯 IP 的那条分支就直接算命中，选 `block` 时会把无关域名一起拒掉。
+     - 混有端口、进程等条件的规则，在 DNS 阶段判断不了，不进 DNS 规则。
+     - 带 `invert` 的场景规则不生成 DNS 规则：对只有 IP 条件的规则集取反，DNS 阶段会命中所有域名。
+  4. 其余的，交给 `final` 线路对应的 DNS server；`final` 是 `block` 时交给 `local`（见上面的原则）。
 - **线路自己服务器的域名**：线路的 `domain_resolver` 由 XDial 生成，统一用 `local`。有 `detour` 的线路也一样：本机解析出地址，再经 `detour` 拨过去。
 - **私有地址和局域网**：编译不加"私有地址直连"这类规则，公司网段多半也是私有地址。【推断】本机所在子网的路由比 TUN 的路由更具体，局域网流量本来就不进 TUN；其他私有地址按场景走。M2 实测。
 
@@ -507,7 +511,8 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   | 错误码 | 退出码 | 说明 |
   |---|---|---|
   | `usage` | 2 | 命令、参数或选项不对 |
-  | `input.read` | 3 | 读不到输入文件或 stdin |
+  | `input.read` | 3 | 读不到输入文件或 stdin：不存在、读出错 |
+| `input.permission` | 4 | 没有权限读输入文件 |
   | `config.invalid` | 1 | 配置有问题，详情在 `problems` |
   | `config.syntax` | — | JSON 语法错误 |
   | `config.unknown_key` | — | 没有登记的键，或者大小写不一致 |
@@ -527,7 +532,8 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
 
 ### 5.5 `xdial schema`
 
-- 输出 XDial 的全部能力：命令、参数和选项；每个命令成功输出的 JSON Schema；错误码表和退出码表；配置格式的 JSON Schema。
+- 输出 XDial 的全部能力：命令、参数和选项；每个命令成功输出的 JSON Schema；错误信封 `xdial.error/v1` 的 JSON Schema（含 `problems` 的元素）；错误码表和退出码表；配置格式的 JSON Schema。
+- 契约测试对成功和失败两条路径都用这些 JSON Schema 校验。
 - 配置格式里线路部分的字段，从分类表和 sing-box 自带的 schema 生成器裁出来，只含允许的类型和字段。
 - AI 不读文档，先跑 `xdial schema --json` 就能知道怎么用。
 
