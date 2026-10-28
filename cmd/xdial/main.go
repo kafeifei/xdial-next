@@ -14,7 +14,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/kafeifei/xdial-next/internal/buildinfo"
 	"github.com/kafeifei/xdial-next/internal/cli"
@@ -31,13 +30,12 @@ func main() {
 
 // command is one entry of the command table; `xdial schema` prints it.
 type command struct {
-	Path        []string `json:"command"`
-	Args        []string `json:"args,omitempty"`
-	Options     []option `json:"options"`
-	Summary     string   `json:"summary"`
-	Output      string   `json:"output_schema"`
-	run         func(*context_) int
-	valueOption map[string]bool
+	Path    []string `json:"command"`
+	Args    []string `json:"args,omitempty"`
+	Options []option `json:"options"`
+	Summary string   `json:"summary"`
+	Output  string   `json:"output_schema"`
+	run     func(*context_) int
 }
 
 type option struct {
@@ -57,7 +55,7 @@ type context_ struct {
 }
 
 func commands() []*command {
-	return []*command{
+	return append([]*command{
 		{
 			Path: []string{"version"}, Summary: "显示这个 xdial 的版本", Output: versionSchema,
 			Options: []option{jsonOption}, run: runVersion,
@@ -71,13 +69,10 @@ func commands() []*command {
 			Path: []string{"schema"}, Summary: "列出全部命令、输出格式、错误码和配置格式", Output: schemaSchema,
 			Options: []option{jsonOption}, run: runSchema,
 		},
-	}
+	}, daemonCommands()...)
 }
 
 const usageHint = "运行 xdial schema 查看全部命令"
-
-// checkDeadline bounds config check as a whole.
-const checkDeadline = 2 * time.Minute
 
 // run executes one command line and returns the exit code. A panic is a
 // defect: it is still reported in the output contract, as internal.
@@ -125,10 +120,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 	}
 
 	ctx := &context_{options: map[string]string{}, stdin: stdin, out: out}
-	known := map[string]bool{}
+	known, valued := map[string]bool{}, map[string]bool{}
 	for _, o := range cmd.Options {
 		if o.Name != "--json" {
 			known[o.Name] = true
+			valued[o.Name] = o.Value != ""
 		}
 	}
 	rest = args[len(cmd.Path):]
@@ -146,13 +142,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 		if !strings.HasPrefix(name, "--") || !known[name] {
 			return out.Fail(cli.Errorf(cli.CodeUsage, usageHint, "%s 不支持选项 %s", strings.Join(cmd.Path, " "), name))
 		}
-		if cmd.valueOption[name] && !hasValue {
+		if valued[name] && !hasValue {
 			if i+1 >= len(rest) {
 				return out.Fail(cli.Errorf(cli.CodeUsage, usageHint, "选项 %s 缺少值", name))
 			}
 			i++
 			value = rest[i]
-		} else if !cmd.valueOption[name] && hasValue {
+		} else if !valued[name] && hasValue {
 			return out.Fail(cli.Errorf(cli.CodeUsage, usageHint, "选项 %s 不带值", name))
 		}
 		ctx.options[name] = value
@@ -243,50 +239,17 @@ func runConfigCheck(ctx *context_) int {
 		return ctx.out.Fail(err)
 	}
 	report := checkReport{Revision: c.Root.Revision(), Version: c.Version, Scenarios: []string{}, Secrets: []secretReport{}, Pending: []string{}}
-	var compileProblems []cli.Problem
-	pending := map[string]bool{}
-	targets := []string{""}
 	for _, s := range c.Scenarios {
-		targets = append(targets, s.ID)
 		report.Scenarios = append(report.Scenarios, s.ID)
 	}
-	// One deadline bounds the whole check, and scenarios that compile to the
-	// same configuration are checked once.
-	deadline, cancel := context.WithTimeout(context.Background(), checkDeadline)
-	defer cancel()
-	checked := map[string]error{}
-	for _, scenario := range targets {
-		result, err := engine.Compile(c, engine.Options{Scenario: scenario, StateDirectory: os.TempDir(), TUN: true})
-		if err == nil {
-			key := string(result.JSON)
-			cached, ok := checked[key]
-			if !ok {
-				cached = engine.Check(deadline, exe, result.JSON)
-				checked[key] = cached
-			}
-			err = cached
-		}
-		if errors.Is(err, engine.ErrCheckUnavailable) {
-			return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "%v", err))
-		}
-		if err != nil {
-			where, path := "整份配置", ""
-			if scenario != "" {
-				where, path = "场景 "+scenario, scenarioPath(c, scenario)
-			}
-			compileProblems = append(compileProblems, cli.Problem{
-				Code: cli.CodeConfigCompile, Path: path, Message: where + "编译后没通过 sing-box 的检查：" + err.Error(),
-				Hint: "检查用的是凭据占位值；如果报错指向某条线路的字段，按提示修改",
-			})
-			continue
-		}
-		for _, p := range result.Pending {
-			pending[p] = true
-		}
+	verification, err := engine.Verify(context.Background(), exe, c)
+	if err != nil {
+		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "%v", err))
 	}
-	if len(compileProblems) > 0 {
-		return ctx.out.Fail(&cli.Error{Code: cli.CodeConfigInvalid, Message: fmt.Sprintf("配置有 %d 处问题", len(compileProblems)), Hint: "按 problems 逐条修改后重新检查", Problems: compileProblems})
+	if len(verification.Problems) > 0 {
+		return ctx.out.Fail(&cli.Error{Code: cli.CodeConfigInvalid, Message: fmt.Sprintf("配置有 %d 处问题", len(verification.Problems)), Problems: verification.Problems})
 	}
+	report.Pending = append(report.Pending, verification.Pending...)
 
 	refs := map[string][]string{}
 	for _, use := range c.Secrets {
@@ -295,10 +258,6 @@ func runConfigCheck(ctx *context_) int {
 	for _, name := range sortedKeys(refs) {
 		report.Secrets = append(report.Secrets, secretReport{Name: name, References: refs[name]})
 	}
-	for p := range pending {
-		report.Pending = append(report.Pending, p)
-	}
-	sort.Strings(report.Pending)
 	if len(report.Secrets) > 0 {
 		report.Pending = append(report.Pending, "凭据的真值不在离线检查的范围内，只用了占位值")
 	}
@@ -315,14 +274,6 @@ func runConfigCheck(ctx *context_) int {
 	})
 }
 
-func scenarioPath(c *config.Config, id string) string {
-	for _, s := range c.Scenarios {
-		if s.ID == id {
-			return s.Path
-		}
-	}
-	return ""
-}
 
 // readFile reads the file the caller named, as the caller: the daemon never
 // opens a path a caller supplies, ARCHITECTURE.md 4.1.

@@ -70,6 +70,15 @@ func (o Output) Succeed(schema string, result any, text func(w io.Writer)) int {
 	return ExitOK
 }
 
+// Print writes one envelope as it is, for replies that arrive already
+// enveloped, such as the daemon's.
+func (o Output) Print(envelope any) int {
+	if err := writeJSON(o.Stdout, envelope); err != nil {
+		return ExitInternal
+	}
+	return ExitOK
+}
+
 // Fail prints an error and returns the exit code registered for it. An error
 // that is not an *Error, or carries an unregistered code, is a defect and is
 // printed as internal.

@@ -49,6 +49,15 @@ const (
 	CodeConfigDuplicateID    = "config.duplicate_id"
 	CodeConfigCompile        = "config.compile"
 	CodeConfigMore           = "config.more"
+
+	CodeDaemonUnreachable = "daemon.unreachable"
+	CodeAPIPermission     = "api.permission"
+	CodeAPIVersion        = "api.version"
+	CodeConfigConflict    = "config.conflict"
+	CodeSecretMissing     = "secret.missing"
+	CodeSecretInUse       = "secret.in_use"
+	CodeSecretFormat      = "secret.format"
+	CodeEngineFailed      = "engine.failed"
 )
 
 var codes = map[string]Code{}
@@ -80,6 +89,15 @@ func init() {
 	register(Code{Name: CodeConfigDuplicateID, Problem: true, Summary: "id 重复"})
 	register(Code{Name: CodeConfigCompile, Problem: true, Summary: "编译出的 sing-box 配置没通过检查"})
 	register(Code{Name: CodeConfigMore, Problem: true, Summary: "问题太多，只列出了前面的，这一条给出没列出的数量"})
+
+	register(Code{Name: CodeDaemonUnreachable, Exit: ExitMissing, Summary: "daemon 没在运行，或者连不上 socket", Hint: "先运行 sudo xdial daemon install"})
+	register(Code{Name: CodeAPIPermission, Exit: ExitPermission, Summary: "调用方不是 root 或 admin 组成员", Hint: "用 admin 组的账户运行，或者加 sudo"})
+	register(Code{Name: CodeAPIVersion, Exit: ExitNegative, Summary: "请求的协议版本 daemon 不认识", Hint: "让 xdial 和 daemon 用同一个版本"})
+	register(Code{Name: CodeConfigConflict, Exit: ExitConflict, Summary: "配置已被别人改过，或者操作和当前状态冲突", Hint: "重新 export 后再改"})
+	register(Code{Name: CodeSecretMissing, Exit: ExitNegative, Summary: "用到的凭据还没设置", Hint: "用 xdial secret set <名字> 设置"})
+	register(Code{Name: CodeSecretInUse, Exit: ExitConflict, Summary: "凭据仍被引用，不能删除", Hint: "先改掉引用它的配置"})
+	register(Code{Name: CodeSecretFormat, Exit: ExitNegative, Summary: "凭据的格式不符合引用它的字段", Hint: "按提示改正后重新设置"})
+	register(Code{Name: CodeEngineFailed, Exit: ExitNegative, Summary: "引擎没能启动，或者启动后很快退出", Hint: "用 xdial status 看原因"})
 }
 
 // Lookup returns the registration of a code.

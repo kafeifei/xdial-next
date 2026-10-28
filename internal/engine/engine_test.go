@@ -1,13 +1,16 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/option"
@@ -19,6 +22,9 @@ import (
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == CheckCommand {
 		os.Exit(RunCheckChild(os.Stdin, os.Stdout))
+	}
+	if len(os.Args) > 1 && os.Args[1] == EngineCommand {
+		os.Exit(RunEngineChild(os.Stdin, os.Stdout, os.Stderr, os.Args[2:]))
 	}
 	os.Exit(m.Run())
 }
@@ -160,7 +166,8 @@ func TestDNSRulesComeFromDomainConditionsAndNeverReject(t *testing.T) {
 	// produce DNS rules; block, IP-only and partial inverted ones do not.
 	var sets []string
 	for _, rule := range dns {
-		for _, s := range rule["rule_set"].([]any) {
+		list, _ := rule["rule_set"].([]any)
+		for _, s := range list {
 			sets = append(sets, s.(string))
 		}
 	}
@@ -287,18 +294,24 @@ func TestDNSOrderAndUsedSetsOnly(t *testing.T) {
 		switch {
 		case rule["inbound"] != nil:
 			kinds = append(kinds, "reject-endpoint")
+		case rule["action"] == "predefined":
+			kinds = append(kinds, "ddr")
 		case rule["preferred_by"] != nil:
 			kinds = append(kinds, "pushed")
 		default:
 			kinds = append(kinds, "scenario")
 		}
 	}
-	if got := strings.Join(kinds, " "); got != "reject-endpoint scenario pushed" {
+	if got := strings.Join(kinds, " "); got != "reject-endpoint ddr scenario pushed" {
 		t.Errorf("DNS rule order %q", got)
 	}
+	// DDR discovery must fail, or the system upgrades past sing-box, 6.4.
+	if dns[1]["rcode"] != "NXDOMAIN" || dns[1]["domain"].([]any)[0] != ddrName {
+		t.Errorf("DDR rule %v", dns[1])
+	}
 	// corp is an endpoint: names chosen for it resolve locally, 3.3.
-	if dns[1]["server"] != tagDNSLocal {
-		t.Errorf("names routed to an endpoint resolve with %v", dns[1]["server"])
+	if dns[2]["server"] != tagDNSLocal {
+		t.Errorf("names routed to an endpoint resolve with %v", dns[2]["server"])
 	}
 	// The block rule's set gets no DNS-only copy.
 	for _, set := range doc["route"].(map[string]any)["rule_set"].([]any) {
@@ -347,5 +360,44 @@ func TestCompiledConfigurationStarts(t *testing.T) {
 	}
 	if err := instance.Close(); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestEngineExitsWhenItsDaemonGoes closes the engine's stdin, as the kernel
+// does when the daemon dies, and expects the engine to shut down by itself.
+func TestEngineExitsWhenItsDaemonGoes(t *testing.T) {
+	c := loadDoc(t, `{"version": 1, "lines": [], "scenarios": [{"id": "s", "rules": [], "final": "direct"}]}`)
+	r, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, EngineCommand)
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdin.Write(r.JSON); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(stdout).ReadBytes('\n')
+	if err != nil || !strings.Contains(string(line), `"ready":true`) {
+		t.Fatalf("engine not ready: %q %v", line, err)
+	}
+	stdin.Close()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("engine exited with %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("engine kept running after its stdin closed")
 	}
 }

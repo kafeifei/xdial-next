@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/kafeifei/xdial-next/internal/config"
 )
@@ -27,6 +28,14 @@ const (
 // DoH upstream for proxy lines, ARCHITECTURE.md 3.3.
 const proxyDNSServer = "1.1.1.1"
 
+// DefaultStack is the TUN stack, ARCHITECTURE.md 6.3: upstream's default;
+// the test VM measured every stack working.
+const DefaultStack = "mixed"
+
+// ddrName is where a system discovers an encrypted upgrade of its resolver,
+// which would take DNS past sing-box, ARCHITECTURE.md 6.4.
+const ddrName = "_dns.resolver.arpa"
+
 // placeholderRule stands in for a remote rule set whose content is not at
 // hand: it can never match, ARCHITECTURE.md 4.1.
 const placeholderDomain = "placeholder.xdial.invalid"
@@ -44,8 +53,9 @@ type Options struct {
 	RuleSet func(*config.Object) ([]*config.Value, bool)
 	// StateDirectory holds the tailscale state of each line, by id.
 	StateDirectory string
-	// TUN adds the TUN inbound.
-	TUN bool
+	// TUN adds the TUN inbound, with Stack as its implementation.
+	TUN   bool
+	Stack string
 	// LogLevel is the sing-box log level XDial sets explicitly, 4.3.
 	LogLevel string
 }
@@ -64,6 +74,8 @@ type Result struct {
 	// Pending lists what could not be checked, such as remote rule sets
 	// compiled with a placeholder, ARCHITECTURE.md 4.2.
 	Pending []string
+	// Secrets names the secrets the compiled objects use, sorted.
+	Secrets []string
 }
 
 type compiler struct {
@@ -168,10 +180,42 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 		return nil, err
 	}
 	sort.Strings(k.pending)
-	return &Result{JSON: out, Pending: k.pending}, nil
+	return &Result{JSON: out, Pending: k.pending, Secrets: k.usedSecrets()}, nil
 }
 
 func isEndpoint(typ string) bool { return typ == "openconnect" || typ == "tailscale" }
+
+// usedSecrets names the secrets of the objects this compilation includes:
+// a line or group it reaches, a rule set it routes by, and mixed.
+func (k *compiler) usedSecrets() []string {
+	compiled := map[string]bool{}
+	for _, list := range [][]*config.Object{k.c.Lines, k.c.Groups} {
+		for _, o := range list {
+			if k.lines[o.ID] {
+				compiled[o.Path] = true
+			}
+		}
+	}
+	for _, o := range k.c.RuleSets {
+		if k.ruleSets[o.ID] {
+			compiled[o.Path] = true
+		}
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, use := range k.c.Secrets {
+		object, _, _ := strings.Cut(use.Path, ".")
+		if !compiled[object] && object != "mixed" {
+			continue
+		}
+		if !seen[use.Name] {
+			seen[use.Name] = true
+			names = append(names, use.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
 
 // reach marks an outbound and everything it dials through or chooses from.
 func (k *compiler) reach(id string) {
@@ -196,14 +240,17 @@ func (k *compiler) reach(id string) {
 func (k *compiler) inbounds() []any {
 	var inbounds []any
 	if k.opts.TUN {
-		// Stack and strict_route are settled in M2, ARCHITECTURE.md 4.3 of
-		// the plan; these are the provisional values.
-		inbounds = append(inbounds, map[string]any{
+		// ARCHITECTURE.md 6.3: auto_route, no strict_route.
+		tun := map[string]any{
 			"type":       "tun",
 			"tag":        tagTUN,
 			"address":    []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
 			"auto_route": true,
-		})
+		}
+		if k.opts.Stack != "" {
+			tun["stack"] = k.opts.Stack
+		}
+		inbounds = append(inbounds, tun)
 	}
 	if m := k.c.Mixed; m != nil {
 		mixed := m.Clone(k.replace)
@@ -374,6 +421,7 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 	if len(endpointIDs) > 0 {
 		rules = append(rules, map[string]any{"inbound": endpointIDs, "action": "reject"})
 	}
+	rules = append(rules, map[string]any{"domain": []string{ddrName}, "action": "predefined", "rcode": "NXDOMAIN"})
 	final := tagDNSLocal
 	if scenario != nil {
 		for _, r := range scenario.Rules {
@@ -402,9 +450,6 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 		servers = append(servers, map[string]any{"type": k.c.Line(id).Type, "tag": tag, "endpoint": id})
 		rules = append(rules, map[string]any{"preferred_by": []string{tag}, "action": "route", "server": tag})
 	}
-	dns := map[string]any{"servers": servers, "final": final, "reverse_mapping": true}
-	if len(rules) > 0 {
-		dns["rules"] = rules
-	}
+	dns := map[string]any{"servers": servers, "final": final, "reverse_mapping": true, "rules": rules}
 	return dns, used
 }

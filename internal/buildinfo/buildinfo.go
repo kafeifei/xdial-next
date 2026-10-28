@@ -51,3 +51,10 @@ func SingBox() string {
 	}
 	return "unknown"
 }
+
+// Identity is the daemon identity this build installs and talks to,
+// ARCHITECTURE.md 6.1. Development builds are Debug; releases set it at
+// link time:
+//
+//	-ldflags "-X github.com/kafeifei/xdial-next/internal/buildinfo.Identity=com.kafeifei.xdial"
+var Identity = "com.kafeifei.xdial.debug"

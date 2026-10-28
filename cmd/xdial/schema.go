@@ -33,6 +33,13 @@ func envelope(name string, result map[string]any) map[string]any {
 	})
 }
 
+// secretRefSchema never has a value field: secrets are write-only.
+func secretRefSchema() map[string]any {
+	return object([]string{"name", "set", "references"}, map[string]any{
+		"name": str(), "set": map[string]any{"type": "boolean"}, "updated": str(), "references": strList(),
+	})
+}
+
 func outputSchemas() map[string]any {
 	problem := object([]string{"code", "message"}, map[string]any{
 		"code": str(), "path": str(), "object": str(), "message": str(), "hint": str(),
@@ -64,6 +71,42 @@ func outputSchemas() map[string]any {
 				"config":     map[string]any{"type": "object"},
 			},
 		)),
+		"xdial.daemon.install/v1": envelope("xdial.daemon.install/v1", object(
+			[]string{"identity", "binary", "plist", "socket"},
+			map[string]any{"identity": str(), "binary": str(), "plist": str(), "socket": str()},
+		)),
+		"xdial.daemon.uninstall/v1": envelope("xdial.daemon.uninstall/v1", object(
+			[]string{"identity", "removed", "purged"},
+			map[string]any{"identity": str(), "removed": strList(), "purged": map[string]any{"type": "boolean"}},
+		)),
+		"xdial.daemon.run/v1": envelope("xdial.daemon.run/v1", object([]string{"stopped"}, map[string]any{"stopped": map[string]any{"type": "boolean"}})),
+		"xdial.status/v1": envelope("xdial.status/v1", object(
+			[]string{"state", "connected", "scenario", "revision", "since", "last_error", "system_dns", "engine_pid"},
+			map[string]any{
+				"state":     map[string]any{"enum": []string{"disconnected", "connecting", "connected", "failed"}},
+				"connected": map[string]any{"type": "boolean"}, "scenario": str(), "revision": str(), "since": str(),
+				"last_error": str(), "system_dns": map[string]any{"type": "boolean"}, "engine_pid": map[string]any{"type": "integer"},
+			},
+		)),
+		"xdial.config.export/v1": envelope("xdial.config.export/v1", object(
+			[]string{"revision", "content"}, map[string]any{"revision": str(), "content": map[string]any{"type": "object"}},
+		)),
+		"xdial.config.apply/v1": envelope("xdial.config.apply/v1", object(
+			[]string{"applied", "revision", "previous_revision", "changes", "missing_secrets", "secrets", "pending", "reloaded"},
+			map[string]any{
+				"applied": map[string]any{"type": "boolean"}, "revision": str(), "previous_revision": str(),
+				"changes": map[string]any{"type": "array", "items": object([]string{"kind", "id", "change"}, map[string]any{
+					"kind": str(), "id": str(), "change": map[string]any{"enum": []string{"added", "removed", "changed"}},
+				})},
+				"missing_secrets": strList(), "secrets": map[string]any{"type": "array", "items": secretRefSchema()},
+				"pending": strList(), "reloaded": map[string]any{"type": "boolean"},
+			},
+		)),
+		"xdial.secret/v1":      envelope("xdial.secret/v1", secretRefSchema()),
+		"xdial.secret.list/v1": envelope("xdial.secret.list/v1", object([]string{"secrets"}, map[string]any{"secrets": map[string]any{"type": "array", "items": secretRefSchema()}})),
+		"xdial.logs/v1": envelope("xdial.logs/v1", object([]string{"time", "type"}, map[string]any{
+			"time": str(), "type": str(), "fields": map[string]any{"type": "object"},
+		})),
 		cli.ErrorSchema: object([]string{"schema", "ok", "error"}, map[string]any{
 			"schema": map[string]any{"const": cli.ErrorSchema},
 			"ok":     map[string]any{"const": false},
