@@ -433,7 +433,93 @@
   - 表达不了的部分整体报错并列出，不悄悄丢掉。细节在 M6 定。
 - **种子配置**：只含配置，不含凭据。
 
-## 5. 留给后面的
+## 5. CLI 约定
+
+CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用。本节是架构样板，第一版由用户审；之后的命令都照着写，变更属于高风险。
+
+### 5.1 命令语法
+
+- **形式**：`xdial <名词> <动词> [参数] [--选项]`，例如 `xdial config check <文件>`、`xdial secret set <名字>`、`xdial scenario use <id>`。
+- **常用操作提到顶层**：`status`、`connect`、`disconnect`、`explain`、`doctor`、`logs`、`schema`、`version`。
+- **选项**：只用长选项（`--json`、`--if-match=<revision>`）。布尔选项不带值；带值的选项写成 `--name=value` 或 `--name value`。
+- **不提问**：所有输入都由参数、文件或 stdin 给出，命令运行中不向终端提问。`secret set` 从 stdin 读值，stdin 是终端时关闭回显，这不算提问。
+- **不读环境变量当输入**：凭据和配置都不从环境变量读，避免它们出现在进程信息里。
+
+### 5.2 输出
+
+- **默认**：给人看的文字。结果写 stdout，错误写 stderr，格式是 `xdial: <说明>`，有提示时另起一行 `提示：<下一步>`。
+- **`--json`**：每个命令都支持。stdout 上只输出一个 JSON 文档，成功和失败都是；stderr 不输出任何东西。持续输出的命令（`logs --follow`）输出 JSON Lines，一行一个文档。
+- **成功**：
+
+  ```json
+  { "schema": "xdial.config.check/v1", "ok": true, "result": { } }
+  ```
+
+- **失败**：
+
+  ```json
+  { "schema": "xdial.error/v1", "ok": false,
+    "error": { "code": "config.invalid", "message": "配置有 2 处问题", "hint": "按 problems 逐条修改后重新检查",
+               "problems": [
+                 { "code": "config.secret_inline", "path": "lines[0].password", "object": "line hk",
+                   "message": "password 是凭据字段，不能写明文", "hint": "改成 {\"secret\": \"hk\"}，再用 xdial secret set hk 设置值" } ] } }
+  ```
+
+- **字段**：
+  - `schema`：输出的类型和版本，形如 `xdial.<命令>/v<N>`，错误统一是 `xdial.error/v1`。
+  - `code`：稳定的错误码，见 5.4。
+  - `message`、`hint`：中文，给人和 AI 读；程序判断只看 `code`。
+  - `problems`：校验类命令一次列出全部问题，不在第一处停下。
+  - `path`：出错的位置，用点和下标表示，例如 `lines[0].tls.server_name`、`scenarios[1].rules[0].line`。`object` 另外写出对象的类别和 id，方便对上号。
+- **版本规则**：同一个 `schema` 版本里，字段只增不删、不改名、不改类型；做不到就升版本号。每个命令的输出都有契约测试，用 `xdial schema` 给出的 JSON Schema 校验。
+- **外部文本**：订阅节点名、远端错误这类外部来的文本，文字输出时把控制字符转义成 `\uXXXX`，防止改写终端或误导读输出的 AI；`--json` 输出由 JSON 编码自然转义。
+
+### 5.3 退出码
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 成功 |
+| 1 | 命令跑完了，结论是否定的，例如检查发现问题 |
+| 2 | 用法错误：命令、参数或选项不对 |
+| 3 | 依赖的东西不在：daemon 没在运行、文件不存在、资源还没下载 |
+| 4 | 没有权限 |
+| 5 | 冲突：`--if-match` 的 revision 已经过时，或者操作和当前状态冲突 |
+| 70 | XDial 自己的错误（缺陷） |
+
+### 5.4 错误码
+
+- **格式**：小写，`<领域>.<原因>`，例如 `config.secret_inline`。错误码一旦发布就不改含义；不用了就留着不再产生。
+- **完整的表由 `xdial schema` 输出**，代码里每个错误码都登记了退出码、说明和默认提示，测试保证没有登记的错误码发不出去。
+- **第一批**：
+
+  | 错误码 | 退出码 | 说明 |
+  |---|---|---|
+  | `usage` | 2 | 命令、参数或选项不对 |
+  | `input.read` | 3 | 读不到输入文件或 stdin |
+  | `config.invalid` | 1 | 配置有问题，详情在 `problems` |
+  | `config.syntax` | — | JSON 语法错误 |
+  | `config.unknown_key` | — | 没有登记的键，或者大小写不一致 |
+  | `config.duplicate_key` | — | 同一个对象里键重复 |
+  | `config.forbidden_key` | — | 禁止类或 XDial 生成类的键 |
+  | `config.secret_inline` | — | 凭据字段写了明文 |
+  | `config.value` | — | 值不在值域里 |
+  | `config.type_not_allowed` | — | 类型不在允许清单里 |
+  | `config.reference` | — | 引用的对象不存在，或者类别不对 |
+  | `config.cycle` | — | `detour` 和组成员成环 |
+  | `config.duplicate_id` | — | id 重复 |
+  | `config.compile` | — | 编译出的 sing-box 配置没通过检查 |
+  | `config.version` | 1 | 配置的 `version` 比这个 XDial 新 |
+  | `internal` | 70 | XDial 自己的错误 |
+
+  标"—"的只出现在 `problems` 里，整体的错误码是 `config.invalid`。daemon、凭据、连接相关的错误码随 M2 补上。
+
+### 5.5 `xdial schema`
+
+- 输出 XDial 的全部能力：命令、参数和选项；每个命令成功输出的 JSON Schema；错误码表和退出码表；配置格式的 JSON Schema。
+- 配置格式里线路部分的字段，从分类表和 sing-box 自带的 schema 生成器裁出来，只含允许的类型和字段。
+- AI 不读文档，先跑 `xdial schema --json` 就能知道怎么用。
+
+## 6. 留给后面的
 
 - **M1**：
   - **编译 PR**：
@@ -442,10 +528,6 @@
     - 私有地址的默认去向；
     - 规则集更新后怎么生效；
     - 分类表和允许清单的包路径。
-  - **CLI 约定**（另一个架构样板）：
-    - 错误码表；
-    - 字段路径的格式；
-    - 订阅节点名、远端错误文本里的控制字符怎么转义，防止终端和 AI 被注入。
 - **M2**：
   - 数据目录的具体路径，Debug 和正式版怎么分开；
   - 子进程的启动方式和管道协议；
