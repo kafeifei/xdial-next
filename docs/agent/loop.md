@@ -68,7 +68,7 @@
 |---|---|---|
 | 低 | 文档（`docs/agent` 和 `docs/plan.md` 除外）、README、测试文件、testdata | 关卡全过后自动合并 |
 | 中 | 其余文件，包括 `e2e/` | 用户批准后自动合并 |
-| 高 | 工作流与 `.github` 下的配置；脚本；`tools/`；任意目录下的 AGENTS.md、AGENTS.override.md、CLAUDE.md、CLAUDE.local.md 和 `.claude/`；`.codex/`、`.mcp.json`；`docs/agent`、`docs/plan.md`；任意目录下的 go.mod、go.sum，以及 go.work；Makefile、lint 配置、`.gitattributes` | 用户批准后自动合并；另需不同模型的复审和 e2e 证据 |
+| 高 | 工作流与 `.github` 下的配置；脚本；`tools/`；任意目录下的 AGENTS.md、AGENTS.override.md、CLAUDE.md、CLAUDE.local.md 和 `.claude/`；`.codex/`、`.mcp.json`；`docs/agent`、`docs/plan.md`、`ARCHITECTURE.md`；任意目录下的 go.mod、go.sum，以及 go.work；Makefile、lint 配置、`.gitattributes` | 用户批准后自动合并；另需不同模型的复审和 e2e 证据 |
 
 以后新增这几类包时，把路径加进 high（这个改动本身也是高风险）：daemon 本地 API、TUN / 路由 / DNS、凭据、安装更新卸载、CLI JSON schema、配置格式。
 

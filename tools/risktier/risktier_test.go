@@ -63,6 +63,7 @@ func TestRepositoryRules(t *testing.T) {
 		{".github/risk-tiers.json", tierHigh},
 		{"tools/risktier/risktier_test.go", tierHigh},
 		{"AGENTS.md", tierHigh},
+		{"ARCHITECTURE.md", tierHigh},
 		{"go.sum", tierHigh},
 		{"scripts/check-deps.sh", tierHigh},
 		{"Makefile", tierHigh},
