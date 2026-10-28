@@ -22,10 +22,26 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == engine.CheckCommand {
-		os.Exit(engine.RunCheckChild(os.Stdin, os.Stdout))
+	if code, ok := hidden(os.Args[1:]); ok {
+		os.Exit(code)
 	}
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+// hidden runs the subcommands xdial starts itself: the one-shot check child
+// and the engine child, ARCHITECTURE.md 2.2 and 6.1. They are not part of
+// the CLI contract.
+func hidden(args []string) (int, bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+	switch args[0] {
+	case engine.CheckCommand:
+		return engine.RunCheckChild(os.Stdin, os.Stdout), true
+	case engine.EngineCommand:
+		return engine.RunEngineChild(os.Stdin, os.Stdout, os.Stderr, args[1:]), true
+	}
+	return 0, false
 }
 
 // command is one entry of the command table; `xdial schema` prints it.

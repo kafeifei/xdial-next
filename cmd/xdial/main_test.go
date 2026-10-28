@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -19,8 +21,8 @@ import (
 
 // The test binary doubles as the check child, as xdial itself does.
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && os.Args[1] == engine.CheckCommand {
-		os.Exit(engine.RunCheckChild(os.Stdin, os.Stdout))
+	if code, ok := hidden(os.Args[1:]); ok {
+		os.Exit(code)
 	}
 	os.Exit(m.Run())
 }
@@ -377,5 +379,28 @@ func TestUnreachableLinesAreChecked(t *testing.T) {
 	e := contract(t, stdout, stderr)["error"].(map[string]any)
 	if !strings.Contains(fmt.Sprint(e["problems"]), "整份配置") {
 		t.Errorf("problems %v", e["problems"])
+	}
+}
+
+func TestHiddenCommandsAreDispatched(t *testing.T) {
+	if _, ok := hidden([]string{"version"}); ok {
+		t.Error("a public command went to the hidden dispatcher")
+	}
+	// The engine child must start from the real binary: feed it a minimal
+	// configuration and expect it to report ready.
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, engine.EngineCommand)
+	cmd.Stdin = strings.NewReader(`{"log": {"level": "error"}, "outbounds": [{"type": "direct", "tag": "direct"}]}`)
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	line, _ := bufio.NewReader(stdout).ReadBytes('\n')
+	_ = cmd.Wait() // stdin ends, so the engine shuts down by itself
+	if !strings.Contains(string(line), `"ready":true`) {
+		t.Errorf("engine child did not start: %q", line)
 	}
 }
