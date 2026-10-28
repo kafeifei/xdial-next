@@ -19,7 +19,11 @@ type Layout struct {
 }
 
 func (l Layout) at(parts ...string) string {
-	return filepath.Join(append([]string{l.Root}, parts...)...)
+	root := l.Root
+	if root == "" {
+		root = "/"
+	}
+	return filepath.Join(append([]string{root}, parts...)...)
 }
 
 // Data is the daemon's data directory.
