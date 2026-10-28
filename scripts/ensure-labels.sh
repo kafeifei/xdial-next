@@ -8,7 +8,7 @@ while IFS='|' read -r name color description; do
   gh label create "$name" --repo "$REPO" --color "$color" --description "$description" --force > /dev/null
 done << 'EOF'
 risk:low|0e8a16|低风险：关卡全过后自动合并
-risk:medium|fbca04|中风险：等仓库所有者加 owner-approved
+risk:medium|fbca04|中风险：关卡全过后自动合并
 risk:high|d93f0b|高风险：等仓库所有者加 owner-approved，另需换模型复审和 e2e 证据
 owner-approved|1d76db|仓库所有者批准合并；只对批准时的代码有效；agent 不得添加
 needs-rethink|b60205|审了 3 轮仍未通过：停下复盘，由用户决定

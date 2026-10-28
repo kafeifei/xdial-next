@@ -53,9 +53,15 @@ func TestRepositoryRules(t *testing.T) {
 		want  string
 	}{
 		{"docs/incidents/README.md", tierLow},
-		{"README.md cmd/xdial/main_test.go", tierLow},
-		{"cmd/xdial/main.go", tierMedium},
-		{"docs/incidents/README.md cmd/xdial/main.go", tierMedium},
+		{"README.md docs/incidents/README.md", tierLow},
+		{"e2e/run.sh", tierMedium},
+		{"docs/incidents/README.md e2e/run.sh", tierMedium},
+		// Product code under cmd/ and internal/ carries the CLI surface, the
+		// configuration format and the daemon, so even its tests are high.
+		{"cmd/xdial/main.go", tierHigh},
+		{"cmd/xdial/main_test.go", tierHigh},
+		{"internal/config/parse.go", tierHigh},
+		{"ARCHITECTURE.md", tierHigh},
 		{"", tierMedium},
 		{"docs/agent/loop.md", tierHigh},
 		{"docs/agent/review-filters.md README.md", tierHigh},
