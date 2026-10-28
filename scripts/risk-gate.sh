@@ -101,8 +101,8 @@ for t in low medium high; do
   fi
 done
 
-# 低、中风险关卡全过就合并；高风险要有效的批准。
-if [[ "$tier" != high || "$approved" == true ]]; then
+# 低、中风险关卡全过就合并；高风险要有效的批准。档位不认识时按高风险处理。
+if [[ "$tier" == low || "$tier" == medium || "$approved" == true ]]; then
   if [[ "$DRAFT" != true ]]; then
     gh pr merge "$PR" --repo "$REPO" --auto --merge ||
       echo "::warning::开不了自动合并，关卡结论不受影响，可以手动合并"
