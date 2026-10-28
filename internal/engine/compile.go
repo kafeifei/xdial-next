@@ -305,9 +305,6 @@ func (k *compiler) route(scenario *config.Scenario, endpointIDs []string, ruleSe
 		map[string]any{"protocol": "dns", "action": "hijack-dns"},
 		map[string]any{"action": "resolve"},
 	)
-	for _, id := range endpointIDs {
-		rules = append(rules, map[string]any{"preferred_by": []string{id}, "action": "route", "outbound": id})
-	}
 	final := config.Direct
 	if scenario != nil {
 		for _, r := range scenario.Rules {
@@ -323,6 +320,13 @@ func (k *compiler) route(scenario *config.Scenario, endpointIDs []string, ruleSe
 			}
 			rules = append(rules, rule)
 		}
+	}
+	// What a VPN server pushes is remote input: it comes after the user's
+	// own rules, block included, and can only claim what final would get.
+	for _, id := range endpointIDs {
+		rules = append(rules, map[string]any{"preferred_by": []string{id}, "action": "route", "outbound": id})
+	}
+	if scenario != nil {
 		if scenario.Final == config.Block {
 			rules = append(rules, map[string]any{"network": []string{"tcp", "udp", "icmp"}, "action": "reject"})
 		} else {
@@ -363,11 +367,6 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 	if len(endpointIDs) > 0 {
 		rules = append(rules, map[string]any{"inbound": endpointIDs, "action": "reject"})
 	}
-	for _, id := range endpointIDs {
-		tag := dnsEndpoint + id
-		servers = append(servers, map[string]any{"type": k.c.Line(id).Type, "tag": tag, "endpoint": id})
-		rules = append(rules, map[string]any{"preferred_by": []string{tag}, "action": "route", "server": tag})
-	}
 	final := tagDNSLocal
 	if scenario != nil {
 		for _, r := range scenario.Rules {
@@ -385,6 +384,12 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 		if scenario.Final != config.Block {
 			final = server(scenario.Final)
 		}
+	}
+	// VPN-pushed names, after the scenario's own rules as in routing.
+	for _, id := range endpointIDs {
+		tag := dnsEndpoint + id
+		servers = append(servers, map[string]any{"type": k.c.Line(id).Type, "tag": tag, "endpoint": id})
+		rules = append(rules, map[string]any{"preferred_by": []string{tag}, "action": "route", "server": tag})
 	}
 	dns := map[string]any{"servers": servers, "final": final, "reverse_mapping": true}
 	if len(rules) > 0 {

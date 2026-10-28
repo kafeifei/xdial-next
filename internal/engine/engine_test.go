@@ -109,15 +109,17 @@ func TestRouteOrder(t *testing.T) {
 		actions = append(actions, r["action"].(string))
 	}
 	// office reaches corp but not tailnet, so only corp is compiled.
-	want := "reject sniff hijack-dns resolve route route"
-	if got := strings.Join(actions[:6], " "); got != want {
-		t.Errorf("route starts %q, want %q", got, want)
+	want := "reject sniff hijack-dns resolve route route route"
+	if got := strings.Join(actions, " "); got != want {
+		t.Errorf("route is %q, want %q", got, want)
 	}
 	if in := route[0]["inbound"].([]any); len(in) != 1 || in[0] != "corp" {
 		t.Errorf("first rule rejects %v, want the corp endpoint", in)
 	}
-	if route[4]["preferred_by"] == nil || route[5]["rule_set"] == nil {
-		t.Error("VPN-pushed routes must come before scenario rules")
+	// What the VPN pushes is remote input and must not pre-empt the
+	// scenario's own rules.
+	if route[4]["rule_set"] == nil || route[5]["rule_set"] == nil || route[6]["preferred_by"] == nil {
+		t.Error("VPN-pushed routes must come after scenario rules")
 	}
 	if doc["route"].(map[string]any)["final"] != "proxy" {
 		t.Error("final not compiled")
