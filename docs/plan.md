@@ -2,7 +2,7 @@
 
 **目标：** 在新仓库重写 XDial，要求核心功能明确、只依赖上游 sing-box、以 CLI 为核心且对 AI 友好，再按核心功能重新设计界面。新版达标后接管 XDial 的名字和更新源。
 
-状态：方向和项目循环已于 2026-10-25 对齐，M0 进行中。
+状态：方向和项目循环已于 2026-10-25 对齐；M0 于 2026-10-27 完成，M1 进行中。
 
 > 本文从 kafeifei/XDial 的 `docs/plans/rewrite.md`（#56）迁来，之后以本仓库为准。
 
@@ -104,7 +104,7 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 ### 4.3 数据面
 
 - 用 sing-box 的 `tun` 入站加 `auto_route`，路由规则 `hijack-dns` 接管 DNS，direct 出站跟随系统默认接口。stack 和 strict_route 怎么选，M2 实测后再定。
-- 构建 tag 至少要有 `with_gvisor`、`with_openconnect` 和 `with_tailscale`。上游源码里，这两个 endpoint 都受 tag 控制。
+- 不用上游的 `include`，由 XDial 自己的 registry 决定注册哪些类型。构建 tag 要有 `with_gvisor`、`with_utls`、`with_dhcp`，以及去掉 tailscale peerapi、C2N 等能力的 `ts_omit_*`，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.3、2.6 和 3.3。
 - 场景切换时，daemon 重新编译配置并重载 sing-box。组内切线路走 selector，不重载。
 - 断开、卸载或 daemon 异常退出之后，不能留下路由、DNS 或接口残留。M2 在虚拟机里逐项检查。
 
@@ -122,12 +122,16 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 
 ### 4.5 配置与凭据
 
-- **配置格式**：纯文本、可以 diff，沿用 Line / RuleSet / Scenario / 线路组的划分。具体格式是 M1 的架构样板，第一版由用户审。
+2026-10-27 与用户对齐，定稿见 [ARCHITECTURE.md](../ARCHITECTURE.md)。要点：
+
+- **配置格式**：一个 JSON 文件。线路、线路组、规则集直接写 sing-box 的原生对象，`tag` 换成 `id`；XDial 只增加场景、凭据引用和少量全局项。会让 root daemon 读文件、执行程序或改系统网络的字段一律拒绝。
+- **进程结构**：sing-box 跑在 daemon 监管的子进程里（同一个 `xdial` 二进制），panic、远端让进程退出、日志里的敏感信息都止于进程边界。
+- **凭据**：和配置分开，只写不读，存在 daemon 的 root 专属文件里，并排除出 Time Machine。
+- **订阅**：拉下来的节点放在 daemon 的缓存里，不进配置。
 - **导入旧配置**：首次启动时只读导入。
   - 旧库在 `~/.xdial/configuration/profiles.enc`，用 AES-256-GCM 加密，密钥放在用户的 Keychain 里，见 [Profile 配置库](https://github.com/kafeifei/XDial/blob/main/docs/agent/profiles.md)。
-  - 【推断】导入应该以用户身份由 CLI 或 App 执行，而不是让 root daemon 去读用户 Keychain。
+  - 由用户身份的 CLI 读旧库，再通过本地 API 交给 daemon；root daemon 不读用户 Keychain。
   - 旧文件不写回，也不删除。
-- **凭据**：线路密码和 auth key 怎么存是高风险设计，在 M1 定。
 - **种子配置**：保留"构建时注入首次启动配置"这个通用能力。公司版的配置内容仍然只放在独立的私有仓库，不进主仓库。
 
 ### 4.6 安装、更新、卸载
@@ -274,8 +278,8 @@ jev 那种"观察、生成问题卡、出修复 Draft PR"的闭环，等事件�
 | 里程碑 | 内容 | 完成标准 |
 |---|---|---|
 | M0 循环骨架 | 新仓库和分支规则；CI 门禁；AI 审核和安全审核；风险定档；PR 证据模板；测试虚拟机和 e2e 骨架 | 一个示例 PR 走完全部关卡并自动合并 |
-| M1 CLI 与配置 | 配置格式、校验、编译成 sing-box 配置；`--json` 约定、错误码；`xdial schema` 和 `config apply --dry-run` | 架构样板经用户审过；编译出的配置全部通过 `sing-box check` |
-| M2 daemon 与 TUN | daemon 注册和本地 API；连接、断开、状态、卸载 | 在虚拟机里连接后，流量和 DNS 都进入 sing-box；断开和卸载后没有残留 |
+| M1 CLI 与配置 | 配置格式、校验、编译成 sing-box 配置；`--json` 约定、错误码；`xdial schema` 和离线的 `xdial config check <文件>`（与 daemon 同一份校验和编译代码，不改任何状态） | 架构样板经用户审过；编译出的配置全部通过 `sing-box check` |
+| M2 daemon 与 TUN | daemon 注册和本地 API；`config apply`（含 `--dry-run`）和凭据命令；连接、断开、状态、卸载 | 在虚拟机里连接后，流量和 DNS 都进入 sing-box；断开和卸载后没有残留 |
 | M3 线路 | 代理协议和订阅导入；AnyConnect；Tailscale | 用户在真实环境验证过 AnyConnect 和 Tailnet |
 | M4 场景与诊断 | 规则集、场景、线路组；重载切换和 selector；`explain`、`doctor`、事件日志、测速 | 场景切换和诊断用例在虚拟机里通过 |
 | M5 菜单栏 App | 按核心功能重新设计界面，只调用本地 API | 用户确认界面 |
@@ -296,7 +300,7 @@ jev 那种"观察、生成问题卡、出修复 Draft PR"的闭环，等事件�
 - 现在依赖的是 sing-box 的 beta 版（v1.14.0-beta.2），1.14 正式版发布后跟进。
 - 新版和其他全局 VPN 客户端会冲突，安装或连接时要给出明确提示。
 - daemon 注册需要用户在系统设置里批准，首次安装的体验在 M2 验证。
-- 【推断】导入旧配置需要访问用户的 Keychain，不能放在 root daemon 里做。
+- 导入旧配置需要访问用户的 Keychain，由用户身份的 CLI 做，不放在 root daemon 里（已定，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 4.8）。
 
 ## 10. 旧仓库怎么处理
 
