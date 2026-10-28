@@ -176,7 +176,7 @@
 | 类 | 含义 | 例子 |
 |---|---|---|
 | 普通 | 用户直接写 | `server`、`server_port`、`tls.server_name`、tailscale 的 `control_url`、`exit_node` |
-| 凭据 | 必须写成凭据引用，写明文直接拒绝 | `password`、`uuid`、`private_key`、openconnect 的 `cookie` 和 `token.secret`、`tls.client_key` |
+| 凭据 | 必须写成凭据引用，写明文直接拒绝 | `password`、`uuid`、openconnect 的 `cookie` 和 `token.secret`、`mixed.password` |
 | 可为凭据 | 明文和凭据引用都接受 | 传输层 `headers` 的值 |
 | XDial 生成 | 由 XDial 统一生成，配置里出现就拒绝 | `tag`；`tls.engine`（固定为 go）；tailscale 的 `state_directory`、`auth_key`；dialer 里选择接口、地址或 DNS 的字段，如 `bind_interface`、`inet4_bind_address`、`domain_resolver`、`network_strategy` |
 | 禁止 | 2.1 列出的那些能力，配置里出现就拒绝 | 见下 |
@@ -222,7 +222,7 @@
    - 解析的结果重新序列化成规范 JSON。之后的每一步只碰这份规范 JSON，不再碰原文，也就不存在"检查看到的键"和"实际生效的键"不一致的问题。
    - 这一步不能交给 sing：它的 JSON 解析器在键名精确匹配不上时，会按大小写折叠再匹配一次，`Certificate_Path`、甚至 `ſsh_server`（U+017F）都会生效。
 2. **解析成 sing-box 的类型化结构**：剥离 XDial 自己的键，用受限 registry 解析规范 JSON。然后检查值域和跨字段约束。
-3. **替换凭据**：在结构上把凭据引用替换成值，不做文本替换，然后把第 2 步的检查再跑一遍。相关真值都齐全时，跨字段的真值检查（例如证书和私钥是否配对）在这一步做；缺凭据的，留到连接时再查。
+3. **替换凭据**：在结构上把凭据引用替换成值，不做文本替换，然后把第 2 步的检查再跑一遍。相关真值都齐全时，跨字段的真值检查在这一步做；缺凭据的，留到连接时再查。
 
 ### 2.6 运行时的暴露面
 
@@ -421,7 +421,8 @@
   - vmess 和 vless 的 `uuid` 接受任意非空字符串：sing-box 会把非 UUID 的值映射成 UUIDv5，以兼容 Xray。
 - **占位值**：
   - 编译检查用格式合法的占位值，不用真值。
-  - 占位值按关联字段成组生成：证书和私钥一起换，ss2022 的密码按 `method` 生成。
+  - 占位值按关联字段成组生成，例如 ss2022 的密码按 `method` 生成。
+  - 第一版不开放客户端证书（TLS 和 openconnect 的 `client_certificate`、`client_key` 一律拒绝）。以后开放时，证书和私钥是一组：占位时成对替换，真值在 `secret set` 和连接时由 XDial 核对是否配对。
   - 只能用真值做的检查，见 2.5 第 3 步。
 
 ### 4.6 命令
