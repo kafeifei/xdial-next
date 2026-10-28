@@ -1,6 +1,11 @@
 GO ?= go
 export GOWORK := off
 
+# 构建 tag 见 ARCHITECTURE.md 2.3 和 2.6：不用上游的 include，类型由 XDial 自己的 registry 决定；
+# ts_omit_* 去掉 tailscale 自己终结、不经过 sing-box 路由的服务。CI 用同一份。
+TAGS := $(shell cat .github/build-tags.txt)
+export GOFLAGS := -tags=$(TAGS)
+
 .PHONY: build test lint gates check e2e
 
 build:

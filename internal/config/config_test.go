@@ -1,0 +1,188 @@
+package config
+
+import (
+	"os"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/kafeifei/xdial-next/internal/cli"
+)
+
+func TestParseAcceptsCommentsAndTrailingCommas(t *testing.T) {
+	v, err := Parse([]byte(`// leading
+	{
+		# hash comment
+		"a": [1, 2, /* inline */ 3,],
+		"b": {"c": "é😀",},
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.Get("a").Items); got != 3 {
+		t.Errorf("a has %d items", got)
+	}
+	if got := v.Get("b").Get("c").String; got != "é😀" {
+		t.Errorf("c = %q", got)
+	}
+}
+
+func TestParseRejects(t *testing.T) {
+	cases := map[string]string{
+		"duplicate key":  `{"a": 1, "a": 2}`,
+		"bom":            "\xEF\xBB\xBF{}",
+		"invalid utf-8":  "{\"a\": \"\xff\"}",
+		"go escape":      `{"a": "\x41"}`,
+		"control char":   "{\"a\": \"x\ty\"}",
+		"trailing data":  `{} {}`,
+		"bad number":     `{"a": 01}`,
+		"open comment":   `{"a": 1 /* }`,
+		"single quotes":  `{'a': 1}`,
+		"unquoted key":   `{a: 1}`,
+		"missing value":  `{"a": }`,
+		"truncated":      `{"a": [1, 2`,
+		"deep nesting":   strings.Repeat("[", maxDepth+2) + strings.Repeat("]", maxDepth+2),
+		"empty document": ``,
+	}
+	for name, doc := range cases {
+		if _, err := Parse([]byte(doc)); err == nil {
+			t.Errorf("%s: parsed without error", name)
+		}
+	}
+}
+
+func load(t *testing.T, doc string) (*Config, []cli.Problem) {
+	t.Helper()
+	c, problems, err := Load([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, problems
+}
+
+// TestArchitectureExample keeps the example in ARCHITECTURE.md 1.2 valid
+// and identical to testdata/example.jsonc.
+func TestArchitectureExample(t *testing.T) {
+	data, err := os.ReadFile("testdata/example.jsonc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := os.ReadFile("../../ARCHITECTURE.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile("(?s)### 1\\.2 示例\n\n```jsonc\n(.*?)```").FindSubmatch(doc)
+	if m == nil {
+		t.Fatal("ARCHITECTURE.md has no example in 1.2")
+	}
+	if !strings.HasSuffix(string(data), string(m[1])) {
+		t.Error("testdata/example.jsonc differs from the example in ARCHITECTURE.md 1.2")
+	}
+	c, problems := load(t, string(data))
+	if len(problems) > 0 {
+		t.Fatalf("example has problems: %+v", problems)
+	}
+	if len(c.Lines) != 4 || len(c.Groups) != 1 || len(c.RuleSets) != 2 || len(c.Scenarios) != 1 {
+		t.Errorf("unexpected objects: %d lines, %d groups, %d rule sets, %d scenarios", len(c.Lines), len(c.Groups), len(c.RuleSets), len(c.Scenarios))
+	}
+	names := map[string]bool{}
+	for _, s := range c.Secrets {
+		names[s.Name] = true
+	}
+	for _, want := range []string{"mixed", "hk", "jp", "corp", "airport-url"} {
+		if !names[want] {
+			t.Errorf("secret %q not collected", want)
+		}
+	}
+}
+
+const base = `{"version": 1, "lines": [%s], "groups": [%s], "rule_sets": [{"id": "r", "type": "inline", "rules": [{"domain": ["a.example"]}]}%s], "scenarios": [{"id": "s", "rules": [{"rule_set": "r", "line": "direct"}], "final": "%s"}]}`
+
+func build(lines, groups, ruleSets, final string) string {
+	if final == "" {
+		final = "direct"
+	}
+	if ruleSets != "" {
+		ruleSets = "," + ruleSets
+	}
+	parts := strings.SplitN(base, "%s", 5)
+	return parts[0] + lines + parts[1] + groups + parts[2] + ruleSets + parts[3] + final + parts[4]
+}
+
+const trojan = `{"id": "hk", "type": "trojan", "server": "hk.example.com", "server_port": 443, "password": {"secret": "hk"}%s}`
+
+func line(extra string) string { return strings.Replace(trojan, "%s", extra, 1) }
+
+func codes(problems []cli.Problem) string {
+	var list []string
+	for _, p := range problems {
+		list = append(list, p.Code+"@"+p.Path)
+	}
+	return strings.Join(list, " ")
+}
+
+func TestLoadProblems(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+		want string // a code@path that must be among the problems
+	}{
+		{"inline secret", build(`{"id": "hk", "type": "trojan", "server": "h.example", "server_port": 443, "password": "x"}`, "", "", ""), "config.secret_inline@lines[0].password"},
+		{"secret ref with extra key", build(line(`, "uuid": 1`), "", "", ""), "config.unknown_key@lines[0].uuid"},
+		{"case folded key", build(line(`, "TLS": {}`), "", "", ""), "config.unknown_key@lines[0].TLS"},
+		{"long s folding", build(line(`, "tls": {"enabled": true, "ſerver_name": "x.example"}`), "", "", ""), "config.unknown_key@lines[0].tls.ſerver_name"},
+		{"forbidden path", build(line(`, "tls": {"certificate_path": "/etc/hosts"}`), "", "", ""), "config.forbidden_key@lines[0].tls.certificate_path"},
+		{"forbidden even when empty", build(line(`, "tls": {"certificate_path": ""}`), "", "", ""), "config.forbidden_key@lines[0].tls.certificate_path"},
+		{"generated field", build(line(`, "bind_interface": "en0"`), "", "", ""), "config.forbidden_key@lines[0].bind_interface"},
+		{"protect path", build(line(`, "protect_path": "/tmp/x"`), "", "", ""), "config.forbidden_key@lines[0].protect_path"},
+		{"spoof", build(line(`, "tls": {"spoof": "x"}`), "", "", ""), "config.forbidden_key@lines[0].tls.spoof"},
+		{"tag", build(line(`, "tag": "x"`), "", "", ""), "config.forbidden_key@lines[0].tag"},
+		{"type not allowed", build(`{"id": "t", "type": "tor"}`, "", "", ""), "config.type_not_allowed@lines[0].type"},
+		{"direct as a line type", build(`{"id": "d", "type": "direct"}`, "", "", ""), "config.type_not_allowed@lines[0].type"},
+		{"missing server", build(`{"id": "hk", "type": "trojan", "server_port": 443, "password": {"secret": "hk"}}`, "", "", ""), "config.value@lines[0].server"},
+		{"negative duration", build(line(`, "connect_timeout": "-1s"`), "", "", ""), "config.value@lines[0].connect_timeout"},
+		{"zero duration", build("", `{"id": "g", "type": "urltest", "outbounds": ["direct"], "interval": "0s"}`, "", ""), "config.value@groups[0].interval"},
+		{"non-PEM certificate", build(line(`, "tls": {"certificate": "not a certificate"}`), "", "", ""), "config.value@lines[0].tls.certificate"},
+		{"port out of range", build(`{"id": "hk", "type": "trojan", "server": "h.example", "server_port": 70000, "password": {"secret": "hk"}}`, "", "", ""), "config.value@lines[0].server_port"},
+		{"bad secret name", build(`{"id": "hk", "type": "trojan", "server": "h.example", "server_port": 443, "password": {"secret": "Bad Name"}}`, "", "", ""), "config.value@lines[0].password.secret"},
+		{"reserved id", build(`{"id": "direct", "type": "trojan", "server": "h.example", "server_port": 443, "password": {"secret": "hk"}}`, "", "", ""), "config.duplicate_id@lines[0].id"},
+		{"duplicate id across lines and groups", build(line(""), `{"id": "hk", "type": "selector", "outbounds": ["direct"]}`, "", ""), "config.duplicate_id@groups[0].id"},
+		{"missing member", build("", `{"id": "g", "type": "selector", "outbounds": ["nope"]}`, "", ""), "config.reference@groups[0].outbounds[0]"},
+		{"block as a member", build("", `{"id": "g", "type": "selector", "outbounds": ["block"]}`, "", ""), "config.reference@groups[0].outbounds[0]"},
+		{"default not a member", build(line(""), `{"id": "g", "type": "selector", "outbounds": ["direct"], "default": "hk"}`, "", ""), "config.reference@groups[0].default"},
+		{"missing final", build("", "", "", "nope"), "config.reference@scenarios[0].final"},
+		{"cycle", build(line(`, "detour": "g"`), `{"id": "g", "type": "selector", "outbounds": ["hk"]}`, "", ""), "config.cycle@"},
+		{"download via endpoint", build(`{"id": "corp", "type": "openconnect", "server": "https://vpn.example"}`, `{"id": "g", "type": "selector", "outbounds": ["corp"]}`, `{"id": "x", "type": "remote", "format": "binary", "url": "https://e.example/x.srs", "download_via": "g"}`, ""), "config.reference@rule_sets[1].download_via"},
+		{"remote url over http", build("", "", `{"id": "x", "type": "remote", "format": "binary", "url": "http://e.example/x.srs"}`, ""), "config.value@rule_sets[1].url"},
+		{"local rule set", build("", "", `{"id": "x", "type": "local", "path": "/etc/hosts"}`, ""), "config.type_not_allowed@rule_sets[1].type"},
+		{"plugin cert", build(`{"id": "ss", "type": "shadowsocks", "server": "s.example", "server_port": 8388, "method": "aes-128-gcm", "password": {"secret": "ss"}, "plugin": "v2ray-plugin", "plugin_opts": "tls;cert=/etc/hosts"}`, "", "", ""), "config.value@lines[0].plugin_opts"},
+		{"tailscale ssh", build(`{"id": "ts", "type": "tailscale", "ssh_server": true}`, "", "", ""), "config.forbidden_key@lines[0].ssh_server"},
+		{"openconnect wrapper", build(`{"id": "oc", "type": "openconnect", "server": "https://vpn.example", "csd": {"wrapper_path": "/bin/sh"}}`, "", "", ""), "config.forbidden_key@lines[0].csd"},
+		{"unknown top-level key", `{"version": 1, "inbounds": [], "scenarios": []}`, "config.unknown_key@inbounds"},
+		{"missing version", `{"scenarios": []}`, "config.value@version"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, problems := load(t, tc.doc)
+			if !strings.Contains(" "+codes(problems), " "+tc.want) {
+				t.Errorf("want %s, got %s", tc.want, codes(problems))
+			}
+		})
+	}
+}
+
+func TestLoadNewerVersion(t *testing.T) {
+	if _, _, err := Load([]byte(`{"version": 99}`)); err != ErrNewerVersion {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestSecretsAreCollectedNotKept(t *testing.T) {
+	c, problems := load(t, build(line(""), "", "", ""))
+	if len(problems) > 0 {
+		t.Fatal(codes(problems))
+	}
+	if len(c.Secrets) != 1 || c.Secrets[0].Name != "hk" || c.Secrets[0].Path != "lines[0].password" {
+		t.Errorf("secrets = %+v", c.Secrets)
+	}
+}

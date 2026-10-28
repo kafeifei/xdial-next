@@ -1,0 +1,1 @@
+with_gvisor,with_utls,with_dhcp,ts_omit_peerapiserver,ts_omit_c2n,ts_omit_debug,ts_omit_portmapper,ts_omit_logtail,ts_omit_netlog,ts_omit_ssh,ts_omit_webclient,ts_omit_drive,ts_omit_taildrop

@@ -1,81 +1,322 @@
-// Command xdial is the XDial command line.
-//
-// In M0 it only reports its own build, which gives CI, review and the VM e2e
-// run something real to exercise. The command grammar and the JSON
-// conventions are architecture samples settled in M1.
+// Command xdial is the XDial command line. It follows the conventions of
+// ARCHITECTURE.md section 5: `xdial <noun> <verb>`, long options anywhere on
+// the line, one JSON document on stdout with --json, registered error codes
+// and the exit codes of 5.3.
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"runtime"
+	"sort"
+	"strings"
 
 	"github.com/kafeifei/xdial-next/internal/buildinfo"
+	"github.com/kafeifei/xdial-next/internal/cli"
+	"github.com/kafeifei/xdial-next/internal/config"
+	"github.com/kafeifei/xdial-next/internal/engine"
 )
 
-const usage = "usage: xdial version [--json]"
-
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	if len(os.Args) > 1 && os.Args[1] == engine.CheckCommand {
+		os.Exit(engine.RunCheckChild(os.Stdin, os.Stdout))
+	}
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-// run executes one command and returns the process exit code: 0 on success,
-// 1 when the command fails, 2 for usage errors.
-func run(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprintln(stderr, usage)
-		return 2
+// command is one entry of the command table; `xdial schema` prints it.
+type command struct {
+	Path        []string `json:"command"`
+	Args        []string `json:"args,omitempty"`
+	Options     []option `json:"options"`
+	Summary     string   `json:"summary"`
+	Output      string   `json:"output_schema"`
+	run         func(*context_) int
+	valueOption map[string]bool
+}
+
+type option struct {
+	Name    string `json:"name"`
+	Value   string `json:"value,omitempty"`
+	Summary string `json:"summary"`
+}
+
+var jsonOption = option{Name: "--json", Summary: "输出一个 JSON 文档，成功和失败都是"}
+
+// context_ is what a command runs with.
+type context_ struct {
+	args    []string
+	options map[string]string
+	stdin   io.Reader
+	out     cli.Output
+}
+
+func commands() []*command {
+	return []*command{
+		{
+			Path: []string{"version"}, Summary: "显示这个 xdial 的版本", Output: versionSchema,
+			Options: []option{jsonOption}, run: runVersion,
+		},
+		{
+			Path: []string{"config", "check"}, Args: []string{"<文件>"}, Output: checkSchema,
+			Summary: "离线检查一份配置：不联网、不依赖 daemon、不改任何状态（ARCHITECTURE.md 4.2）",
+			Options: []option{jsonOption}, run: runConfigCheck,
+		},
+		{
+			Path: []string{"schema"}, Summary: "列出全部命令、输出格式、错误码和配置格式", Output: schemaSchema,
+			Options: []option{jsonOption}, run: runSchema,
+		},
 	}
-	switch args[0] {
-	case "version":
-		return runVersion(args[1:], stdout, stderr)
-	default:
-		fmt.Fprintf(stderr, "xdial: unknown command %q\n%s\n", args[0], usage)
-		return 2
+}
+
+const usageHint = "运行 xdial schema 查看全部命令"
+
+// run executes one command line and returns the exit code.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	asJSON := false
+	for _, a := range args {
+		if a == "--json" {
+			asJSON = true
+		}
 	}
+	out := cli.Output{Stdout: stdout, Stderr: stderr, JSON: asJSON}
+
+	var words []string
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			break
+		}
+		words = append(words, a)
+	}
+	var cmd *command
+	for _, c := range commands() {
+		if len(words) >= len(c.Path) && equal(words[:len(c.Path)], c.Path) && (cmd == nil || len(c.Path) > len(cmd.Path)) {
+			cmd = c
+		}
+	}
+	if cmd == nil {
+		if len(args) == 0 {
+			return out.Fail(cli.Errorf(cli.CodeUsage, usageHint, "缺少命令"))
+		}
+		return out.Fail(cli.Errorf(cli.CodeUsage, usageHint, "不认识的命令 %q", strings.Join(words, " ")))
+	}
+
+	ctx := &context_{options: map[string]string{}, stdin: stdin, out: out}
+	known := map[string]bool{}
+	for _, o := range cmd.Options {
+		known[o.Name] = true
+	}
+	rest := args[len(cmd.Path):]
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			ctx.args = append(ctx.args, a)
+			continue
+		}
+		if a == "--" {
+			ctx.args = append(ctx.args, rest[i+1:]...)
+			break
+		}
+		name, value, hasValue := strings.Cut(a, "=")
+		if !strings.HasPrefix(name, "--") || !known[name] {
+			return out.Fail(cli.Errorf(cli.CodeUsage, usageHint, "%s 不支持选项 %s", strings.Join(cmd.Path, " "), name))
+		}
+		if cmd.valueOption[name] && !hasValue {
+			if i+1 >= len(rest) {
+				return out.Fail(cli.Errorf(cli.CodeUsage, usageHint, "选项 %s 缺少值", name))
+			}
+			i++
+			value = rest[i]
+		} else if !cmd.valueOption[name] && hasValue {
+			return out.Fail(cli.Errorf(cli.CodeUsage, usageHint, "选项 %s 不带值", name))
+		}
+		ctx.options[name] = value
+	}
+	if len(ctx.args) != len(cmd.Args) {
+		return out.Fail(cli.Errorf(cli.CodeUsage, "用法：xdial "+strings.Join(append(append([]string{}, cmd.Path...), cmd.Args...), " "),
+			"%s 需要 %d 个参数，这里有 %d 个", strings.Join(cmd.Path, " "), len(cmd.Args), len(ctx.args)))
+	}
+	return cmd.run(ctx)
+}
+
+func equal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type versionInfo struct {
 	Version   string `json:"version"`
 	Revision  string `json:"revision"`
-	GoVersion string `json:"goVersion"`
+	GoVersion string `json:"go_version"`
 	OS        string `json:"os"`
 	Arch      string `json:"arch"`
+	SingBox   string `json:"sing_box"`
 }
 
-func runVersion(args []string, stdout, stderr io.Writer) int {
-	flags := flag.NewFlagSet("version", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	asJSON := flags.Bool("json", false, "print as JSON")
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if flags.NArg() > 0 {
-		fmt.Fprintf(stderr, "xdial version: unexpected argument %q\n", flags.Arg(0))
-		return 2
-	}
-
+func runVersion(ctx *context_) int {
 	info := versionInfo{
 		Version:   buildinfo.Version,
 		Revision:  buildinfo.Revision(),
 		GoVersion: runtime.Version(),
 		OS:        runtime.GOOS,
 		Arch:      runtime.GOARCH,
+		SingBox:   buildinfo.SingBox(),
 	}
-	if *asJSON {
-		if err := json.NewEncoder(stdout).Encode(info); err != nil {
-			fmt.Fprintln(stderr, "xdial version:", err)
-			return 1
+	return ctx.out.Succeed("xdial.version/v1", info, func(w io.Writer) {
+		fmt.Fprintf(w, "xdial %s (%s, sing-box %s, %s, %s/%s)\n", info.Version, info.Revision, info.SingBox, info.GoVersion, info.OS, info.Arch)
+	})
+}
+
+type secretReport struct {
+	Name       string   `json:"name"`
+	References []string `json:"references"`
+}
+
+type checkReport struct {
+	Revision  string         `json:"revision"`
+	Version   int            `json:"version"`
+	Scenarios []string       `json:"scenarios"`
+	Secrets   []secretReport `json:"secrets"`
+	Pending   []string       `json:"pending"`
+}
+
+func runConfigCheck(ctx *context_) int {
+	path := ctx.args[0]
+	var data []byte
+	var err error
+	if path == "-" {
+		data, err = io.ReadAll(io.LimitReader(ctx.stdin, config.MaxDocumentSize+1))
+	} else {
+		data, err = readFile(path)
+	}
+	if err != nil {
+		return ctx.out.Fail(err)
+	}
+	c, problems, err := config.Load(data)
+	if errors.Is(err, config.ErrNewerVersion) {
+		return ctx.out.Fail(cli.Errorf(cli.CodeConfigVersion, "升级 xdial 后再检查", "这份配置的 version 比这个 xdial 支持的 %d 新", config.CurrentVersion))
+	}
+	if err != nil {
+		return ctx.out.Fail(err)
+	}
+	if len(problems) > 0 {
+		return ctx.out.Fail(&cli.Error{Code: cli.CodeConfigInvalid, Message: fmt.Sprintf("配置有 %d 处问题", len(problems)), Hint: "按 problems 逐条修改后重新检查", Problems: problems})
+	}
+
+	exe, err := engine.Executable()
+	if err != nil {
+		return ctx.out.Fail(err)
+	}
+	report := checkReport{Revision: c.Root.Revision(), Version: c.Version, Scenarios: []string{}, Secrets: []secretReport{}, Pending: []string{}}
+	var compileProblems []cli.Problem
+	pending := map[string]bool{}
+	targets := []string{""}
+	for _, s := range c.Scenarios {
+		targets = append(targets, s.ID)
+		report.Scenarios = append(report.Scenarios, s.ID)
+	}
+	for _, scenario := range targets {
+		result, err := engine.Compile(c, engine.Options{Scenario: scenario, StateDirectory: os.TempDir(), TUN: true})
+		if err == nil {
+			err = engine.Check(context.Background(), exe, result.JSON)
 		}
-		return 0
+		if err != nil {
+			where, path := "整份配置", ""
+			if scenario != "" {
+				where, path = "场景 "+scenario, scenarioPath(c, scenario)
+			}
+			compileProblems = append(compileProblems, cli.Problem{
+				Code: cli.CodeConfigCompile, Path: path, Message: where + "编译后没通过 sing-box 的检查：" + err.Error(),
+				Hint: "检查用的是凭据占位值；如果报错指向某条线路的字段，按提示修改",
+			})
+			continue
+		}
+		for _, p := range result.Pending {
+			pending[p] = true
+		}
 	}
-	fmt.Fprintf(stdout, "xdial %s (%s, %s, %s/%s)\n", info.Version, info.Revision, info.GoVersion, info.OS, info.Arch)
-	return 0
+	if len(compileProblems) > 0 {
+		return ctx.out.Fail(&cli.Error{Code: cli.CodeConfigInvalid, Message: fmt.Sprintf("配置有 %d 处问题", len(compileProblems)), Hint: "按 problems 逐条修改后重新检查", Problems: compileProblems})
+	}
+
+	refs := map[string][]string{}
+	for _, use := range c.Secrets {
+		refs[use.Name] = append(refs[use.Name], use.Path)
+	}
+	for _, name := range sortedKeys(refs) {
+		report.Secrets = append(report.Secrets, secretReport{Name: name, References: refs[name]})
+	}
+	for p := range pending {
+		report.Pending = append(report.Pending, p)
+	}
+	sort.Strings(report.Pending)
+	if len(report.Secrets) > 0 {
+		report.Pending = append(report.Pending, "凭据的真值不在离线检查的范围内，只用了占位值")
+	}
+
+	return ctx.out.Succeed("xdial.config.check/v1", report, func(w io.Writer) {
+		fmt.Fprintf(w, "配置没有问题（revision %s）\n", report.Revision[:12])
+		fmt.Fprintf(w, "场景：%s\n", strings.Join(report.Scenarios, "、"))
+		for _, s := range report.Secrets {
+			fmt.Fprintf(w, "凭据 %s：%s\n", s.Name, strings.Join(s.References, "、"))
+		}
+		for _, p := range report.Pending {
+			fmt.Fprintln(w, "没法离线验证：", cli.Escape(p))
+		}
+	})
+}
+
+func scenarioPath(c *config.Config, id string) string {
+	for _, s := range c.Scenarios {
+		if s.ID == id {
+			return s.Path
+		}
+	}
+	return ""
+}
+
+// readFile reads the file the caller named, as the caller: the daemon never
+// opens a path a caller supplies, ARCHITECTURE.md 4.1.
+func readFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return nil, cli.Errorf(cli.CodeInputPermission, "", "没有权限读 %s", path)
+		}
+		return nil, cli.Errorf(cli.CodeInputRead, "确认文件存在", "读不到 %s：%v", path, unwrapPathError(err))
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, config.MaxDocumentSize+1))
+	if err != nil {
+		return nil, cli.Errorf(cli.CodeInputRead, "", "读 %s 出错：%v", path, unwrapPathError(err))
+	}
+	return data, nil
+}
+
+func unwrapPathError(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

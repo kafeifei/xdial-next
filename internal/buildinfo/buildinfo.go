@@ -34,3 +34,20 @@ func Revision() string {
 	}
 	return revision
 }
+
+// SingBox returns the sing-box module version linked into this binary.
+func SingBox() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "github.com/sagernet/sing-box" {
+			if dep.Replace != nil {
+				return dep.Replace.Version
+			}
+			return dep.Version
+		}
+	}
+	return "unknown"
+}

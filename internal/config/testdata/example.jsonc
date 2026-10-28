@@ -1,0 +1,39 @@
+// The example of ARCHITECTURE.md 1.2; TestArchitectureExample keeps them identical.
+{
+  "version": 1,
+  "mixed": { "port": 7890, "username": "me", "password": { "secret": "mixed" } },
+  "lines": [
+    { "id": "hk", "name": "香港", "type": "trojan",
+      "server": "hk.example.com", "server_port": 443,
+      "password": { "secret": "hk" },
+      "tls": { "enabled": true, "server_name": "hk.example.com" } },
+    { "id": "jp", "name": "日本", "type": "vless",
+      "server": "jp.example.com", "server_port": 443,
+      "uuid": { "secret": "jp" },
+      "tls": { "enabled": true, "server_name": "jp.example.com" } },
+    { "id": "corp", "name": "公司 VPN", "type": "openconnect", "flavor": "anyconnect",
+      "server": "https://vpn.corp.example", "username": "alice",
+      "password": { "secret": "corp" } },
+    { "id": "tailnet", "name": "Tailnet", "type": "tailscale", "accept_routes": true }
+  ],
+  "groups": [
+    { "id": "proxy", "name": "代理", "type": "urltest", "outbounds": ["hk", "jp"] }
+  ],
+  "rule_sets": [
+    { "id": "corp-domains", "name": "公司域名", "type": "inline",
+      "rules": [{ "domain_suffix": ["corp.example"] }] },
+    { "id": "cn-ip", "name": "国内 IP", "type": "remote", "format": "binary",
+      "url": "https://example.com/geoip-cn.srs", "download_via": "proxy" }
+  ],
+  "scenarios": [
+    { "id": "office", "name": "办公",
+      "rules": [
+        { "rule_set": "corp-domains", "line": "corp" },
+        { "rule_set": "cn-ip", "line": "direct" }
+      ],
+      "final": "proxy" }
+  ],
+  "subscriptions": [
+    { "id": "airport", "name": "机场", "url": { "secret": "airport-url" } }
+  ]
+}

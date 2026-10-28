@@ -16,10 +16,29 @@ report() {
 
 report environment true "macOS $(sw_vers -productVersion) $(uname -m)"
 
-if out="$("$xdial" version --json 2>&1)" && jq -e '.os == "darwin" and .arch == "arm64"' <<< "$out" > /dev/null; then
+if out="$("$xdial" version --json 2>&1)" && jq -e '.schema == "xdial.version/v1" and .ok and .result.os == "darwin" and .result.arch == "arm64"' <<< "$out" > /dev/null; then
   report version-json true "$out"
 else
   report version-json false "$out"
+fi
+
+# 离线检查要在真正的 macOS 上通过：编译出的配置含 TUN 和 openconnect，box.New 在子进程里跑。
+cat > "$work/config.jsonc" << 'EOF'
+{
+  "version": 1,
+  "mixed": { "port": 17890, "username": "e2e", "password": { "secret": "mixed" } },
+  "lines": [
+    { "id": "hk", "type": "trojan", "server": "hk.example.com", "server_port": 443,
+      "password": { "secret": "hk" }, "tls": { "enabled": true, "server_name": "hk.example.com" } }
+  ],
+  "rule_sets": [{ "id": "corp", "type": "inline", "rules": [{ "domain_suffix": ["corp.example"] }] }],
+  "scenarios": [{ "id": "office", "rules": [{ "rule_set": "corp", "line": "hk" }], "final": "direct" }]
+}
+EOF
+if out="$("$xdial" config check "$work/config.jsonc" --json 2>&1)" && jq -e '.ok and .result.scenarios == ["office"]' <<< "$out" > /dev/null; then
+  report config-check true "$(jq -c '.result.pending' <<< "$out")"
+else
+  report config-check false "$out"
 fi
 
 exit "$failed"
