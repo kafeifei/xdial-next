@@ -194,3 +194,46 @@ func TestSecretsAreCollectedNotKept(t *testing.T) {
 		t.Errorf("secrets = %+v", c.Secrets)
 	}
 }
+
+func TestRegexBudget(t *testing.T) {
+	heavy := strings.Repeat(`\\pL{1000}`, 5) // JSON-escaped \pL
+	one := build("", "", `{"id": "x", "type": "inline", "rules": [{"domain_regex": ["`+heavy+`"]}]}`, "")
+	if _, problems := load(t, one); !strings.Contains(codes(problems), "config.value@rule_sets[1].rules[0].domain_regex") {
+		t.Errorf("a heavy regex passed: %s", codes(problems))
+	}
+	// Many modest patterns add up past the document budget.
+	var rules []string
+	for i := 0; i < 400; i++ {
+		rules = append(rules, `{"domain_regex": ["[a-z]{250}x`+itoa(i)+`"]}`)
+	}
+	many := build("", "", `{"id": "x", "type": "inline", "rules": [`+strings.Join(rules, ",")+`]}`, "")
+	if _, problems := load(t, many); !strings.Contains(codes(problems), "config.value@rule_sets[1].rules[") {
+		t.Errorf("the document regex budget did not apply: %s", codes(problems))
+	}
+}
+
+func TestProblemsAreCapped(t *testing.T) {
+	zeros := strings.Repeat("0,", 18999) + "0"
+	doc := build("", "", `{"id": "x", "type": "inline", "rules": [{"domain": [`+zeros+`]}]}`, "")
+	_, problems := load(t, doc)
+	if len(problems) != maxProblems+1 || problems[maxProblems].Code != cli.CodeConfigMore {
+		t.Fatalf("got %d problems, last %+v", len(problems), problems[len(problems)-1])
+	}
+	if !strings.Contains(problems[maxProblems].Message, "18800") {
+		t.Errorf("the count of dropped problems is wrong: %s", problems[maxProblems].Message)
+	}
+}
+
+func TestParseCapsNodes(t *testing.T) {
+	doc := "[" + strings.Repeat("0,", maxNodes) + "0]"
+	if _, err := Parse([]byte(doc)); err == nil {
+		t.Error("a document with too many values parsed")
+	}
+}
+
+func TestDetourDirectIsRejected(t *testing.T) {
+	_, problems := load(t, build(line(`, "detour": "direct"`), "", "", ""))
+	if !strings.Contains(codes(problems), "config.reference@lines[0].detour") {
+		t.Errorf("detour direct passed: %s", codes(problems))
+	}
+}

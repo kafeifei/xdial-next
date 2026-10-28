@@ -88,6 +88,9 @@ func (o Output) Fail(err error) int {
 			e.Problems[i].Code = CodeInternal
 		}
 	}
+	if e.Hint == "" {
+		e.Hint = code.Hint
+	}
 	if o.JSON {
 		if writeJSON(o.Stdout, envelope{Schema: ErrorSchema, OK: false, Error: e}) != nil {
 			return ExitInternal

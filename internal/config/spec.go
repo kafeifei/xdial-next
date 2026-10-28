@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"regexp/syntax"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,7 @@ type Spec struct {
 	required       bool                        // the field must be present in its object
 	pattern        string                      // JSON Schema pattern, for strings whose check is a regular expression
 	minLen         int
+	isRegex        bool // counted against the document's regular expression budget
 
 	// Placeholder produces a well-formed stand-in for a secret so the
 	// sing-box check never sees the real value, ARCHITECTURE.md 4.5. It may
@@ -97,17 +99,33 @@ type RefUse struct {
 }
 
 type walker struct {
-	problems []cli.Problem
-	secrets  []SecretUse
-	refs     []RefUse
-	label    string
+	problems   []cli.Problem
+	dropped    int // problems past maxProblems, reported as a count
+	regexInsts int // compiled size of every regular expression so far
+	secrets    []SecretUse
+	refs       []RefUse
+	label      string
 }
 
+// maxProblems caps the list a check prints, so a hostile document cannot
+// turn a few megabytes into millions of problems.
+const maxProblems = 200
+
 func (w *walker) problem(code, path, hint, format string, args ...any) {
+	w.problemFor(w.label, code, path, hint, format, args...)
+}
+
+func (w *walker) problemFor(object, code, path, hint, format string, args ...any) {
+	if len(w.problems) >= maxProblems {
+		w.dropped++
+		return
+	}
 	w.problems = append(w.problems, cli.Problem{
-		Code: code, Path: path, Object: w.label, Message: fmt.Sprintf(format, args...), Hint: hint,
+		Code: code, Path: path, Object: object, Message: fmt.Sprintf(format, args...), Hint: hint,
 	})
 }
+
+func (w *walker) failed() bool { return len(w.problems) > 0 }
 
 func joinKey(path, key string) string {
 	if path == "" {
@@ -211,6 +229,9 @@ func (w *walker) value(v *Value, spec *Spec, path string) {
 		}
 		if spec.Ref != "" {
 			w.refs = append(w.refs, RefUse{Namespace: spec.Ref, Target: v.String, Path: path, Object: w.label})
+		}
+		if spec.isRegex {
+			w.regex(v.String, path)
 		}
 	case shapeBool:
 		if v.Kind != KindBool {
@@ -415,13 +436,37 @@ const maxRegexLength = 512
 // defaultMaxItems caps any array the tables do not size explicitly.
 const defaultMaxItems = 1024
 
-func regex() *Spec {
-	return checked(&Spec{shape: shapeString, maxLen: maxRegexLength}, func(v *Value) string {
-		if _, err := regexp.Compile(v.String); err != nil {
-			return "不是合法的正则表达式"
-		}
-		return ""
-	})
+func regex() *Spec { return &Spec{shape: shapeString, maxLen: maxRegexLength, isRegex: true} }
+
+// Regular expressions are budgeted by their compiled size, which is what
+// both parsing here and matching in sing-box cost; a 512-byte pattern such
+// as \pL{1000} repeated compiles to tens of thousands of instructions.
+const (
+	maxRegexInsts         = 4096
+	maxDocumentRegexInsts = 65536
+)
+
+func (w *walker) regex(pattern, path string) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		w.problem(cli.CodeConfigValue, path, "", "不是合法的正则表达式")
+		return
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		w.problem(cli.CodeConfigValue, path, "", "不是合法的正则表达式")
+		return
+	}
+	n := len(prog.Inst)
+	if n > maxRegexInsts {
+		w.problem(cli.CodeConfigValue, path, "拆成几条更简单的正则", "正则太复杂：编译后 %d 条指令，单条上限 %d", n, maxRegexInsts)
+		return
+	}
+	before := w.regexInsts
+	w.regexInsts += n
+	if before <= maxDocumentRegexInsts && w.regexInsts > maxDocumentRegexInsts {
+		w.problem(cli.CodeConfigValue, path, "减少正则的数量，能用 domain_suffix 的就不用正则", "整份配置的正则总量超过上限（编译后 %d 条指令）", maxDocumentRegexInsts)
+	}
 }
 
 func cidr() *Spec {

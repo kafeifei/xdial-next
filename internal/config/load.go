@@ -168,10 +168,13 @@ func Load(data []byte) (*Config, []cli.Problem, error) {
 	}
 	c.Mixed = root.Get("mixed")
 	c.Secrets = w.secrets
-	if len(w.problems) == 0 {
+	if !w.failed() {
 		c.checkObjects(w)
 	}
-	if len(w.problems) > 0 {
+	if w.dropped > 0 {
+		w.problems = append(w.problems, cli.Problem{Code: cli.CodeConfigMore, Message: fmt.Sprintf("还有 %d 处问题没有列出", w.dropped), Hint: "先改掉上面这些，再重新检查"})
+	}
+	if w.failed() {
 		return nil, w.problems, nil
 	}
 	return c, nil, nil
@@ -230,7 +233,7 @@ func (c *Config) add(o *Object) {
 // ids, references, cycles and the rules sing-box only enforces at start.
 func (c *Config) checkObjects(w *walker) {
 	problem := func(o *Object, code, path, hint, format string, args ...any) {
-		w.problems = append(w.problems, cli.Problem{Code: code, Path: path, Object: o.Label(), Message: fmt.Sprintf(format, args...), Hint: hint})
+		w.problemFor(o.Label(), code, path, hint, format, args...)
 	}
 
 	// Lines and groups share a namespace because both are outbounds.
@@ -285,7 +288,13 @@ func (c *Config) checkObjects(w *walker) {
 	}
 	for _, o := range append(append([]*Object{}, c.Lines...), c.Groups...) {
 		if d := o.Value.Get("detour"); d != nil {
-			outboundRef(o, o.Path+".detour", d.String, false)
+			if d.String == Direct {
+				// sing-box refuses every dial through an empty direct
+				// detour, but only when traffic arrives.
+				problem(o, cli.CodeConfigReference, o.Path+".detour", "去掉 detour，不写就是直连", "detour 不能是 direct")
+			} else {
+				outboundRef(o, o.Path+".detour", d.String, false)
+			}
 		}
 		if members := o.Value.Get("outbounds"); members != nil {
 			ids := map[string]bool{}
@@ -319,7 +328,7 @@ func (c *Config) checkObjects(w *walker) {
 		}
 		outboundRef(&s.Object, s.Path+".final", s.Final, true)
 	}
-	if len(w.problems) > 0 {
+	if w.failed() {
 		return
 	}
 
@@ -409,11 +418,11 @@ func (c *Config) checkPlugin(o *Object, w *walker) {
 		return
 	}
 	if o.Value.Get("plugin") == nil {
-		w.problems = append(w.problems, cli.Problem{Code: cli.CodeConfigValue, Path: o.Path + ".plugin_opts", Object: o.Label(), Message: "写了 plugin_opts 却没写 plugin"})
+		w.problemFor(o.Label(), cli.CodeConfigValue, o.Path+".plugin_opts", "", "写了 plugin_opts 却没写 plugin")
 		return
 	}
 	if msg := pluginOptions(o.Value)(opts); msg != "" {
-		w.problems = append(w.problems, cli.Problem{Code: cli.CodeConfigValue, Path: o.Path + ".plugin_opts", Object: o.Label(), Message: msg})
+		w.problemFor(o.Label(), cli.CodeConfigValue, o.Path+".plugin_opts", "", "%s", msg)
 	}
 }
 
@@ -427,7 +436,7 @@ const (
 // sing-box only rejects when starting, or not at all, ARCHITECTURE.md 2.4.
 func checkCrossField(o *Object, w *walker) {
 	problem := func(path, format string, args ...any) {
-		w.problems = append(w.problems, cli.Problem{Code: cli.CodeConfigValue, Path: path, Object: o.Label(), Message: fmt.Sprintf(format, args...)})
+		w.problemFor(o.Label(), cli.CodeConfigValue, path, "", format, args...)
 	}
 	if o.Type == "urltest" {
 		interval := durationOr(o.Value.Get("interval"), defaultURLTestInterval)

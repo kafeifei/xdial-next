@@ -24,6 +24,7 @@ type Code struct {
 	Exit    int    `json:"exit,omitempty"`
 	Problem bool   `json:"problem,omitempty"`
 	Summary string `json:"summary"`
+	Hint    string `json:"hint,omitempty"` // printed when the error carries none
 }
 
 // Error codes, ARCHITECTURE.md 5.4. A code is never renamed or reused; a
@@ -47,6 +48,7 @@ const (
 	CodeConfigCycle          = "config.cycle"
 	CodeConfigDuplicateID    = "config.duplicate_id"
 	CodeConfigCompile        = "config.compile"
+	CodeConfigMore           = "config.more"
 )
 
 var codes = map[string]Code{}
@@ -59,12 +61,12 @@ func register(code Code) {
 }
 
 func init() {
-	register(Code{Name: CodeUsage, Exit: ExitUsage, Summary: "命令、参数或选项不对"})
-	register(Code{Name: CodeInputRead, Exit: ExitMissing, Summary: "读不到输入文件或 stdin：不存在、读出错"})
-	register(Code{Name: CodeInputPermission, Exit: ExitPermission, Summary: "没有权限读输入文件"})
-	register(Code{Name: CodeConfigInvalid, Exit: ExitNegative, Summary: "配置有问题，详情在 problems"})
-	register(Code{Name: CodeConfigVersion, Exit: ExitNegative, Summary: "配置的 version 比这个 XDial 新"})
-	register(Code{Name: CodeInternal, Exit: ExitInternal, Summary: "XDial 自己的错误"})
+	register(Code{Name: CodeUsage, Exit: ExitUsage, Summary: "命令、参数或选项不对", Hint: "运行 xdial schema 查看全部命令"})
+	register(Code{Name: CodeInputRead, Exit: ExitMissing, Summary: "读不到输入文件或 stdin：不存在、读出错", Hint: "确认文件存在、路径写对"})
+	register(Code{Name: CodeInputPermission, Exit: ExitPermission, Summary: "没有权限读输入文件", Hint: "检查文件权限"})
+	register(Code{Name: CodeConfigInvalid, Exit: ExitNegative, Summary: "配置有问题，详情在 problems", Hint: "按 problems 逐条修改后重新检查"})
+	register(Code{Name: CodeConfigVersion, Exit: ExitNegative, Summary: "配置的 version 比这个 XDial 新", Hint: "升级 xdial"})
+	register(Code{Name: CodeInternal, Exit: ExitInternal, Summary: "XDial 自己的错误", Hint: "这是缺陷，请附上命令和输出报告"})
 
 	register(Code{Name: CodeConfigSyntax, Problem: true, Summary: "JSON 语法错误"})
 	register(Code{Name: CodeConfigUnknownKey, Problem: true, Summary: "没有登记的键，或者大小写不一致"})
@@ -77,6 +79,7 @@ func init() {
 	register(Code{Name: CodeConfigCycle, Problem: true, Summary: "detour 和组成员成环"})
 	register(Code{Name: CodeConfigDuplicateID, Problem: true, Summary: "id 重复"})
 	register(Code{Name: CodeConfigCompile, Problem: true, Summary: "编译出的 sing-box 配置没通过检查"})
+	register(Code{Name: CodeConfigMore, Problem: true, Summary: "问题太多，只列出了前面的，这一条给出没列出的数量"})
 }
 
 // Lookup returns the registration of a code.

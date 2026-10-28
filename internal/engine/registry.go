@@ -29,8 +29,10 @@ import (
 // list admits and the ones XDial's generated configuration needs,
 // ARCHITECTURE.md 2.3. Upstream's include package also registers tor,
 // bridge, snell and services such as api and ssmapi; leaving it out keeps
-// them out of reach entirely. No service is registered.
-func Context(ctx context.Context) context.Context {
+// them out of reach entirely. No service is registered. The context also
+// carries the second line of defense of guard.go; allowed lists the only
+// directories sing-box may touch.
+func Context(ctx context.Context, allowed ...string) context.Context {
 	inbounds := inbound.NewRegistry()
 	tun.RegisterInbound(inbounds)
 	mixed.RegisterInbound(inbounds)
@@ -55,5 +57,5 @@ func Context(ctx context.Context) context.Context {
 	openconnect.RegisterDNSTransport(resolvers)
 	tailscale.RegistryTransport(resolvers)
 
-	return box.Context(ctx, inbounds, outbounds, endpoints, resolvers, service.NewRegistry(), certificate.NewRegistry())
+	return box.Context(guard(ctx, allowed...), inbounds, outbounds, endpoints, resolvers, service.NewRegistry(), certificate.NewRegistry())
 }

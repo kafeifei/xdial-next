@@ -29,10 +29,12 @@ cat > "$work/config.jsonc" << 'EOF'
   "mixed": { "port": 17890, "username": "e2e", "password": { "secret": "mixed" } },
   "lines": [
     { "id": "hk", "type": "trojan", "server": "hk.example.com", "server_port": 443,
-      "password": { "secret": "hk" }, "tls": { "enabled": true, "server_name": "hk.example.com" } }
+      "password": { "secret": "hk" }, "tls": { "enabled": true, "server_name": "hk.example.com" } },
+    { "id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://vpn.corp.example",
+      "username": "e2e", "password": { "secret": "corp" } }
   ],
   "rule_sets": [{ "id": "corp", "type": "inline", "rules": [{ "domain_suffix": ["corp.example"] }] }],
-  "scenarios": [{ "id": "office", "rules": [{ "rule_set": "corp", "line": "hk" }], "final": "direct" }]
+  "scenarios": [{ "id": "office", "rules": [{ "rule_set": "corp", "line": "corp" }], "final": "hk" }]
 }
 EOF
 if out="$("$xdial" config check "$work/config.jsonc" --json 2>&1)" && jq -e '.ok and .result.scenarios == ["office"]' <<< "$out" > /dev/null; then

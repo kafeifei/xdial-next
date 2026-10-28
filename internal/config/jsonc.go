@@ -66,6 +66,7 @@ func (v *Value) Get(key string) *Value {
 const (
 	MaxDocumentSize = 4 << 20
 	maxDepth        = 64
+	maxNodes        = 500_000
 )
 
 // SyntaxError is a document that is not JSON with comments.
@@ -124,6 +125,7 @@ func Parse(data []byte) (*Value, error) {
 
 type parser struct {
 	data   []byte
+	nodes  int
 	pos    int
 	line   int
 	column int
@@ -188,6 +190,10 @@ func (p *parser) skipSpace() {
 func (p *parser) value(depth int) *Value {
 	if depth > maxDepth {
 		p.fail("嵌套超过 %d 层", maxDepth)
+		return nil
+	}
+	if p.nodes++; p.nodes > maxNodes {
+		p.fail("值超过 %d 个", maxNodes)
 		return nil
 	}
 	v := &Value{Line: p.line, Column: p.column}

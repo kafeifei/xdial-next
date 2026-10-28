@@ -3,9 +3,14 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/option"
 
 	"github.com/kafeifei/xdial-next/internal/config"
 )
@@ -209,5 +214,138 @@ func TestCheckRunsInAChild(t *testing.T) {
 	}
 	if err := Check(context.Background(), exe, []byte(`{"outbounds": [{"type": "tor", "tag": "t"}]}`)); err == nil {
 		t.Error("a type outside the registry passed the check")
+	}
+}
+
+func TestGuardRefusesFilesAndFeatures(t *testing.T) {
+	dir := t.TempDir()
+	cert := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(cert, []byte("not used"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Built by hand, past the classification table, to reach the guard.
+	readsFile := `{"outbounds": [{"type": "trojan", "tag": "t", "server": "t.example", "server_port": 443, "password": "x",
+		"tls": {"enabled": true, "certificate_path": "` + cert + `"}}]}`
+	if err := CheckInProcess([]byte(readsFile)); err == nil || !strings.Contains(err.Error(), "XDial 不允许") {
+		t.Errorf("certificate_path read through the guard: %v", err)
+	}
+	ssh := `{"endpoints": [{"type": "tailscale", "tag": "ts", "state_directory": "` + dir + `", "ssh_server": true}]}`
+	if err := CheckInProcess([]byte(ssh)); err == nil || !strings.Contains(err.Error(), "XDial 不允许") {
+		t.Errorf("tailscale ssh_server passed the security policy: %v", err)
+	}
+}
+
+func TestMixedInboundListensOnLoopbackWithUsers(t *testing.T) {
+	c := loadFile(t, "testdata/example.jsonc")
+	_, doc := compile(t, c, "office")
+	var mixed map[string]any
+	for _, in := range doc["inbounds"].([]any) {
+		if m := in.(map[string]any); m["type"] == "mixed" {
+			mixed = m
+		}
+	}
+	if mixed == nil {
+		t.Fatal("no mixed inbound")
+	}
+	users := mixed["users"].([]any)
+	if mixed["listen"] != "127.0.0.1" || len(users) != 1 || users[0].(map[string]any)["password"] == "" {
+		t.Errorf("mixed inbound must listen on loopback with a user: %v", mixed)
+	}
+	if mixed["set_system_proxy"] != nil {
+		t.Error("mixed inbound must not touch the system proxy")
+	}
+}
+
+func TestCheckUnavailable(t *testing.T) {
+	err := Check(context.Background(), filepath.Join(t.TempDir(), "missing"), []byte("{}"))
+	if !errors.Is(err, ErrCheckUnavailable) {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestDNSOrderAndUsedSetsOnly(t *testing.T) {
+	c := loadDoc(t, `{"version": 1,
+		"lines": [
+			{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "hk"}},
+			{"id": "corp", "type": "openconnect", "server": "https://vpn.example"}
+		],
+		"rule_sets": [
+			{"id": "corp-names", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]},
+			{"id": "ads", "type": "inline", "rules": [{"domain_suffix": ["ads.example"]}]}
+		],
+		"scenarios": [{"id": "s", "rules": [
+			{"rule_set": "corp-names", "line": "corp"},
+			{"rule_set": "ads", "line": "block"}
+		], "final": "hk"}]}`)
+	r, doc := compile(t, c, "s")
+	if err := CheckInProcess(r.JSON); err != nil {
+		t.Fatalf("sing-box check failed: %v", err)
+	}
+	dns := rules(doc, "dns")
+	var kinds []string
+	for _, rule := range dns {
+		switch {
+		case rule["inbound"] != nil:
+			kinds = append(kinds, "reject-endpoint")
+		case rule["preferred_by"] != nil:
+			kinds = append(kinds, "pushed")
+		default:
+			kinds = append(kinds, "scenario")
+		}
+	}
+	if got := strings.Join(kinds, " "); got != "reject-endpoint scenario pushed" {
+		t.Errorf("DNS rule order %q", got)
+	}
+	// corp is an endpoint: names chosen for it resolve locally, 3.3.
+	if dns[1]["server"] != tagDNSLocal {
+		t.Errorf("names routed to an endpoint resolve with %v", dns[1]["server"])
+	}
+	// The block rule's set gets no DNS-only copy.
+	for _, set := range doc["route"].(map[string]any)["rule_set"].([]any) {
+		if set.(map[string]any)["tag"] == dnsRuleSet+"ads" {
+			t.Error("a DNS-only rule set was compiled for a rule no DNS rule uses")
+		}
+	}
+}
+
+// TestCompiledConfigurationStarts goes past box.New, which never resolves
+// references between generated parts: starting wires every outbound, rule
+// set and DNS server together. TUN, endpoints and mixed are left out, as
+// they need root, the network or a free port.
+func TestCompiledConfigurationStarts(t *testing.T) {
+	c := loadDoc(t, `{"version": 1,
+		"lines": [
+			{"id": "a", "type": "trojan", "server": "a.example", "server_port": 443, "password": {"secret": "a"}},
+			{"id": "b", "type": "vless", "server": "b.example", "server_port": 443, "uuid": {"secret": "b"}, "detour": "a"}
+		],
+		"groups": [{"id": "proxy", "type": "urltest", "outbounds": ["a", "b"]}],
+		"rule_sets": [
+			{"id": "names", "type": "inline", "rules": [{"domain_suffix": ["x.example"]}, {"ip_cidr": ["192.0.2.0/24"]}]},
+			{"id": "ips", "type": "inline", "rules": [{"ip_cidr": ["198.51.100.0/24"]}]}
+		],
+		"scenarios": [{"id": "s", "rules": [
+			{"rule_set": "names", "line": "proxy"},
+			{"rule_set": "ips", "line": "block"},
+			{"rule_set": "names", "line": "b", "invert": true}
+		], "final": "proxy"}]}`)
+	r, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(Context(context.Background()))
+	defer cancel()
+	var opts option.Options
+	if err := opts.UnmarshalJSONContext(ctx, r.JSON); err != nil {
+		t.Fatal(err)
+	}
+	instance, err := box.New(box.Options{Context: ctx, Options: opts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Start(); err != nil {
+		t.Errorf("compiled configuration does not start: %v\n%s", err, r.JSON)
+	}
+	if err := instance.Close(); err != nil {
+		t.Error(err)
 	}
 }

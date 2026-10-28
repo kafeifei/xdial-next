@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	box "github.com/sagernet/sing-box"
@@ -65,37 +66,56 @@ func RunCheckChild(stdin io.Reader, stdout io.Writer) int {
 	return 0
 }
 
-// ErrCheckCrashed is a child that died without a report, as when sing-box
-// panics on something the value checks let through.
-var ErrCheckCrashed = errors.New("sing-box 检查进程异常退出")
+// ErrCheckUnavailable means the check child could not run at all. That is
+// XDial's own failure, not a problem in the configuration.
+var ErrCheckUnavailable = errors.New("sing-box 检查进程起不来")
 
 // Check runs CheckInProcess in a one-shot child of executable, so a panic in
 // sing-box takes down the child and not the caller. The configuration it
-// checks holds placeholders, never real secrets.
+// checks holds placeholders, never real secrets. Any error other than
+// ErrCheckUnavailable is the configuration's.
 func Check(ctx context.Context, executable string, compiled []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, executable, CheckCommand)
 	cmd.Stdin = bytes.NewReader(compiled)
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &limitedWriter{w: &stdout, n: maxReport}
-	cmd.Stderr = io.Discard
+	cmd.Stderr = &limitedWriter{w: &stderr, n: 4096}
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
-	runErr := cmd.Run()
+	cmd.WaitDelay = 2 * time.Second
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("%w：%v", ErrCheckUnavailable, err)
+	}
+	runErr := cmd.Wait()
 	var r report
 	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("sing-box 检查超过 %s 没有结束", checkTimeout)
+			return fmt.Errorf("sing-box 检查超过 %s 没有结束，配置可能太大或太复杂", checkTimeout)
 		}
-		return ErrCheckCrashed
+		return fmt.Errorf("sing-box 检查进程异常退出：%s", panicLine(stderr.String()))
 	}
 	if r.OK && runErr == nil {
 		return nil
 	}
 	if r.Error == "" {
-		return ErrCheckCrashed
+		return fmt.Errorf("sing-box 检查进程异常退出：%s", panicLine(stderr.String()))
 	}
 	return errors.New(r.Error)
+}
+
+// panicLine picks the line that says what went wrong out of a crash's
+// stderr, so the problem points somewhere without dumping a stack.
+func panicLine(stderr string) string {
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(line, "panic:") || strings.HasPrefix(line, "fatal error:") {
+			if len(line) > 200 {
+				line = line[:200]
+			}
+			return line
+		}
+	}
+	return "没有输出原因"
 }
 
 type limitedWriter struct {

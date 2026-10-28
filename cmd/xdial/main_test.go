@@ -341,3 +341,41 @@ func TestEveryErrorCodeIsRegistered(t *testing.T) {
 		t.Errorf("unregistered code printed: %d %s", code, out.String())
 	}
 }
+
+func TestPanicIsReportedAsInternal(t *testing.T) {
+	// A nil stdin makes reading "-" panic; the contract must still hold.
+	var out, errOut bytes.Buffer
+	code := run([]string{"config", "check", "-", "--json"}, nil, &out, &errOut)
+	if code != cli.ExitInternal || contract(t, out.String(), errOut.String())["error"].(map[string]any)["code"] != cli.CodeInternal {
+		t.Errorf("panic: exit %d %q", code, out.String())
+	}
+}
+
+func TestJSONBeforeTheCommand(t *testing.T) {
+	code, stdout, stderr := execute("--json", "version")
+	if code != 0 {
+		t.Fatalf("exit %d %s %s", code, stdout, stderr)
+	}
+	contract(t, stdout, stderr)
+}
+
+func TestUnreachableLinesAreChecked(t *testing.T) {
+	// The scenario never reaches "spare", yet the whole-configuration check
+	// still compiles it, ARCHITECTURE.md 3.1.
+	doc := `{"version": 1,
+		"lines": [{"id": "spare", "type": "trojan", "server": "s.example", "server_port": 443, "password": {"secret": "s"},
+			"multiplex": {"enabled": true, "brutal": {"enabled": true, "up_mbps": 0}}}],
+		"scenarios": [{"id": "s", "rules": [], "final": "direct"}]}`
+	path := filepath.Join(t.TempDir(), "c.jsonc")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := execute("config", "check", path, "--json")
+	if code != cli.ExitNegative {
+		t.Fatalf("exit %d %s", code, stdout)
+	}
+	e := contract(t, stdout, stderr)["error"].(map[string]any)
+	if !strings.Contains(fmt.Sprint(e["problems"]), "整份配置") {
+		t.Errorf("problems %v", e["problems"])
+	}
+}

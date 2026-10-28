@@ -12,6 +12,31 @@ import (
 	"github.com/sagernet/sing-box/schema"
 )
 
+// omitted lists the keys sing-box marks schema:"omit", which it does for
+// deprecated fields; ARCHITECTURE.md 2.4 forbids every one of them.
+func omitted(t reflect.Type) map[string]bool {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	keys := map[string]bool{}
+	if t.Kind() != reflect.Struct {
+		return keys
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		switch {
+		case name == "" && f.Anonymous:
+			for k := range omitted(f.Type) {
+				keys[k] = true
+			}
+		case name != "" && name != "-" && f.Tag.Get("schema") == "omit":
+			keys[name] = true
+		}
+	}
+	return keys
+}
+
 // jsonKeys lists the JSON keys a sing-box option struct accepts, flattening
 // embedded structs. Fields tagged json:"-" are variants merged by custom
 // unmarshalling; callers that need them name them explicitly.
@@ -105,6 +130,11 @@ func compare(t *testing.T, path string, fields map[string]*Spec, typ reflect.Typ
 	}
 	for _, k := range extra {
 		upstream[k] = nil
+	}
+	for key := range omitted(typ) {
+		if spec, ok := fields[key]; ok && spec.Class != Forbidden {
+			t.Errorf("%s.%s: sing-box deprecates this field, so the table must forbid it", path, key)
+		}
 	}
 	for key, ft := range upstream {
 		spec, ok := fields[key]

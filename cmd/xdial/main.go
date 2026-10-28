@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/kafeifei/xdial-next/internal/buildinfo"
 	"github.com/kafeifei/xdial-next/internal/cli"
@@ -75,15 +76,33 @@ func commands() []*command {
 
 const usageHint = "运行 xdial schema 查看全部命令"
 
-// run executes one command line and returns the exit code.
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+// checkDeadline bounds config check as a whole.
+const checkDeadline = 2 * time.Minute
+
+// run executes one command line and returns the exit code. A panic is a
+// defect: it is still reported in the output contract, as internal.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
+	// --json may stand anywhere before "--", the command words included.
 	asJSON := false
-	for _, a := range args {
+	var rest []string
+	for i, a := range args {
+		if a == "--" {
+			rest = append(rest, args[i:]...)
+			break
+		}
 		if a == "--json" {
 			asJSON = true
+			continue
 		}
+		rest = append(rest, a)
 	}
+	args = rest
 	out := cli.Output{Stdout: stdout, Stderr: stderr, JSON: asJSON}
+	defer func() {
+		if r := recover(); r != nil {
+			code = out.Fail(cli.Errorf(cli.CodeInternal, "", "xdial 内部错误：%v", r))
+		}
+	}()
 
 	var words []string
 	for _, a := range args {
@@ -108,9 +127,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	ctx := &context_{options: map[string]string{}, stdin: stdin, out: out}
 	known := map[string]bool{}
 	for _, o := range cmd.Options {
-		known[o.Name] = true
+		if o.Name != "--json" {
+			known[o.Name] = true
+		}
 	}
-	rest := args[len(cmd.Path):]
+	rest = args[len(cmd.Path):]
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		if !strings.HasPrefix(a, "-") || a == "-" {
@@ -229,10 +250,24 @@ func runConfigCheck(ctx *context_) int {
 		targets = append(targets, s.ID)
 		report.Scenarios = append(report.Scenarios, s.ID)
 	}
+	// One deadline bounds the whole check, and scenarios that compile to the
+	// same configuration are checked once.
+	deadline, cancel := context.WithTimeout(context.Background(), checkDeadline)
+	defer cancel()
+	checked := map[string]error{}
 	for _, scenario := range targets {
 		result, err := engine.Compile(c, engine.Options{Scenario: scenario, StateDirectory: os.TempDir(), TUN: true})
 		if err == nil {
-			err = engine.Check(context.Background(), exe, result.JSON)
+			key := string(result.JSON)
+			cached, ok := checked[key]
+			if !ok {
+				cached = engine.Check(deadline, exe, result.JSON)
+				checked[key] = cached
+			}
+			err = cached
+		}
+		if errors.Is(err, engine.ErrCheckUnavailable) {
+			return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "%v", err))
 		}
 		if err != nil {
 			where, path := "整份配置", ""

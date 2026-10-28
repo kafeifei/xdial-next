@@ -154,9 +154,14 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 		doc["inbounds"] = inbounds
 	}
 
-	ruleSets, dnsSets := k.compileRuleSets()
+	ruleSets, candidates := k.compileRuleSets()
+	dns, used := k.dns(scenario, endpointIDs, candidates)
+	for _, id := range used {
+		set := candidates[id]
+		ruleSets = append(ruleSets, map[string]any{"type": "inline", "tag": set.tag, "rules": set.rules})
+	}
 	doc["route"] = k.route(scenario, endpointIDs, ruleSets)
-	doc["dns"] = k.dns(scenario, endpointIDs, dnsSets)
+	doc["dns"] = dns
 
 	out, err := json.Marshal(doc)
 	if err != nil {
@@ -217,7 +222,8 @@ func (k *compiler) inbounds() []any {
 }
 
 // compileRuleSets returns the rule sets for routing and, for each, the
-// DNS-only rule set built from its pure domain rules, ARCHITECTURE.md 3.3.
+// candidate DNS-only rule set built from its pure domain rules,
+// ARCHITECTURE.md 3.3. A candidate is compiled only if a DNS rule uses it.
 func (k *compiler) compileRuleSets() (route []any, dns map[string]dnsSet) {
 	dns = map[string]dnsSet{}
 	for _, o := range k.c.RuleSets {
@@ -242,9 +248,7 @@ func (k *compiler) compileRuleSets() (route []any, dns map[string]dnsSet) {
 			}
 		}
 		if len(domainRules) > 0 {
-			tag := dnsRuleSet + o.ID
-			route = append(route, map[string]any{"type": "inline", "tag": tag, "rules": domainRules})
-			dns[o.ID] = dnsSet{tag: tag, complete: len(domainRules) == len(rules)}
+			dns[o.ID] = dnsSet{tag: dnsRuleSet + o.ID, rules: domainRules, complete: len(domainRules) == len(rules)}
 		}
 	}
 	return route, dns
@@ -252,6 +256,7 @@ func (k *compiler) compileRuleSets() (route []any, dns map[string]dnsSet) {
 
 type dnsSet struct {
 	tag      string
+	rules    []*config.Value
 	complete bool // every rule of the set is a pure domain rule
 }
 
@@ -345,7 +350,9 @@ func (k *compiler) route(scenario *config.Scenario, endpointIDs []string, ruleSe
 	return route
 }
 
-func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map[string]dnsSet) map[string]any {
+func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map[string]dnsSet) (map[string]any, []string) {
+	var used []string
+	seen := map[string]bool{}
 	servers := []any{map[string]any{"type": "local", "tag": tagDNSLocal}}
 	via := map[string]bool{}
 	server := func(line string) string {
@@ -375,6 +382,10 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 			if !ok || r.Line == config.Block || (r.Invert && !set.complete) {
 				continue
 			}
+			if !seen[r.RuleSet] {
+				seen[r.RuleSet] = true
+				used = append(used, r.RuleSet)
+			}
 			rule := map[string]any{"rule_set": []string{set.tag}, "action": "route", "server": server(r.Line)}
 			if r.Invert {
 				rule["invert"] = true
@@ -395,5 +406,5 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 	if len(rules) > 0 {
 		dns["rules"] = rules
 	}
-	return dns
+	return dns, used
 }

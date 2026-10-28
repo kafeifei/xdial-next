@@ -2,7 +2,10 @@ module github.com/kafeifei/xdial-next
 
 go 1.26.5
 
-require github.com/sagernet/sing-box v1.14.0-beta.2
+require (
+	github.com/sagernet/sing v0.8.12-0.20260721063414-596db5dd6ef4
+	github.com/sagernet/sing-box v1.14.0-beta.2
+)
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
@@ -71,7 +74,6 @@ require (
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a // indirect
 	github.com/sagernet/nftables v0.3.0-mod.4 // indirect
 	github.com/sagernet/quic-go v0.59.0-sing-box-mod.4 // indirect
-	github.com/sagernet/sing v0.8.12-0.20260721063414-596db5dd6ef4 // indirect
 	github.com/sagernet/sing-mux v0.3.5 // indirect
 	github.com/sagernet/sing-openconnect v0.0.0-20260722140139-e0c977659ca2 // indirect
 	github.com/sagernet/sing-shadowsocks v0.2.8 // indirect
