@@ -197,6 +197,9 @@ func runConfigCheck(ctx *context_) int {
 	var err error
 	if path == "-" {
 		data, err = io.ReadAll(io.LimitReader(ctx.stdin, config.MaxDocumentSize+1))
+		if err != nil {
+			err = cli.Errorf(cli.CodeInputRead, "", "读 stdin 出错：%v", err)
+		}
 	} else {
 		data, err = readFile(path)
 	}
@@ -267,9 +270,9 @@ func runConfigCheck(ctx *context_) int {
 
 	return ctx.out.Succeed("xdial.config.check/v1", report, func(w io.Writer) {
 		fmt.Fprintf(w, "配置没有问题（revision %s）\n", report.Revision[:12])
-		fmt.Fprintf(w, "场景：%s\n", strings.Join(report.Scenarios, "、"))
+		fmt.Fprintf(w, "场景：%s\n", cli.Escape(strings.Join(report.Scenarios, "、")))
 		for _, s := range report.Secrets {
-			fmt.Fprintf(w, "凭据 %s：%s\n", s.Name, strings.Join(s.References, "、"))
+			fmt.Fprintf(w, "凭据 %s：%s\n", cli.Escape(s.Name), cli.Escape(strings.Join(s.References, "、")))
 		}
 		for _, p := range report.Pending {
 			fmt.Fprintln(w, "没法离线验证：", cli.Escape(p))

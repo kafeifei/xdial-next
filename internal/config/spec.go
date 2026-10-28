@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -64,6 +65,8 @@ type Spec struct {
 	defaultVariant string                      // shapeUnion: the variant of an object without "type"
 	maxItems       int                         // arrays; 0 means the default cap
 	required       bool                        // the field must be present in its object
+	pattern        string                      // JSON Schema pattern, for strings whose check is a regular expression
+	minLen         int
 
 	// Placeholder produces a well-formed stand-in for a secret so the
 	// sing-box check never sees the real value, ARCHITECTURE.md 4.5. It may
@@ -452,10 +455,18 @@ func portRange() *Spec {
 }
 
 func httpsURL() *Spec {
-	return checked(&Spec{shape: shapeString, maxLen: 2048}, func(v *Value) string {
-		if !strings.HasPrefix(v.String, "https://") {
-			return "只能是 https 地址"
+	return checked(&Spec{shape: shapeString, maxLen: 2048}, func(v *Value) string { return checkHTTPS(v.String) })
+}
+
+func checkHTTPS(s string) string {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil {
+		return "只能是带主机名的 https 地址，不能带用户名和密码"
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > math.MaxUint16 {
+			return "端口不合法"
 		}
-		return ""
-	})
+	}
+	return ""
 }

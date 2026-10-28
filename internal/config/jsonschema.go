@@ -65,6 +65,12 @@ func specSchema(s *Spec) map[string]any {
 		if s.maxLen > 0 {
 			out["maxLength"] = s.maxLen
 		}
+		if s.minLen > 0 {
+			out["minLength"] = s.minLen
+		}
+		if s.pattern != "" {
+			out["pattern"] = s.pattern
+		}
 		return out
 	case shapeBool:
 		return map[string]any{"type": "boolean"}

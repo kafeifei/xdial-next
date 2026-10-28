@@ -128,6 +128,11 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 				continue
 			}
 			v := o.Value.Clone(k.replace).Without("id", "name").With("tag", config.String(o.ID))
+			if o.Kind == "line" {
+				// Without it sing-box hands a server name to the detour
+				// instead of resolving it here, ARCHITECTURE.md 3.3.
+				v = v.With("domain_resolver", config.String(tagDNSLocal))
+			}
 			if o.Type == "tailscale" {
 				v = v.With("state_directory", config.String(filepath.Join(opts.StateDirectory, o.ID)))
 			}
@@ -266,7 +271,11 @@ func placeholderRule() *config.Value {
 // the DNS stage can evaluate, ARCHITECTURE.md 3.3.
 func domainOnly(rule *config.Value) bool {
 	if t := rule.Get("type"); t != nil && t.String == "logical" {
-		for _, r := range rule.Get("rules").Items {
+		rules := rule.Get("rules")
+		if rules == nil || len(rules.Items) == 0 {
+			return false
+		}
+		for _, r := range rules.Items {
 			if !domainOnly(r) {
 				return false
 			}

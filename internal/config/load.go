@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/kafeifei/xdial-next/internal/cli"
 )
@@ -302,6 +303,7 @@ func (c *Config) checkObjects(w *walker) {
 		if o.Type == "shadowsocks" {
 			c.checkPlugin(o, w)
 		}
+		checkCrossField(o, w)
 	}
 	for _, o := range append(append([]*Object{}, c.RuleSets...), c.Subscriptions...) {
 		if via := o.Value.Get("download_via"); via != nil {
@@ -414,6 +416,51 @@ func (c *Config) checkPlugin(o *Object, w *walker) {
 		w.problems = append(w.problems, cli.Problem{Code: cli.CodeConfigValue, Path: o.Path + ".plugin_opts", Object: o.Label(), Message: msg})
 	}
 }
+
+// Defaults sing-box fills in, which cross-field checks compare against.
+const (
+	defaultURLTestInterval    = 3 * time.Minute
+	defaultURLTestIdleTimeout = 30 * time.Minute
+)
+
+// checkCrossField checks constraints between fields of one object that
+// sing-box only rejects when starting, or not at all, ARCHITECTURE.md 2.4.
+func checkCrossField(o *Object, w *walker) {
+	problem := func(path, format string, args ...any) {
+		w.problems = append(w.problems, cli.Problem{Code: cli.CodeConfigValue, Path: path, Object: o.Label(), Message: fmt.Sprintf(format, args...)})
+	}
+	if o.Type == "urltest" {
+		interval := durationOr(o.Value.Get("interval"), defaultURLTestInterval)
+		idle := durationOr(o.Value.Get("idle_timeout"), defaultURLTestIdleTimeout)
+		if interval > idle {
+			problem(o.Path+".interval", "interval（%s）不能大于 idle_timeout（%s）", interval, idle)
+		}
+	}
+	if tls := o.Value.Get("tls"); tls != nil {
+		lo, hi := tls.Get("min_version"), tls.Get("max_version")
+		if lo != nil && hi != nil && lo.String > hi.String {
+			problem(o.Path+".tls.min_version", "min_version %s 高于 max_version %s，没有可用的 TLS 版本", lo.String, hi.String)
+		}
+		if reality := tls.Get("reality"); reality != nil && isTrue(reality.Get("enabled")) {
+			if utls := tls.Get("utls"); utls == nil || !isTrue(utls.Get("enabled")) {
+				problem(o.Path+".tls.utls", "reality 需要同时开启 utls")
+			}
+		}
+	}
+}
+
+func durationOr(v *Value, fallback time.Duration) time.Duration {
+	if v == nil {
+		return fallback
+	}
+	d, err := time.ParseDuration(v.String)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
+func isTrue(v *Value) bool { return v != nil && v.Kind == KindBool && v.Bool }
 
 func indexOf(list []string, s string) int {
 	for i, item := range list {

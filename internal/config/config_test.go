@@ -159,6 +159,14 @@ func TestLoadProblems(t *testing.T) {
 		{"tailscale ssh", build(`{"id": "ts", "type": "tailscale", "ssh_server": true}`, "", "", ""), "config.forbidden_key@lines[0].ssh_server"},
 		{"openconnect wrapper", build(`{"id": "oc", "type": "openconnect", "server": "https://vpn.example", "csd": {"wrapper_path": "/bin/sh"}}`, "", "", ""), "config.forbidden_key@lines[0].csd"},
 		{"unknown top-level key", `{"version": 1, "inbounds": [], "scenarios": []}`, "config.unknown_key@inbounds"},
+		{"logical rule without rules", build("", "", `{"id": "x", "type": "inline", "rules": [{"type": "logical", "mode": "and"}]}`, ""), "config.value@rule_sets[1].rules[0].rules"},
+		{"header name with escape", build(`{"id": "v", "type": "vless", "server": "v.example", "server_port": 443, "uuid": {"secret": "v"}, "transport": {"type": "ws", "headers": {"\u001b[31m": "x"}}}`, "", "", ""), "config.value@lines[0].transport.headers.\x1b[31m"},
+		{"reality short id too long", build(`{"id": "v", "type": "vless", "server": "v.example", "server_port": 443, "uuid": {"secret": "v"}, "tls": {"enabled": true, "utls": {"enabled": true}, "reality": {"enabled": true, "public_key": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0", "short_id": "0123456789abcdef01"}}}`, "", "", ""), "config.value@lines[0].tls.reality.short_id"},
+		{"reality bad public key", build(`{"id": "v", "type": "vless", "server": "v.example", "server_port": 443, "uuid": {"secret": "v"}, "tls": {"enabled": true, "utls": {"enabled": true}, "reality": {"enabled": true, "public_key": "short"}}}`, "", "", ""), "config.value@lines[0].tls.reality.public_key"},
+		{"reality without utls", build(`{"id": "v", "type": "vless", "server": "v.example", "server_port": 443, "uuid": {"secret": "v"}, "tls": {"enabled": true, "reality": {"enabled": true, "public_key": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0"}}}`, "", "", ""), "config.value@lines[0].tls.utls"},
+		{"urltest interval above idle timeout", build("", `{"id": "g", "type": "urltest", "outbounds": ["direct"], "interval": "2m", "idle_timeout": "1m"}`, "", ""), "config.value@groups[0].interval"},
+		{"tls versions crossed", build(line(`, "tls": {"enabled": true, "min_version": "1.3", "max_version": "1.2"}`), "", "", ""), "config.value@lines[0].tls.min_version"},
+		{"https without host", build("", "", `{"id": "x", "type": "remote", "format": "binary", "url": "https://"}`, ""), "config.value@rule_sets[1].url"},
 		{"missing version", `{"scenarios": []}`, "config.value@version"},
 	}
 	for _, tc := range cases {

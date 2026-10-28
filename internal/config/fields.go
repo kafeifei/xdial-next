@@ -4,6 +4,8 @@ import (
 	"crypto/x509"
 	"encoding/base32"
 	"encoding/base64"
+	"encoding/hex"
+	"regexp"
 	"strings"
 
 	"github.com/sagernet/sing-box/transport/sip003"
@@ -30,7 +32,7 @@ const (
 )
 
 func idSpec() *Spec {
-	return checked(&Spec{shape: shapeString, maxLen: 63}, func(v *Value) string {
+	return checked(&Spec{shape: shapeString, maxLen: 63, pattern: idPattern.String()}, func(v *Value) string {
 		if !validID(v.String) {
 			return "id 只能用小写字母、数字和连字符，以字母或数字开头，最长 63 个字符"
 		}
@@ -154,15 +156,31 @@ func tlsFields() map[string]*Spec {
 				"chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random", "randomized"),
 		}),
 		"reality": obj(map[string]*Spec{
-			"enabled":    boolean(),
-			"public_key": str(),
-			"short_id":   str(),
+			"enabled": boolean(),
+			"public_key": checked(&Spec{shape: shapeString, maxLen: 64}, func(v *Value) string {
+				if key, err := base64.RawURLEncoding.DecodeString(v.String); err != nil || len(key) != 32 {
+					return "应该是不带填充的 base64url 编码的 32 字节公钥"
+				}
+				return ""
+			}),
+			// sing-box decodes short_id into an 8-byte array and panics on more.
+			"short_id": checked(&Spec{shape: shapeString, maxLen: 16}, func(v *Value) string {
+				if len(v.String)%2 != 0 {
+					return "short_id 应该是偶数个十六进制字符，最多 16 个"
+				}
+				if _, err := hex.DecodeString(v.String); err != nil {
+					return "short_id 应该是十六进制"
+				}
+				return ""
+			}),
 		}),
 	}
 }
 
+var headerToken = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$")
+
 func headerName(v *Value) string {
-	if v.String == "" || strings.ContainsAny(v.String, " \t\r\n:") {
+	if !headerToken.MatchString(v.String) {
 		return "不是合法的 HTTP 头名"
 	}
 	return ""
@@ -539,8 +557,8 @@ func headlessRuleSpec(depth int) *Spec {
 	if depth < 4 {
 		variants["logical"] = map[string]*Spec{
 			"type":   enum("logical"),
-			"mode":   enum("and", "or"),
-			"rules":  &Spec{shape: shapeArray, elem: headlessRuleSpec(depth + 1), maxItems: 64},
+			"mode":   req(enum("and", "or")),
+			"rules":  req(&Spec{shape: shapeArray, elem: headlessRuleSpec(depth + 1), maxItems: 64}),
 			"invert": boolean(),
 		}
 	}
@@ -573,12 +591,7 @@ func remoteURL() *Spec {
 		maxLen:      2048,
 		check:       func(v *Value) string { return httpsURL().check(v) },
 		Placeholder: func(*Value) string { return "https://xdial.invalid/rule-set" },
-		Format: func(value string, _ *Value) string {
-			if !strings.HasPrefix(value, "https://") {
-				return "只能是 https 地址"
-			}
-			return ""
-		},
+		Format:      func(value string, _ *Value) string { return checkHTTPS(value) },
 	}
 }
 
@@ -610,7 +623,7 @@ func scenarioSpec() *Spec {
 func mixedSpec() *Spec {
 	return obj(map[string]*Spec{
 		"port":     req(intRange(1024, 65535)),
-		"username": req(checked(&Spec{shape: shapeString, maxLen: 255}, nonEmpty)),
+		"username": req(checked(&Spec{shape: shapeString, maxLen: 255, minLen: 1}, nonEmpty)),
 		"password": req(password(255)),
 	})
 }

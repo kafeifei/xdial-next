@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -312,6 +313,23 @@ func TestConfigCheckInputErrors(t *testing.T) {
 	code, stdout, stderr = execute("config", "check", locked, "--json")
 	if code != cli.ExitPermission || contract(t, stdout, stderr)["error"].(map[string]any)["code"] != cli.CodeInputPermission {
 		t.Errorf("unreadable file: exit %d %s", code, stdout)
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("broken") }
+
+func TestConfigCheckStdin(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run([]string{"config", "check", "-", "--json"}, failingReader{}, &out, &errOut)
+	if code != cli.ExitMissing || contract(t, out.String(), errOut.String())["error"].(map[string]any)["code"] != cli.CodeInputRead {
+		t.Errorf("failing stdin: exit %d %s", code, out.String())
+	}
+	out.Reset()
+	code = run([]string{"config", "check", "-", "--json"}, strings.NewReader(`{"version": 1, "rule_sets": [{"id": "r", "type": "inline", "rules": [{"type": "logical", "mode": "and"}]}], "scenarios": []}`), &out, &errOut)
+	if code != cli.ExitNegative {
+		t.Errorf("logical rule without rules: exit %d %s", code, out.String())
 	}
 }
 

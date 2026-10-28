@@ -186,6 +186,13 @@ func TestOnlyReachableObjectsCompile(t *testing.T) {
 	if !got["a"] || !got["b"] || doc["endpoints"] != nil {
 		t.Errorf("compiled outbounds %v, endpoints %v", got, doc["endpoints"])
 	}
+	// Every line resolves its server name here, even behind a detour.
+	for _, o := range doc["outbounds"].([]any) {
+		m := o.(map[string]any)
+		if m["tag"] == "b" && m["domain_resolver"] != tagDNSLocal {
+			t.Errorf("line b behind a detour has domain_resolver %v", m["domain_resolver"])
+		}
+	}
 }
 
 func TestCheckRunsInAChild(t *testing.T) {
