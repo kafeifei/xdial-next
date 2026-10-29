@@ -335,7 +335,9 @@ func runDaemonInstall(ctx *context_) int {
 		return ctx.out.Fail(err)
 	}
 	defer os.Remove(staged)
-	_ = exec.Command("/bin/launchctl", "bootout", "system/"+l.ID).Run()
+	if err := bootout(l.ID); err != nil {
+		return ctx.out.Fail(err)
+	}
 	if err := os.Rename(staged, l.Bin()); err != nil {
 		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "替换二进制失败：%v", err))
 	}
@@ -461,7 +463,9 @@ func runDaemonUninstall(ctx *context_) int {
 		return ctx.out.Fail(err)
 	}
 	l := layout()
-	_ = exec.Command("/bin/launchctl", "bootout", "system/"+l.ID).Run()
+	if err := bootout(l.ID); err != nil {
+		return ctx.out.Fail(err)
+	}
 	// The resolver key goes with the daemon's session; remove it again in
 	// case an older daemon left one that is not temporary.
 	_ = sysdns.Clear(l.DNSKey())
@@ -614,4 +618,24 @@ func runSubscriptionUpdate(ctx *context_) int {
 			fmt.Fprintln(w, "新内容在下一次连接或切场景时生效")
 		}
 	})
+}
+
+// bootoutTimeout bounds the wait for the running daemon to go. It stops
+// only after the connection request in progress, which can take half a
+// minute, and launchd kills it 20 seconds after asking.
+const bootoutTimeout = 60 * time.Second
+
+// bootout stops the running daemon and waits until launchd no longer has
+// the job: until then bootstrapping it again fails with an I/O error, and
+// the daemon may still be cleaning up what install or uninstall replaces.
+func bootout(id string) error {
+	_ = exec.Command("/bin/launchctl", "bootout", "system/"+id).Run()
+	deadline := time.Now().Add(bootoutTimeout)
+	for exec.Command("/bin/launchctl", "print", "system/"+id).Run() == nil {
+		if time.Now().After(deadline) {
+			return cli.Errorf(cli.CodeInternal, "", "旧的 daemon %s 内没有停下", bootoutTimeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return nil
 }
