@@ -799,9 +799,9 @@ func TestCorruptCacheIsNotConnectedFrom(t *testing.T) {
 	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
 	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
 	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"process_name": ["x"], "query_type": ["A"]}]}`)
-	// Listing reads what the cache says; connecting checks the content
-	// again, and content that fails is not used.
-	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceMissing)
+	// Connecting checks the cached content: content that fails is not
+	// used but downloaded again, which the test network refuses.
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceDownload)
 }
 
 func TestRuleSetUpdateRefusesLoopback(t *testing.T) {

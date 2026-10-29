@@ -144,9 +144,15 @@ func (d *Daemon) fetchFor(cfg *config.Config, scenario string) error {
 		if err != nil {
 			return err
 		}
-		if _, ok := d.ruleSetMeta(o, url); ok {
+		// Checked, not just present: content that no longer passes is
+		// dropped and downloaded again.
+		if _, _, ok := d.cachedRules(o, url); ok {
 			continue
 		}
+		d.dropInvalid(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), func() bool {
+			_, _, ok := d.cachedRules(o, url)
+			return ok
+		})
 		if _, err := d.downloadRuleSet(cfg, o, secrets); err != nil {
 			return prefixed(err, fmt.Sprintf("场景 %s 用到的规则集 %s 还没下载，下载失败：", scenario, o.ID))
 		}
@@ -167,6 +173,10 @@ func (d *Daemon) cachedRuleSets(cfg *config.Config, scenario string, secrets map
 		}
 		_, rules, ok := d.cachedRules(o, url)
 		if !ok {
+			d.dropInvalid(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), func() bool {
+				_, _, ok := d.cachedRules(o, url)
+				return ok
+			})
 			d.wakeResources()
 			return nil, cli.Errorf(cli.CodeResourceMissing, "用 xdial rule-set update "+o.ID+" 下载", "场景 %s 用到的规则集 %s 还没下载", scenario, o.ID)
 		}
@@ -176,6 +186,22 @@ func (d *Daemon) cachedRuleSets(cfg *config.Config, scenario string, secrets map
 		content[o.ID] = rules
 	}
 	return content, nil
+}
+
+// dropInvalid removes a cached file whose content no longer passes the
+// checks, so the background loop downloads it again instead of trusting
+// its age. It never waits for d.res, which a download may hold for
+// minutes while the caller holds d.ctl; when a download is running it
+// leaves the file to that download.
+func (d *Daemon) dropInvalid(path string, valid func() bool) {
+	if !d.res.TryLock() {
+		return
+	}
+	defer d.res.Unlock()
+	if _, err := os.Stat(path); err == nil && !valid() {
+		_ = os.Remove(path)
+		d.events.add("cache_dropped", map[string]any{"file": filepath.Base(path)})
+	}
 }
 
 // ruleSetMeta reads what the cache says about a rule set without checking
