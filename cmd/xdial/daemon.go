@@ -434,7 +434,11 @@ func ownedInfo(path string, info os.FileInfo, owners []uint32, dir bool) error {
 	if info.Mode().Perm()&0o022 != 0 && !(dir && info.Mode()&os.ModeSticky != 0) {
 		return cli.Errorf(cli.CodeInputPermission, "chmod go-w 之后再装", "%s 属主以外的人能改", path)
 	}
-	if hasACL(path) {
+	acl, err := hasACL(path)
+	if err != nil {
+		return cli.Errorf(cli.CodeInputPermission, "", "没能检查 %s 的 ACL：%v", path, err)
+	}
+	if acl {
 		return cli.Errorf(cli.CodeInputPermission, "chmod -N 去掉 ACL 之后再装", "%s 带 ACL，别的用户可能改得了它", path)
 	}
 	return nil
@@ -442,14 +446,18 @@ func ownedInfo(path string, info os.FileInfo, owners []uint32, dir bool) error {
 
 // hasACL reports whether path carries an access control list; ls -le
 // prints its entries as numbered lines. Without cgo there is no direct
-// call, and any ACL is refused rather than interpreted.
-func hasACL(path string) bool {
-	out, err := exec.Command("/bin/ls", "-lde", path).Output()
+// call, and any ACL is refused rather than interpreted. Not being able to
+// tell is an error, never a no.
+func hasACL(path string) (bool, error) {
+	out, err := exec.Command(aclLister, "-lde", path).Output()
 	if err != nil {
-		return false
+		return false, err
 	}
-	return aclEntry.Match(out)
+	return aclEntry.Match(out), nil
 }
+
+// aclLister lists a path with its ACL; tests replace it.
+var aclLister = "/bin/ls"
 
 var aclEntry = regexp.MustCompile(`(?m)^\s*\d+: `)
 

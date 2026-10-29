@@ -17,6 +17,9 @@ ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
 
 mkdir -p "$out_dir/share"
 GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$out_dir/share/xdial" ./cmd/xdial
+# Go 不给 git worktree 里构建的二进制写 VCS 信息，这里自己记下构建时的提交，结果才对得上代码。
+commit="$(git rev-parse HEAD)$(git diff --quiet HEAD -- || echo -dirty)"
+echo "$commit" > "$out_dir/commit"
 # 默认跑 e2e/run.sh；XDIAL_E2E_CASES 可以换成别的用例文件，例如 e2e/experiments/ 下的实验。
 cp "${XDIAL_E2E_CASES:-e2e/run.sh}" "$out_dir/share/run.sh"
 
@@ -130,7 +133,7 @@ jq -R -c 'fromjson? | select(type == "object" and has("case"))' "$out_dir/output
 cat "$out_dir/results.jsonl"
 passed="$(jq -s '[.[] | select(.ok)] | length' "$out_dir/results.jsonl")"
 total="$(jq -s 'length' "$out_dir/results.jsonl")"
-echo "e2e: $passed/$total 通过，结果在 $out_dir/results.jsonl，原始输出在 $out_dir/output.log" >&2
+echo "e2e: $passed/$total 通过（提交 $commit），结果在 $out_dir/results.jsonl，原始输出在 $out_dir/output.log" >&2
 if (( status == 0 && (total == 0 || passed != total) )); then
   status=1
 fi

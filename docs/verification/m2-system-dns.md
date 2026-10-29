@@ -55,4 +55,4 @@ ARCHITECTURE.md 第 6 节里标"实测"的结论，出处都在这里。环境�
 - 连接中 `kill -9` daemon：0.5 秒后键已经不在。新 daemon 启动时不删这个键，所以键是随旧会话消失的；launchd 拉起新的 daemon 后恢复连接，只有一个引擎；
 - `kill -9` 引擎：0.3 秒后键已经不在（放行直连），随后自动重连；
 - 连接中重新 `daemon install`：装完自动恢复连接；
-- 断开和 `uninstall --purge` 之后，utun 个数、默认路由、resolver #1、DNS 和 HTTPS 都回到连接前，没有留下文件和进程。
+- 断开和 `uninstall --purge` 之后，没有带 172.19.0.1 的接口，默认路由、resolver #1、DNS 和 HTTPS 都回到连接前，没有留下文件和进程。用例只数带 XDial 地址的接口，不比 utun 总数：系统服务自己的 utun 在开机后会陆续增加。

@@ -464,6 +464,11 @@ func TestStageBinaryChecksTheSource(t *testing.T) {
 			t.Fatalf("chmod -N: %v %s", err, out)
 		}
 	}
+	aclLister = "/nonexistent/ls"
+	if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {
+		t.Errorf("a source whose ACL could not be checked was installed: %v", err)
+	}
+	aclLister = "/bin/ls"
 	t.Setenv("SUDO_UID", strconv.Itoa(os.Getuid()+1))
 	if os.Getuid() != 0 {
 		if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {

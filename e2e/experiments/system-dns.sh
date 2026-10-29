@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # M2 系统 DNS 的实验，结果记在 docs/verification/m2-system-dns.md。
 # 运行：XDIAL_E2E_CASES=e2e/experiments/system-dns.sh make e2e（约 15 分钟，大部分在等超时）。
-# 每一项都只报告观测到的事实（ok 恒为 true），结论由人对照记录。
+# 多数项只报告观测到的事实（ok 恒为 true），结论由人对照记录；回落实验按对照和观测断言。
 set -uo pipefail
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 work="$(mktemp -d)"
@@ -82,21 +82,18 @@ cat > "$work/dead.jsonc" << 'EOF'
 EOF
 "$xdial" config apply "$work/dead.jsonc" --json > /dev/null 2>&1
 printf 'x\n' | "$xdial" secret set dead --json > /dev/null 2>&1
-# 阳性对照：连接前的系统查询在 en0 上抓得到，说明抓包本身有效。
-sudo tcpdump -i en0 -n -l "udp port 53 or tcp port 53" > "$work/control.txt" 2> /dev/null &
-tdc=$!
+# 同一个抓包进程先做阳性对照（连接前的系统查询在 en0 上抓得到），再观测连接后的查询。
+sudo tcpdump -i en0 -n -l "udp port 53 or tcp port 53" > "$work/en0.txt" 2> "$work/tcpdump.err" &
+td=$!
 sleep 1
 cname="control-$RANDOM$RANDOM.example.org"
 dscacheutil -q host -a name "$cname" > /dev/null 2>&1
 sleep 1
-sudo kill $tdc 2> /dev/null
-report e4-capture-control true "query_on_en0_before_connect=$(grep -c "$cname" "$work/control.txt")"
+control="$(grep -c "$cname" "$work/en0.txt")"
+report e4-capture-control "$([[ "$control" -gt 0 ]] && echo true || echo false)" "query_on_en0_before_connect=$control"
 out="$("$xdial" connect --scenario dead --json 2>&1)"
 report e4-connect "$(jq -e .ok <<< "$out" > /dev/null 2>&1 && echo true || echo false)" "$(jq -c '.result.state // .error' <<< "$out" 2> /dev/null)"
 gw="$(route -n get default 2> /dev/null | awk '/gateway:/{print $2}')"
-sudo tcpdump -i en0 -n -l "udp port 53 or tcp port 53" > "$work/en0.txt" 2> /dev/null &
-td=$!
-sleep 1
 results=""
 for i in 1 2 3 4 5 6; do
   name="probe$i-$RANDOM.example.org"
@@ -106,10 +103,11 @@ for i in 1 2 3 4 5 6; do
 done
 apple="$(dscacheutil -q host -a name www.apple.com 2> /dev/null | awk '/ip_address/{print $2; exit}')"
 sleep 1
+alive="$(sudo kill -0 $td 2> /dev/null && echo yes || echo no)"
 sudo kill $td 2> /dev/null
 sleep 0.5
-q_en0="$(grep -c 'probe' "$work/en0.txt")"
-report e4-fallback true "gw=$gw first=$(first_resolver) results:$results apple=${apple:-none} en0_probe_pkts=$q_en0 sample=$(grep probe "$work/en0.txt" | head -3 | tr '\n' '|' | cut -c1-400)"
+q_en0="$(grep -c 'probe[0-9]-' "$work/en0.txt")"
+report e4-fallback "$([[ "$alive" == yes && "$control" -gt 0 && "$q_en0" == 0 ]] && echo true || echo false)" "capture_alive=$alive gw=$gw first=$(first_resolver) results:$results apple=${apple:-none} en0_probe_pkts=$q_en0 tcpdump_err=$(head -c 200 "$work/tcpdump.err" | tr '\n' ' ')"
 
 # E5：健康场景下 UDP 和 TCP 直接问 172.19.0.2；DDR 和 Firefox canary。
 "$xdial" scenario use ok --json > /dev/null 2>&1

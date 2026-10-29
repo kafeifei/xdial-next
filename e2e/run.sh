@@ -48,19 +48,20 @@ id="com.kafeifei.xdial.debug"
 data="/Library/Application Support/$id"
 
 facts() {
-  local utun route resolver dns http
-  utun="$(ifconfig -l | tr ' ' '\n' | grep -c '^utun')"
+  local tun route resolver dns http
+  # 只数带 XDial TUN 地址的接口：系统服务自己的 utun 个数会在开机后变化。
+  tun="$(ifconfig | grep -c 'inet 172\.19\.0\.1 ')"
   route="$(route -n get 1.1.1.1 2> /dev/null | awk '/interface:/{print $2}')"
   resolver="$(scutil --dns | awk '/^resolver #1/{f=1} f&&/nameserver\[0\]/{print $3; exit}')"
   dns="$(dscacheutil -q host -a name www.apple.com 2> /dev/null | awk '/ip_address/{print $2; exit}')"
   http="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' https://www.apple.com 2> /dev/null)"
-  jq -cn --arg utun "$utun" --arg route "$route" --arg resolver "$resolver" --arg dns "$dns" --arg http "$http" \
-    '{utun: $utun, route: $route, resolver: $resolver, dns: $dns, http: $http}'
+  jq -cn --arg tun "$tun" --arg route "$route" --arg resolver "$resolver" --arg dns "$dns" --arg http "$http" \
+    '{tun: $tun, route: $route, resolver: $resolver, dns: $dns, http: $http}'
 }
 base="$(facts)"
 report m2-baseline true "$base console=$(stat -f %Su /dev/console) me=$(id -un)"
 restored() {
-  jq -e --argjson b "$base" '.utun == $b.utun and .route == $b.route and .resolver == $b.resolver and .dns != "" and .http != "000" and .http != ""' <<< "$1" > /dev/null
+  jq -e --argjson b "$base" '.tun == "0" and .route == $b.route and .resolver == $b.resolver and .dns != "" and .http != "000" and .http != ""' <<< "$1" > /dev/null
 }
 check() { if eval "$2"; then report "$1" true "$3"; else report "$1" false "$3"; fi; }
 key="State:/Network/Service/$id/DNS"
@@ -97,7 +98,7 @@ fi
 check m2-connect "jq -e '.ok and .result.state == \"connected\" and .result.system_dns and (.result.physical_dns | length) > 0' <<< '${out%% |*}' > /dev/null" "$out"
 sleep 2
 during="$(facts)"
-check m2-connected-facts "jq -e --argjson b '$base' '.utun != \$b.utun and (.route | startswith(\"utun\")) and .resolver == \"172.19.0.2\" and .dns != \"\" and .http == \"200\"' <<< '$during' > /dev/null" "$during"
+check m2-connected-facts "jq -e --argjson b '$base' '.tun == \"1\" and (.route | startswith(\"utun\")) and .resolver == \"172.19.0.2\" and .dns != \"\" and .http == \"200\"' <<< '$during' > /dev/null" "$during"
 # 发一次系统查询，在引擎日志里看到它的应答，才算系统查询进了 sing-box。sing-box 在 info 级别只记有
 # 应答记录的查询，所以用一个真实存在、虚拟机平时不会查的名字，比较查询前后日志里它出现的行数。
 probe_name="example.org"
@@ -169,7 +170,7 @@ done
 sleep 2
 engines="$(pgrep -f "xdial __engine" | wc -l | tr -d ' ')"
 resumed="$(facts)"
-check m2-daemon-killed-resumes "[[ '$gone' == 0 ]] && jq -e '.ok and .result.state == \"connected\"' <<< '$st' > /dev/null && [[ '$engines' == 1 ]] && jq -e --argjson b '$base' '(.utun | tonumber) == ((\$b.utun | tonumber) + 1) and .resolver == \"172.19.0.2\" and .http == \"200\"' <<< '$resumed' > /dev/null" "key_after_kill=$gone engines=$engines $resumed"
+check m2-daemon-killed-resumes "[[ '$gone' == 0 ]] && jq -e '.ok and .result.state == \"connected\"' <<< '$st' > /dev/null && [[ '$engines' == 1 ]] && jq -e --argjson b '$base' '.tun == \"1\" and .resolver == \"172.19.0.2\" and .http == \"200\"' <<< '$resumed' > /dev/null" "key_after_kill=$gone engines=$engines $resumed"
 
 # 引擎崩溃：重连之前系统 DNS 先撤掉（放行直连），之后恢复。
 epid="$("$xdial" status --json | jq -r .result.engine_pid)"
