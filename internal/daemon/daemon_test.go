@@ -1051,6 +1051,12 @@ func TestEndpointTextIsScrubbed(t *testing.T) {
 	if strings.Contains(e.Error+e.AuthMessage, "hunter2") || e.AuthURL == "" {
 		t.Errorf("scrubbed status: %+v", e)
 	}
+	// A secret straddling the cut is scrubbed before it is cut.
+	long := map[string]engine.EndpointStatus{"corp": {Error: strings.Repeat("x", maxEndpointText-5) + "hunter2-secret"}}
+	scrubEndpoints(long, newScrubber(map[string]Secret{"corp": {Value: "hunter2-secret"}}))
+	if strings.Contains(long["corp"].Error, "hunt") {
+		t.Errorf("part of a secret survived the cut: %s", long["corp"].Error[maxEndpointText-10:])
+	}
 }
 
 func TestLoginLinksStayOutOfTheLog(t *testing.T) {
@@ -1069,5 +1075,15 @@ func TestWaitAnswersForItsConnectionOnly(t *testing.T) {
 	h.ok("disconnect", nil)
 	if _, err := h.d.waitLine(c, "tailnet", func(engine.EndpointStatus) bool { return false }); !cli.Is(err, cli.CodeConfigConflict) {
 		t.Errorf("waiting on a connection that is gone: %v", err)
+	}
+}
+
+func TestLoginLinksGoBeforeScrubbing(t *testing.T) {
+	// A stored secret "auth" would turn "authentication" into something
+	// the login link pattern no longer finds.
+	scrub := newScrubber(map[string]Secret{"old": {Value: "auth"}})
+	line := "Waiting for authentication: https://login.tailscale.com/a/abc123"
+	if got := scrub.scrub(withoutLoginLinks(line)); strings.Contains(got, "abc123") {
+		t.Errorf("log line: %s", got)
 	}
 }

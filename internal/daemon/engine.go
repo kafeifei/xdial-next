@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -97,7 +99,9 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 		scanner := bufio.NewScanner(errR)
 		scanner.Buffer(make([]byte, 64<<10), 1<<20)
 		for scanner.Scan() {
-			appendRotating(logPath, []byte(withoutLoginLinks(scrub.scrub(scanner.Text()))+"\n"))
+			// Login links go first: scrubbing could break up the words the
+			// pattern looks for.
+			appendRotating(logPath, []byte(scrub.scrub(withoutLoginLinks(scanner.Text()))+"\n"))
 		}
 	}()
 	ready := make(chan engine.Ready, 1)
@@ -206,13 +210,25 @@ func withoutLoginLinks(line string) string {
 }
 
 // scrubEndpoints scrubs what a VPN server says, which reaches status and
-// the event log, as the engine's log is, 4.3.
+// the event log, as the engine's log is, 4.3, and then cuts it to
+// maxEndpointText bytes: cutting first could leave part of a secret the
+// scrubber no longer recognizes.
 func scrubEndpoints(endpoints map[string]engine.EndpointStatus, scrub *scrubber) {
 	for id, e := range endpoints {
-		e.Error = scrub.scrub(e.Error)
-		e.AuthMessage = scrub.scrub(e.AuthMessage)
+		e.Error = cutText(scrub.scrub(e.Error))
+		e.AuthMessage = cutText(scrub.scrub(e.AuthMessage))
 		endpoints[id] = e
 	}
+}
+
+// maxEndpointText bounds a VPN server's text in status and events.
+const maxEndpointText = 512
+
+func cutText(s string) string {
+	if len(s) <= maxEndpointText {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxEndpointText], "") + "…"
 }
 
 // maxStatusLine bounds one status line from the engine.
@@ -255,7 +271,7 @@ func (d *Daemon) endpointsChanged(previous, current map[string]engine.EndpointSt
 	sort.Strings(ids)
 	for _, id := range ids {
 		now, before := current[id], previous[id]
-		if now.State == before.State && now.Error == before.Error && now.DefaultRoute == before.DefaultRoute {
+		if now.State == before.State && now.Error == before.Error && slices.Equal(now.DefaultRoute, before.DefaultRoute) {
 			continue
 		}
 		fields := map[string]any{"line": id, "type": now.Type, "state": now.State}
@@ -265,8 +281,8 @@ func (d *Daemon) endpointsChanged(previous, current map[string]engine.EndpointSt
 		if now.AuthMessage != "" {
 			fields["auth_message"] = now.AuthMessage
 		}
-		if now.DefaultRoute {
-			fields["default_route"] = true
+		if len(now.DefaultRoute) > 0 {
+			fields["default_route"] = now.DefaultRoute
 		}
 		d.events.add("endpoint_state", fields)
 	}

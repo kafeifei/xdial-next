@@ -27,7 +27,7 @@ type EndpointStatus struct {
 	BrowserAuth  bool       `json:"browser_auth,omitempty"`
 	Addresses    []string   `json:"addresses,omitempty"`
 	DNS          []string   `json:"dns,omitempty"`
-	DefaultRoute bool       `json:"default_route,omitempty"`
+	DefaultRoute []string   `json:"default_route,omitempty"` // the families, ipv4 and ipv6
 	Since        *time.Time `json:"since,omitempty"`
 	// Tailscale.
 	AuthURL  string   `json:"auth_url,omitempty"`
@@ -49,13 +49,11 @@ type StatusLine struct {
 const statusInterval = 500 * time.Millisecond
 
 // probeAddresses ask an AnyConnect endpoint whether its routes take
-// everything, 3.2: documentation addresses, which only a default route or
-// one about as wide covers. Public addresses would mislead: sing-box adds
-// a host route for each DNS server the VPN pushes, 1.1.1.1 included.
-var probeAddresses = []netip.Addr{netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("2001:db8::1")}
-
-// maxText bounds what a VPN server's text may take in a status line.
-const maxText = 512
+// everything, 3.2, per address family: documentation addresses, which only
+// a default route or one about as wide covers. Public addresses would
+// mislead: sing-box adds a host route for each DNS server the VPN pushes,
+// 1.1.1.1 included.
+var probeAddresses = map[string]netip.Addr{"ipv4": netip.MustParseAddr("198.51.100.1"), "ipv6": netip.MustParseAddr("2001:db8::1")}
 
 // reportEndpoints writes a StatusLine to w whenever an endpoint's status
 // changes, at most every statusInterval, until ctx ends.
@@ -122,7 +120,7 @@ func watchOpenConnect(ctx context.Context, ep adapter.OpenConnectEndpoint, repor
 
 func openConnectStatus(ep adapter.OpenConnectEndpoint) EndpointStatus {
 	st := ep.OpenConnectStatus()
-	s := EndpointStatus{Type: "openconnect", Error: cut(st.Error)}
+	s := EndpointStatus{Type: "openconnect", Error: st.Error}
 	switch st.State {
 	case adapter.OpenConnectStateConnected:
 		s.State = "connected"
@@ -134,7 +132,7 @@ func openConnectStatus(ep adapter.OpenConnectEndpoint) EndpointStatus {
 		s.State = "connecting"
 	}
 	if c := st.AuthChallenge; c != nil {
-		s.AuthMessage = cut(strings.TrimSpace(strings.Join([]string{c.Message, c.Error}, " ")))
+		s.AuthMessage = strings.TrimSpace(strings.Join([]string{c.Message, c.Error}, " "))
 		s.BrowserAuth = c.Browser != nil
 	}
 	if t := st.TunnelInfo; t != nil {
@@ -147,9 +145,9 @@ func openConnectStatus(ep adapter.OpenConnectEndpoint) EndpointStatus {
 		since := t.ConnectedSince
 		s.Since = &since
 		if preferred, ok := ep.(adapter.OutboundWithPreferredRoutes); ok {
-			for _, a := range probeAddresses {
-				if preferred.PreferredAddress(&adapter.InboundContext{}, a) {
-					s.DefaultRoute = true
+			for _, family := range []string{"ipv4", "ipv6"} {
+				if preferred.PreferredAddress(&adapter.InboundContext{}, probeAddresses[family]) {
+					s.DefaultRoute = append(s.DefaultRoute, family)
 				}
 			}
 		}
@@ -185,12 +183,4 @@ func tailscaleStatus(st *adapter.TailscaleEndpointStatus) EndpointStatus {
 	}
 	sort.Strings(s.Self)
 	return s
-}
-
-// cut shortens a VPN server's text to maxText bytes.
-func cut(s string) string {
-	if len(s) <= maxText {
-		return s
-	}
-	return strings.ToValidUTF8(s[:maxText], "") + "…"
 }
