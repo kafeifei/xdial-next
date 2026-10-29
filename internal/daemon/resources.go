@@ -234,16 +234,26 @@ func (d *Daemon) cacheComplete(cfg *config.Config, scenario string) bool {
 	d.mu.Lock()
 	secrets := maps.Clone(d.secrets)
 	d.mu.Unlock()
+	complete := true
 	for _, o := range remoteRuleSets(cfg, scenario) {
 		url, err := remoteURL(cfg, o, secrets)
 		if err != nil {
 			return false
 		}
 		if _, _, ok := d.cachedRules(o, url); !ok {
-			return false
+			// As when compiling: a refused file is dropped or marked, so
+			// the background loop downloads it again however fresh.
+			d.dropInvalid(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), func() bool {
+				_, _, ok := d.cachedRules(o, url)
+				return ok
+			})
+			complete = false
 		}
 	}
-	return true
+	if !complete {
+		d.wakeResources()
+	}
+	return complete
 }
 
 // markedInvalid reports whether compiling found path's content refused
