@@ -287,19 +287,14 @@ func tailscaleStatus(st *adapter.TailscaleEndpointStatus) EndpointStatus {
 }
 
 // maxText bounds a VPN server's text in a status line, so one endpoint
-// cannot push every line past the daemon's limit. It is far above what the
-// daemon keeps after scrubbing, 512 bytes, so a secret this cut splits is
-// beyond what is kept, and the daemon still scrubs whole secrets first.
+// cannot push every line past the daemon's limit. The daemon keeps only
+// the first 512 bytes, cut where no secret is split, so where this cut
+// falls never matters.
 const maxText = 64 << 10
-
-// TruncatedMark ends a text the engine cut short. The cut may split a
-// secret, which scrubbing then cannot recognize: the daemon drops the end
-// of such a text, as long as the longest secret, before it keeps any.
-const TruncatedMark = "…[engine-cut]"
 
 func bound(s string) string {
 	if len(s) <= maxText {
 		return s
 	}
-	return strings.ToValidUTF8(s[:maxText], "") + TruncatedMark
+	return strings.ToValidUTF8(s[:maxText], "")
 }

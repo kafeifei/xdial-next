@@ -718,7 +718,7 @@ func TestEngineIgnoresACommandForNoSuchLine(t *testing.T) {
 }
 
 func TestStatusTextIsBoundedButFarAboveWhatIsKept(t *testing.T) {
-	if got := bound(strings.Repeat("x", 2<<20)); len(got) != maxText+len(TruncatedMark) || !strings.HasSuffix(got, TruncatedMark) {
+	if got := bound(strings.Repeat("x", 2<<20)); len(got) != maxText {
 		t.Errorf("bounded to %d bytes", len(got))
 	}
 	if maxText <= 4096 {
