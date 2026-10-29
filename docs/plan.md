@@ -71,13 +71,13 @@
   - 子网路由。
   - 解析 Tailnet 里的名字。
 - **不做**：HomeDERP 重选、DERP 诊断、MagicDNS 系统接入，也不带旧仓库的 10 个 tailscale 补丁。
-- **名字解析**：【推断】在 TUN 下，系统 DNS 会全部进入 sing-box，用上游 `tailscale` 类型的 DNS 服务器就能解析 Tailnet 名字，不再需要旧版那套 destination-domain 捕获规则。这一点【未实测】。
+- **名字解析**：连接期间系统查询经 daemon 设置的解析器进入 sing-box（M2 实测，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 6.4）。【推断】用上游 `tailscale` 类型的 DNS 服务器就能解析 Tailnet 名字，不再需要旧版那套 destination-domain 捕获规则。tailscale 这部分【未实测】。
 - **风险**：旧补丁修过一个 peer DERP 状态失效的问题（见 [D35 证据 §4](https://github.com/kafeifei/XDial/blob/main/docs/incidents/d35-transparent-proxy-evidence.md)），去掉补丁后可能复现。复现了先提交给上游。
 
 ### 3.3 不做
 
 - 候选切换（新配置准备好之前，旧连接继续承载流量）。
-- 自动恢复里的预算、门户网络和 network epoch；只保留"网络变化后重连"。
+- 自动恢复里的预算、门户网络和 network epoch。只保留：sing-box 自己跟随默认接口，物理网络的 DNS 变了时重载引擎，引擎崩溃时退避重连（见 [ARCHITECTURE.md](../ARCHITECTURE.md) 6.3、6.4）。
 - 按 SSID 自动切换场景。
 - iOS / tvOS。
 - 远程功能开关。
@@ -103,8 +103,8 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 
 ### 4.3 数据面
 
-- 用 sing-box 的 `tun` 入站加 `auto_route`，路由规则 `hijack-dns` 接管 DNS，direct 出站跟随系统默认接口。stack 和 strict_route 怎么选，M2 实测后再定。
-- 不用上游的 `include`，由 XDial 自己的 registry 决定注册哪些类型。构建 tag 要有 `with_gvisor`、`with_utls`、`with_dhcp`，以及去掉 tailscale peerapi、C2N 等能力的 `ts_omit_*`，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.3、2.6 和 3.3。
+- 用 sing-box 的 `tun` 入站加 `auto_route`，stack 用 `mixed`，不开 `strict_route`；direct 出站跟随系统默认接口。只靠路由规则 `hijack-dns` 接管不了 DNS（M2 实测），连接期间 daemon 把系统解析器指到 TUN 里，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 6.3、6.4。
+- 不用上游的 `include`，由 XDial 自己的 registry 决定注册哪些类型。构建 tag 要有 `with_gvisor`、`with_utls`，以及去掉 tailscale peerapi、C2N 等能力的 `ts_omit_*`，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 2.3、2.6 和 3.3。
 - 场景切换时，daemon 重新编译配置并重载 sing-box。组内切线路走 selector，不重载。
 - 断开、卸载或 daemon 异常退出之后，不能留下路由、DNS 或接口残留。M2 在虚拟机里逐项检查。
 
@@ -137,7 +137,8 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 ### 4.6 安装、更新、卸载
 
 - **安装**：
-  - daemon 用 `SMAppService.daemon` 注册（和旧仓库一样），需要用户在系统设置里批准。
+  - M2 用 `sudo xdial daemon install` 安装，daemon 运行拷贝到 root 专属目录的二进制，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 6.1。
+  - App 怎么安装和升级 daemon 在 M5 定。`SMAppService.daemon` 运行的是 App 包里的二进制，App 装在 `/Applications` 时 admin 用户就能改，不满足"只有 root 能改"；它还需要用户在系统设置里批准。
   - 旧仓库的 [Launch Constraint 事故](https://github.com/kafeifei/XDial/blob/main/docs/incidents/2026-10-13-fresh-registration-launch-constraint.md) 和 [AppTranslocation 事故](https://github.com/kafeifei/XDial/blob/main/docs/incidents/2026-09-08-download-install-translocation.md) 的教训直接适用。
 - **更新**：沿用 stable / beta 两份清单，另外补上回退能力。
   - 旧发布器的 `operation=withdraw` 只会把清单改成 `release: null`，已经装上的 App 不会降级（见 [更新与发布](https://github.com/kafeifei/XDial/blob/main/docs/agent/updates.md)）。
@@ -158,7 +159,7 @@ daemon 和 CLI 打在同一个 Go 二进制 `xdial` 里。
 | AnyConnect | sslcon（third_party）加 2 个补丁 | sing-box `openconnect` |
 | Tailscale | 上游 endpoint 加 10 个补丁，再加 MagicDNS 系统接入 | 上游 endpoint，不打补丁 |
 | sing-box | 15 个本地补丁 | 不打补丁 |
-| 恢复 | 预算、network epoch、门户网络 | 网络变化后重连 |
+| 恢复 | 预算、network epoch、门户网络 | 跟随默认接口；物理网络的 DNS 变了时重载；崩溃时退避重连 |
 | 平台 | macOS，加上 iOS / tvOS 草稿 | 只做 macOS |
 
 ## 5. 项目循环
@@ -298,8 +299,8 @@ jev 那种"观察、生成问题卡、出修复 Draft PR"的闭环，等事件�
 - 【未实测】sing-box 的 `openconnect` 能否连上公司的 AnyConnect 服务器。
 - 【未实测】在 TUN 下，上游 tailscale endpoint 的登录、exit node、子网路由和名字解析是否都能用。
 - 现在依赖的是 sing-box 的 beta 版（v1.14.0-beta.2），1.14 正式版发布后跟进。
-- 新版和其他全局 VPN 客户端会冲突，安装或连接时要给出明确提示。
-- daemon 注册需要用户在系统设置里批准，首次安装的体验在 M2 验证。
+- 新版和其他全局 VPN 客户端会冲突，`xdial doctor`（M4）检测并给出明确提示。正式版和 Debug 之间已由连接锁互斥（[ARCHITECTURE.md](../ARCHITECTURE.md) 6.1）。
+- App 安装 daemon 的方式和首次安装的体验在 M5 定（[ARCHITECTURE.md](../ARCHITECTURE.md) 6.1）。
 - 导入旧配置需要访问用户的 Keychain，由用户身份的 CLI 做，不放在 root daemon 里（已定，见 [ARCHITECTURE.md](../ARCHITECTURE.md) 4.8）。
 
 ## 10. 旧仓库怎么处理
