@@ -1174,11 +1174,44 @@ func TestScrubberMasksOverlaps(t *testing.T) {
 		"a secret overlaps itself": {map[string]Secret{"s": {Value: "ababa"}}, "x abababa y", "x <secret:s> y"},
 		"json escapes":             {map[string]Secret{"s": {Value: "a<b>\x01cd"}}, `msg "a\u003cb\u003e\u0001cd"`, `msg "<secret:s>"`},
 		"quoted":                   {map[string]Secret{"s": {Value: "a<b>\x01cd"}}, `msg "a<b>\x01cd"`, `msg "<secret:s>"`},
+		"JSON.stringify":           {map[string]Secret{"s": {Value: "pass\u2028\"word\n"}}, "msg \"pass\u2028\\\"word\\n\"", `msg "<secret:s>"`},
+		"quotes escaped only":      {map[string]Secret{"s": {Value: "a\"b\x01cd"}}, "msg \"a\\\"b\x01cd\"", `msg "<secret:s>"`},
 	} {
 		if got := newScrubber(c.secrets).scrub(c.text); got != c.want {
 			t.Errorf("%s: %q, want %q", name, got, c.want)
 		}
 	}
+}
+
+func TestScrubberRunsInBoundedSpace(t *testing.T) {
+	// Many names for one value, and a value that overlaps itself, over
+	// text that is nothing but that value: one span each time, found a
+	// period at a time.
+	secrets := map[string]Secret{}
+	for i := range 100 {
+		secrets[fmt.Sprintf("s%03d", i)] = Secret{Value: "aaaa"}
+	}
+	secrets["long"] = Secret{Value: strings.Repeat("a", MaxSecretLength)}
+	s := newScrubber(secrets)
+	if len(s.forms) > 20 {
+		t.Errorf("%d forms for two values", len(s.forms))
+	}
+	text := strings.Repeat("a", 1<<20)
+	if spans := s.spans(text); len(spans) != 1 || spans[0] != (span{0, len(text), "long"}) && spans[0] != (span{0, len(text), "s000"}) {
+		t.Errorf("spans: %v", spans)
+	}
+	if got := s.scrub("x" + strings.Repeat("ab", 1000) + "aaaa y"); got != "x"+strings.Repeat("ab", 1000)+"<secret:long> y" && got != "x"+strings.Repeat("ab", 1000)+"<secret:s000> y" {
+		t.Errorf("scrub: %q", got)
+	}
+}
+
+func TestStoredLongSecretIsRefused(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": doc})
+	h.d.mu.Lock()
+	h.d.secrets["hk"] = Secret{Value: strings.Repeat("x", MaxSecretLength+1)}
+	h.d.mu.Unlock()
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeSecretFormat)
 }
 
 func TestEndpointTextStaysBounded(t *testing.T) {

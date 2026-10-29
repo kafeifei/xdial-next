@@ -558,7 +558,16 @@ func checkFormats(c *config.Config, secrets map[string]Secret) error {
 	var problems []cli.Problem
 	for _, use := range c.Secrets {
 		s, ok := secrets[use.Name]
-		if !ok || use.Spec.Format == nil {
+		if !ok {
+			continue
+		}
+		// secret.set refuses longer values; this catches ones stored before.
+		if len(s.Value) > MaxSecretLength {
+			problems = append(problems, cli.Problem{Code: cli.CodeConfigValue, Path: use.Path, Object: use.Object,
+				Message: fmt.Sprintf("凭据 %s 超过 %d 字节，用 xdial secret set 重新设置", use.Name, MaxSecretLength)})
+			continue
+		}
+		if use.Spec.Format == nil {
 			continue
 		}
 		if msg := use.Spec.Format(s.Value, use.Parent); msg != "" {
