@@ -68,7 +68,8 @@ type Spec struct {
 	required       bool                        // the field must be present in its object
 	pattern        string                      // JSON Schema pattern, for strings whose check is a regular expression
 	minLen         int
-	isRegex        bool // counted against the document's regular expression budget
+	isRegex        bool  // counted against the document's regular expression budget
+	alt            *Spec // shapeString: an object that may stand in place of the string
 
 	// Placeholder produces a well-formed stand-in for a secret so the
 	// sing-box check never sees the real value, ARCHITECTURE.md 4.5. It may
@@ -101,7 +102,10 @@ type RefUse struct {
 type walker struct {
 	// remote checks content from a remote: an unknown key is reported
 	// without its name, in the path or the message, 3.4.
-	remote     bool
+	remote bool
+	// node checks a subscription node, ARCHITECTURE.md 1.5: credential
+	// fields hold their values, and a secret reference is refused.
+	node       bool
 	problems   []cli.Problem
 	dropped    int // problems past maxProblems, reported as a count
 	regexInsts int // compiled size of every regular expression so far
@@ -194,6 +198,19 @@ func (w *walker) field(v *Value, spec *Spec, path string, parent *Value) {
 		w.problem(cli.CodeConfigForbiddenKey, path, "删掉这个字段", "这个字段不允许写：%s", spec.Note)
 		return
 	case Secret, MaybeSecret:
+		if w.node {
+			if _, ok := secretRef(v); ok {
+				w.problem(cli.CodeConfigValue, path, "", "订阅节点不能引用凭据")
+				return
+			}
+			if v.Kind == KindString && spec.Format != nil {
+				if msg := spec.Format(v.String, parent); msg != "" {
+					w.problem(cli.CodeConfigValue, path, "", "%s", msg)
+					return
+				}
+			}
+			break
+		}
 		if name, ok := secretRef(v); ok {
 			if !validID(name) {
 				w.problem(cli.CodeConfigValue, joinKey(path, "secret"), "", "凭据名 %q 不合法：只能用小写字母、数字和连字符，以字母或数字开头，最长 63 个字符", name)
@@ -223,6 +240,10 @@ func secretRef(v *Value) (string, bool) {
 }
 
 func (w *walker) value(v *Value, spec *Spec, path string) {
+	if spec.alt != nil && v.Kind == KindObject {
+		w.value(v, spec.alt, path)
+		return
+	}
 	switch spec.shape {
 	case shapeString:
 		if v.Kind != KindString {

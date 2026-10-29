@@ -194,7 +194,9 @@ cat > "$work/ts.json" << EOF
   "log": { "level": "info", "output": "$work/ts.log" },
   "dns": { "servers": [{ "type": "udp", "tag": "d", "server": "1.1.1.1" }], "final": "d" },
   "inbounds": [{ "type": "shadowsocks", "tag": "ss-in", "listen": "0.0.0.0", "listen_port": 18388,
-                 "method": "aes-128-gcm", "password": "e2e-ss-pass" }],
+                 "method": "aes-128-gcm", "password": "e2e-ss-pass" },
+               { "type": "vless", "tag": "vless-in", "listen": "0.0.0.0", "listen_port": 18389,
+                 "users": [{ "uuid": "1386f85e-657b-4d6e-9d56-78badb75e1fd" }] }],
   "outbounds": [{ "type": "direct", "tag": "direct" }],
   "route": { "default_interface": "$iface", "default_domain_resolver": "d" }
 }
@@ -250,6 +252,50 @@ st="$("$xdial" status --json 2>&1)"
 check m3-missing-keeps-connection "jq -e '.error.code == \"resource.blocked\"' <<< '$out' > /dev/null && jq -e '.result.state == \"connected\" and .result.scenario == \"s\"' <<< '$st' > /dev/null" "$out | $(jq -c '.result | {state, scenario}' <<< "$st")"
 out="$("$xdial" scenario use t --json 2>&1)" && out2="$("$xdial" scenario use s --json 2>&1)"
 check m3-switch-from-cache "jq -e '.ok and .result.scenario == \"s\" and .result.state == \"connected\"' <<< '$out2' > /dev/null" "$out2"
+
+# --- M3：订阅（#11）-----------------------------------------------------------
+# 现场拼一个 Clash 订阅：节点指向测试服务端，规则把 example.org 交给 Proxy 策略。经公网的 echo 服务
+# （httpbingo.org/base64）下载，所以走的是真实的下载路径。组只选 vless 节点，场景按策略名映射。
+sub_yaml="proxies:
+  - {name: \"e2e ss\", type: ss, server: $lan, port: 18388, cipher: aes-128-gcm, password: e2e-ss-pass}
+  - {name: \"e2e vless\", type: vless, server: $lan, port: 18389, uuid: 1386f85e-657b-4d6e-9d56-78badb75e1fd}
+  - {name: \"e2e hy2\", type: hysteria2, server: $lan, port: 1, password: x}
+rules:
+  - DOMAIN-SUFFIX,example.org,Proxy
+  - DOMAIN-SUFFIX,apple.com,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,Proxy
+"
+sub_url="https://httpbingo.org/base64/$(printf '%s' "$sub_yaml" | base64 | tr '+/' '-_' | tr -d '=\n')"
+cat > "$work/m3sub.jsonc" << 'EOF'
+{
+  "version": 1,
+  "groups": [{ "id": "proxy", "type": "selector", "outbounds": [{ "subscription": "air", "filter": "vless" }] }],
+  "subscriptions": [{ "id": "air", "url": { "secret": "air-url" } }],
+  "scenarios": [{ "id": "sub", "rules": [{ "subscription": "air", "policies": { "Proxy": "proxy", "DIRECT": "direct" } }],
+                  "final": "direct" }]
+}
+EOF
+"$xdial" disconnect --json > /dev/null 2>&1
+printf '%s\n' "$sub_url" | "$xdial" secret set air-url --json > /dev/null 2>&1
+out="$("$xdial" config apply "$work/m3sub.jsonc" --json 2>&1)"
+out2="$("$xdial" connect --scenario sub --json 2>&1)"
+check m3-subscription-connect "jq -e '.ok' <<< '$out' > /dev/null && jq -e '.ok and .result.state == \"connected\"' <<< '$out2' > /dev/null" "$(jq -c '.ok' <<< "$out") $out2"
+list="$("$xdial" subscription list --json 2>&1)"
+check m3-subscription-list "jq -e '.result.subscriptions[0] | .cached and .format == \"clash\" and .nodes == 2 and .rules == 2 and .unsupported[\"node:hysteria2\"] == 1 and .unsupported[\"rule:geoip\"] == 1 and ([.policies[].name] == [\"Proxy\", \"DIRECT\"])' <<< '$list' > /dev/null" "$(jq -c '.result.subscriptions[0] | {cached, format, nodes, rules, unsupported, policies}' <<< "$list")"
+show="$("$xdial" subscription show air --json 2>&1)"
+check m3-subscription-show-no-secrets "jq -e '.ok and (.result.nodes | length) == 2' <<< '$show' > /dev/null && ! grep -q e2e-ss-pass <<< '$show'" "$(jq -c '.result.nodes' <<< "$show")"
+before_vless="$(grep -c 'vless-in.*example.org' "$work/ts.log" 2> /dev/null)"
+before_apple="$(grep -c 'apple.com' "$work/ts.log" 2> /dev/null)"
+code_org="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://example.org 2>&1)"
+code_apple="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://www.apple.com 2>&1)"
+sleep 1
+after_vless="$(grep -c 'vless-in.*example.org' "$work/ts.log" 2> /dev/null)"
+after_apple="$(grep -c 'apple.com' "$work/ts.log" 2> /dev/null)"
+check m3-subscription-rules-route '[[ "$code_org" == 200 && "$code_apple" == 200 && "${after_vless:-0}" -gt "${before_vless:-0}" && "${after_apple:-0}" == "${before_apple:-0}" ]]' "example.org=$code_org via vless node: $before_vless -> $after_vless; apple=$code_apple lines at the test server: $before_apple -> $after_apple"
+"$xdial" disconnect --json > /dev/null 2>&1
+"$xdial" config apply "$work/m3.jsonc" --json > /dev/null 2>&1
+"$xdial" connect --scenario s --json > /dev/null 2>&1
 kill "$tspid" 2> /dev/null
 
 # 连接中重装：先断开，换掉二进制，新 daemon 恢复连接。

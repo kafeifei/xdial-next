@@ -137,7 +137,11 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := engine.Compile(cfg, engine.Options{
+	// Subscriptions the scenario reaches come from the cache; the compiler
+	// says which it needed and did not find, and those are downloaded
+	// before compiling again, 1.5.
+	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
+	opts := engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
 		PhysicalDNS: physical[0],
 		Secret:      func(u config.SecretUse) string { return secrets[u.Name].Value },
@@ -145,7 +149,21 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 			rules, ok := ruleSets[o.ID]
 			return rules, ok
 		},
-	})
+		Subscription: source.get,
+	}
+	result, err := engine.Compile(cfg, opts)
+	if err == nil && len(result.MissingSubscriptions) > 0 {
+		if source.err != nil {
+			return nil, source.err
+		}
+		for _, id := range result.MissingSubscriptions {
+			if _, err := d.downloadSubscription(cfg, findSubscription(cfg, id), secrets); err != nil {
+				return nil, prefixed(err, fmt.Sprintf("场景 %s 用到的订阅 %s 还没下载，下载失败：", scenario, id))
+			}
+			delete(source.content, id)
+		}
+		result, err = engine.Compile(cfg, opts)
+	}
 	if err != nil {
 		return nil, cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
 	}
@@ -154,20 +172,21 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if len(result.MissingRuleSets) > 0 {
 		return nil, cli.Errorf(cli.CodeResourceMissing, "", "场景 %s 用到的远程规则集还没下载：%v", scenario, result.MissingRuleSets)
 	}
+	if len(result.MissingSubscriptions) > 0 {
+		return nil, cli.Errorf(cli.CodeResourceMissing, "", "场景 %s 用到的订阅读不出来：%v", scenario, result.MissingSubscriptions)
+	}
+	if len(result.EmptyGroups) > 0 {
+		return nil, cli.Errorf(cli.CodeResourceMissing, "改一下组里订阅成员的 filter 或 exclude，用 xdial subscription show 看节点名", "线路组 %v 从订阅里筛不出任何节点", result.EmptyGroups)
+	}
 	// Downloaded content joined the configuration only now: check the
 	// whole of it before anything running is replaced. The check sees
 	// placeholders for secrets, as every check does, 4.5.
 	if len(result.JSON) > engine.MaxConfigSize {
 		return nil, cli.Errorf(cli.CodeResourceTooLarge, "少用几个大的远程规则集", "场景 %s 编译出的配置超过 %d 字节", scenario, engine.MaxConfigSize)
 	}
-	checked, err := engine.Compile(cfg, engine.Options{
-		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
-		PhysicalDNS: physical[0],
-		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
-			rules, ok := ruleSets[o.ID]
-			return rules, ok
-		},
-	})
+	placeholders := opts
+	placeholders.Secret = engine.Placeholder
+	checked, err := engine.Compile(cfg, placeholders)
 	if err != nil {
 		return nil, cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
 	}

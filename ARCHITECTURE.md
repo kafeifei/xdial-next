@@ -71,10 +71,10 @@
 | `version` | 整数，现在是 1 | 必填 |
 | `mixed` | 本机 SOCKS / HTTP 入口，即 sing-box 的 `mixed` 入站：`port`、`username`、`password`；不写就不开 | 只监听回环地址，端口不小于 1024；用户名和密码必填，密码是凭据引用；`set_system_proxy` 等其余字段由 XDial 生成 |
 | `lines` | sing-box 的出站或 endpoint 对象，类型必须在线路允许清单里（2.3） | `detour` 只能指向线路或线路组 |
-| `groups` | sing-box 的 `selector` 或 `urltest` | `outbounds` 只能指向线路或线路组；selector 的 `default` 必须是自己 `outbounds` 里的成员 |
+| `groups` | sing-box 的 `selector` 或 `urltest` | `outbounds` 只能指向线路或线路组，或者写成订阅成员 `{"subscription", "filter"?, "exclude"?}`（1.5）；selector 的 `default` 必须是自己 `outbounds` 里的一个 id |
 | `rule_sets` | `inline`，或 `remote` | 不允许 `local`（读本机文件），本地规则写成 `inline`。`remote` 由 daemon 自己下载（3.4）：`url` 只能是 https，可以是凭据引用；`download_via` 指定经哪条线路下载，不写则走 `direct` |
-| `scenarios` | `rules`：有序的规则列表，每条是 `{"rule_set", "line", "invert"?}`；`final`：其余流量走的线路 | 场景里不能写匹配条件，匹配只写在规则集里；`final` 必填 |
-| `subscriptions` | 订阅来源：`url`，以及 `download_via` | `url` 必须是凭据引用，只能是 https；其余字段在 M3 定 |
+| `scenarios` | `rules`：有序的规则列表，每条是 `{"rule_set", "line", "invert"?}`，或者引用订阅的规则 `{"subscription", "policies", "other"?}`（1.5）；`final`：其余流量走的线路 | 场景里不能写匹配条件，匹配只写在规则集和订阅里；`final` 必填 |
+| `subscriptions` | 订阅来源：`url`、`download_via`、`user_agent`、`update_interval`，见 1.5 | `url` 必须是凭据引用，只能是 https |
 
 - **`mixed` 为什么必须带认证**：
   - 它和 TUN 一样走当前场景，包括 VPN 和 tailnet 线路。连接时 TUN 本来就接管整机所有进程的流量，所以对本机进程来说，`mixed` 没有多给网络位置。
@@ -101,15 +101,69 @@
   - 直接用结构体构造配置时，重复的 tag 会被静默替换；
   - selector 的 `default` 不合法时，如果缓存里有手选值，会被静默接受。
 
-### 1.5 订阅节点
+### 1.5 订阅
 
-- **不进配置**：从订阅拉下来的节点是派生数据，放在 daemon 的订阅缓存里，不写进配置。
-- **过同一套分类**：节点要过订阅节点的允许清单和同一份字段分类（2.3、2.4），另外再收紧三条：
-  - 只允许代理协议，不允许 endpoint；
-  - 不允许 `detour`；
-  - 不允许凭据引用，否则恶意订阅就能把用户已设置的凭据引到自己的服务器。
-- **节点自带的凭据**：凭据字段在缓存里可以是明文，按凭据对待，存放见 4.4，也不出现在任何输出里。
-- **留到 M3**：线路组和场景怎么引用订阅节点。
+2026-10-29 用户决定：订阅带节点和机场的分流规则；Clash 格式要用的 `gopkg.in/yaml.v3` 批准进依赖白名单。
+
+- **配置里只有来源**：
+
+  ```jsonc
+  { "id": "air", "name": "机场", "url": { "secret": "air-url" },
+    "download_via": "direct",      // 可选，同远程规则集（3.4）
+    "user_agent": "clash.meta",    // 可选，就是这个默认值
+    "update_interval": "12h" }     // 可选，默认 24 小时，最短 10 分钟
+  ```
+
+  - 多数机场按 User-Agent 决定返回的格式。默认的 `clash.meta` 让它返回 Clash 格式，只有 Clash 格式带规则。
+- **格式**：按内容判断。
+  - Clash YAML：`proxies` 和 `rules`。`proxy-groups` 不收，组由用户自己在配置里建。
+  - sing-box JSON：`outbounds` 里节点类型的出站，`tag` 当名字。
+  - 分享链接：`ss://`、`vmess://`、`vless://`、`trojan://`、`anytls://`，每行一个，整段 base64 也行。
+  - Surge 格式不支持（旧版支持），列在第 7 节。
+- **下载和解析**：
+  - 下载同远程规则集（3.4）：同一个下载子进程、同样的地址检查和上限，内容最多 16 MiB。
+  - 解析在另一个以 `nobody` 运行的子进程里做（`xdial __subscription-parse`），它把内容转成 sing-box 原生对象交回 daemon。
+  - daemon 再逐个检查交回来的东西，见下面"节点"和"规则"；通过的部分整体让 sing-box 构造一遍（同 3.4），sing-box 不接受就不替换旧缓存。
+- **节点**：
+  - 转成 sing-box 出站，过订阅节点的允许清单和同一份字段分类（2.3、2.4），另外再收紧三条：
+    - 只允许代理协议：shadowsocks、vmess、vless、trojan、anytls；
+    - 不允许 `detour`；
+    - 凭据字段直接写值，写成凭据引用就拒绝，否则恶意订阅能把用户设置的凭据引到自己的服务器。
+  - 没通过的节点不收，按 `node:invalid` 计数；不支持的类型（hysteria2、tuic 等）按 `node:<类型>` 计数。一个可用节点都没有就算下载失败。
+  - 名字去掉控制字符，最长 256 字节，重名的按顺序加 ` (2)`、` (3)`。最多 2000 个节点。
+  - 节点自带的凭据只存在 daemon 的缓存里，不出现在任何输出：`xdial subscription show` 只列名字、类型、服务器和端口。
+- **线路组引用节点**：`outbounds` 里写
+
+  ```jsonc
+  { "id": "hk", "type": "urltest",
+    "outbounds": [{ "subscription": "air", "filter": "香港|HK", "exclude": "剩余|到期" }, "jp"] }
+  ```
+
+  - 编译时展开成名字被 `filter` 匹配、不被 `exclude` 匹配的节点，按订阅里的顺序。两个都不写就是全部节点。正则按 1.3 的预算计。
+  - 节点编成 tag 为 `xdial:sub:<订阅 id>:<名字>` 的出站，只编被组用到的；和线路一样用物理网络的 DNS 解析自己服务器的域名（3.3）。
+  - 一个组展开后一个成员都没有，连接时报 `resource.missing`，现有连接不动。
+  - 节点不能直接当场景的目标或 `detour`，只能经组用。`download_via` 经过的组不能有订阅成员：下载子进程只装配置里的线路（3.4）。
+- **场景引用规则**：
+
+  ```jsonc
+  { "subscription": "air",
+    "policies": { "🚀 节点选择": "proxy", "🎯 全球直连": "direct", "🛑 广告拦截": "block" },
+    "other": "proxy" }   // 可选
+  ```
+
+  - 订阅里的规则按原来的顺序放在这条场景规则的位置上，每条走它的策略名在 `policies` 里对应的线路；`policies` 里没有的走 `other`，不写 `other` 就不收。
+  - 连续走同一条线路的规则合成一个编译生成的规则集，tag 为 `xdial:sub:<订阅 id>:rules-<序号>`。所以订阅里规则的先后关系不变。
+  - 策略名是订阅里写的原样（Clash 规则的第三段），`xdial subscription list` / `show` 列出每个策略名和用到它的规则数。
+  - 这些规则和普通规则集一样参与 DNS（3.3）：纯域名条件的部分交给所选线路的 DNS server。
+- **规则**：
+  - Clash 规则按类型转换：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-REGEX`、`IP-CIDR`、`IP-CIDR6`、`DST-PORT`、`PROCESS-NAME`、`PROCESS-PATH`、`NETWORK`。
+  - `no-resolve` 忽略：XDial 先解析域名目的地再路由（3.2）。`MATCH` 不收，由场景的 `final` 代替。
+  - 其余类型（`GEOIP`、`GEOSITE`、`RULE-SET`、`AND`/`OR`/`NOT`、`SRC-*` 等）不收，按 `rule:<类型>` 计数。需要的话，用远程规则集补在场景里，例如订阅规则后面加一条国内 IP 直连。
+  - 每条规则再过一遍和规则集相同的检查，没通过的按 `rule:invalid` 计数。最多 5 万条。
+- **不悄悄丢掉**：上面所有没收的条目按类型计数，存在缓存里，`xdial subscription list`、`update` 的结果和事件日志里都有。
+- **缓存**：在 `private/resources/subscriptions/<id>.<指纹前 16 位>.json`，指纹是 url 和 User-Agent 的 SHA-256；写法、清理、`ETag` 同远程规则集（3.4）。
+- **什么时候下载**：同远程规则集。连接或切场景时，编译器报出场景用到而缓存里没有的订阅，先下载再编译一次；失败则这次请求失败。后台按 `update_interval` 更新，新内容在下一次连接或切场景时生效。
+- **命令**：`xdial subscription list`、`xdial subscription show <id>`、`xdial subscription update [<id>...]`，输出见 `xdial schema`。
 
 ### 1.6 第一版表达不了的
 
@@ -690,7 +744,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - 被允许的连接同时最多 32 个，满了之后新连接收到 `daemon.busy`。
   - `logs --follow` 可以一直开着、中间没有输出，客户端对它不设读超时。
 - **凭据只走 API**：`secret.set` 的值在请求里传，不进命令行参数和环境变量（4.3）。
-- **第一批方法**：`version`、`status`、`config.export`、`config.apply`（`dry_run`、`if_match`）、`secret.set`、`secret.list`、`secret.rm`、`connect`、`disconnect`、`scenario.use`、`logs`（`lines`、`follow`）。M3 加 `rule_set.list`、`rule_set.update`（`ids`），见 3.4。
+- **第一批方法**：`version`、`status`、`config.export`、`config.apply`（`dry_run`、`if_match`）、`secret.set`、`secret.list`、`secret.rm`、`connect`、`disconnect`、`scenario.use`、`logs`（`lines`、`follow`）。M3 加 `rule_set.list`、`rule_set.update`（`ids`），见 3.4；`subscription.list`、`subscription.show`（`id`）、`subscription.update`（`ids`），见 1.5。
   - `connect` 对已经连着的同一场景、同一配置不做任何事。
 - **状态**：`status` 和改变连接的方法返回同一个结构。
   - `state`：`disconnected`、`connecting`（正在连接、重载或等待重连）、`connected`、`failed`。
@@ -845,8 +899,8 @@ SupplementalMatchDomains : [""]
   - 安装时的版本核对比的是构建标识，不是文件内容。签名构建（M6）后改用签名。
   - 和其他全局 VPN 同时连着、更具体的解析器、指定接口的查询：`xdial doctor`（M4）检测并提示。
 - **M3**：
-  - 远程规则集的下载已实现（3.4）；订阅用同一个下载器，在 #11 实现。
-  - 订阅节点怎么被线路组和场景引用；
+  - 远程规则集的下载（3.4）和订阅（1.5）已实现。
+  - Surge 格式的订阅；Clash 的 `GEOIP`、`RULE-SET` 等规则类型。
   - VPN 推送内容的形态，以及要不要由 XDial 过滤、限额后改写成普通规则；
   - AnyConnect 需要浏览器登录时怎么办；
   - `ts_omit_*` tag 加上之后运行是否正常；

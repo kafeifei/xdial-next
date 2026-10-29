@@ -375,7 +375,7 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 	if d.attempts == nil {
 		d.attempts = map[string]resourceAttempt{}
 	}
-	d.attempts[o.ID] = resourceAttempt{at: time.Now(), err: e}
+	d.attempts["rule_set:"+o.ID] = resourceAttempt{at: time.Now(), err: e}
 	d.mu.Unlock()
 	if e != nil {
 		d.events.add("rule_set_update_failed", map[string]any{"id": o.ID, "code": e.Code, "error": e.Message})
@@ -691,8 +691,8 @@ func (d *Daemon) wakeResources() {
 	}
 }
 
-// refreshResources downloads remote content missing from the cache or past
-// its interval.
+// refreshResources downloads remote rule sets and subscriptions missing
+// from the cache or past their interval.
 func (d *Daemon) refreshResources() {
 	d.mu.Lock()
 	cfg := d.cfg
@@ -707,7 +707,7 @@ func (d *Daemon) refreshResources() {
 		if o.Type != "remote" {
 			continue
 		}
-		if a, ok := attempts[o.ID]; ok && a.err != nil && now.Sub(a.at) < resourceRetryDelay {
+		if a, ok := attempts["rule_set:"+o.ID]; ok && a.err != nil && now.Sub(a.at) < resourceRetryDelay {
 			continue
 		}
 		url, err := remoteURL(cfg, o, secrets)
@@ -720,8 +720,22 @@ func (d *Daemon) refreshResources() {
 		}
 		_, _ = d.downloadRuleSet(cfg, o, secrets)
 	}
+	for _, o := range cfg.Subscriptions {
+		if a, ok := attempts["subscription:"+o.ID]; ok && a.err != nil && now.Sub(a.at) < resourceRetryDelay {
+			continue
+		}
+		url, err := remoteURL(cfg, o, secrets)
+		if err != nil {
+			continue
+		}
+		if c, _, ok := d.cachedSubscription(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) {
+			continue
+		}
+		_, _ = d.downloadSubscription(cfg, o, secrets)
+	}
 	d.res.Lock()
 	d.collectRuleSets()
+	d.collectSubscriptions()
 	d.res.Unlock()
 }
 
@@ -768,7 +782,7 @@ func (d *Daemon) ruleSetList(json.RawMessage) reply {
 					info.FetchedAt, info.ChangedAt, info.NextUpdate = &c.FetchedAt, &c.ChangedAt, &next
 				}
 			}
-			if a, ok := attempts[o.ID]; ok && a.err != nil {
+			if a, ok := attempts["rule_set:"+o.ID]; ok && a.err != nil {
 				info.LastError = a.err
 			}
 			list = append(list, info)

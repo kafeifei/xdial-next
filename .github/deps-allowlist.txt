@@ -3,3 +3,4 @@
 # 格式：每行一个模块路径，# 之后写批准日期和理由。
 github.com/sagernet/sing-box  # 2026-10-25 重写方案：唯一引入的上游项目
 github.com/sagernet/sing  # 2026-10-28 用户批准：sing-box 的底层库，同一作者，组装配置和解析 plugin_opts 要直接用
+gopkg.in/yaml.v3  # 2026-10-29 用户批准：Clash 格式的订阅是 YAML（#11）

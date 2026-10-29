@@ -490,7 +490,7 @@ var endpointTypes = map[string]bool{"openconnect": true, "tailscale": true}
 
 func groupSpec() *Spec {
 	common := map[string]*Spec{"id": req(idSpec()), "name": nameSpec(), "type": req(str()), "tag": forbidden(noteTag)}
-	members := &Spec{shape: shapeArray, elem: ref("line"), maxItems: 1024}
+	members := &Spec{shape: shapeArray, elem: memberSpec(), maxItems: 1024}
 	return union("", map[string]map[string]*Spec{
 		"selector": with(common, map[string]*Spec{
 			"outbounds":                   req(members),
@@ -507,6 +507,36 @@ func groupSpec() *Spec {
 		}),
 	})
 }
+
+// memberSpec is one member of a group: a line or group id, or the nodes
+// of a subscription whose names match filter and not exclude, 1.5.
+func memberSpec() *Spec {
+	s := ref("line")
+	s.alt = obj(map[string]*Spec{
+		"subscription": req(ref("subscription")),
+		"filter":       regex(),
+		"exclude":      regex(),
+	})
+	return s
+}
+
+// nodeSpec is the allow list for subscription nodes, 1.5: proxy types
+// only, without detour, and without the XDial keys of a line.
+func nodeSpec() *Spec {
+	line := lineSpec()
+	variants := map[string]map[string]*Spec{}
+	for _, typ := range NodeTypes {
+		fields := with(line.variants[typ])
+		delete(fields, "id")
+		delete(fields, "name")
+		fields["detour"] = forbidden("订阅节点不能指定 detour")
+		variants[typ] = fields
+	}
+	return union("", variants)
+}
+
+// NodeTypes are the line types a subscription node may have.
+var NodeTypes = []string{"shadowsocks", "vmess", "vless", "trojan", "anytls"}
 
 func httpOrHTTPS(v *Value) string {
 	if !strings.HasPrefix(v.String, "https://") && !strings.HasPrefix(v.String, "http://") {
@@ -604,18 +634,45 @@ func subscriptionSpec() *Spec {
 	url := remoteURL()
 	url.Class = Secret
 	return obj(map[string]*Spec{
-		"id":           req(idSpec()),
-		"name":         nameSpec(),
-		"url":          req(url),
-		"download_via": ref("line"),
+		"id":              req(idSpec()),
+		"name":            nameSpec(),
+		"url":             req(url),
+		"download_via":    ref("line"),
+		"user_agent":      checked(&Spec{shape: shapeString, maxLen: 256}, printable),
+		"update_interval": duration(),
 	})
 }
 
+// printable refuses control characters, which have no place in a header.
+func printable(v *Value) string {
+	for _, r := range v.String {
+		if r < 0x20 || r == 0x7f {
+			return "不能含控制字符"
+		}
+	}
+	return ""
+}
+
+// policyName is a key of a scenario's policies: the name a subscription
+// gives a rule's target.
+func policyName(v *Value) string {
+	if v.String == "" || len(v.String) > 256 {
+		return "策略名不能为空，最多 256 字节"
+	}
+	return printable(v)
+}
+
 func scenarioSpec() *Spec {
+	// A rule binds a rule set to a line, or the rules of a subscription,
+	// in their own order, to lines by policy; load checks that it is one
+	// or the other, 1.5.
 	rule := obj(map[string]*Spec{
-		"rule_set": req(ref("rule_set")),
-		"line":     req(ref("target")),
-		"invert":   boolean(),
+		"rule_set":     ref("rule_set"),
+		"line":         ref("target"),
+		"invert":       boolean(),
+		"subscription": ref("subscription"),
+		"policies":     &Spec{shape: shapeMap, elem: ref("target"), check: policyName},
+		"other":        ref("target"),
 	})
 	return obj(map[string]*Spec{
 		"id":    req(idSpec()),
