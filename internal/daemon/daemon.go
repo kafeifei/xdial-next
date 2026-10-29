@@ -10,12 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kafeifei/xdial-next/internal/config"
 	"github.com/kafeifei/xdial-next/internal/paths"
 	"github.com/kafeifei/xdial-next/internal/store"
-	"github.com/kafeifei/xdial-next/internal/sysdns"
 )
 
 // Options configures a daemon. Tests replace the system hooks.
@@ -24,31 +24,30 @@ type Options struct {
 	// Executable starts the engine and the checks; the daemon runs its own
 	// root-owned copy, 6.1.
 	Executable string
-	// Authorize decides whether a peer may use the API; nil means root or a
-	// member of admin, 6.2.
-	Authorize func(uid uint32, groups []uint32) bool
-	// SetDNS and ClearDNS manage the system resolver key, 6.4.
-	SetDNS   func(key string, server netip.Addr) error
-	ClearDNS func(key string) error
+	// Authorize decides whether a peer may use the API; nil means root or
+	// the user logged in at the console, 6.2.
+	Authorize func(uid uint32) bool
+	// System reaches macOS for DNS, 6.4; nil means the real one.
+	System System
 	// ExcludeFromBackup marks a directory for Time Machine to skip, 4.4.
 	ExcludeFromBackup func(dir string) error
 	// NoTUN leaves the TUN inbound out, so tests run the engine unprivileged.
 	NoTUN bool
 }
 
-// adminGroup is the gid of macOS's admin group.
-const adminGroup = 80
-
-func defaultAuthorize(uid uint32, groups []uint32) bool {
+// consoleOrRoot allows root and the user logged in at the console: the
+// owner of /dev/console, which is root at the login window. It is asked on
+// every request, so after a fast user switch the previous user is refused.
+func consoleOrRoot(uid uint32) bool {
 	if uid == 0 {
 		return true
 	}
-	for _, g := range groups {
-		if g == adminGroup {
-			return true
-		}
+	info, err := os.Stat("/dev/console")
+	if err != nil {
+		return false
 	}
-	return false
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == uid
 }
 
 func excludeFromBackup(dir string) error {
@@ -70,33 +69,41 @@ type Secret struct {
 // Daemon is one running daemon.
 type Daemon struct {
 	opts   Options
+	sys    System
 	events *eventLog
 
-	mu       sync.Mutex
+	// ctl serializes everything that starts, stops or replaces the
+	// connection, 6.3. mu guards the fields below and is never held across
+	// a slow step, so status answers while a connection is coming up.
+	ctl sync.Mutex
+	mu  sync.Mutex
+
 	raw      []byte // the stored canonical configuration
 	cfg      *config.Config
-	state    State
+	state    State // what the user asked for; persisted
 	secrets  map[string]Secret
-	engine   *engineProc
+	conn     *connection
 	status   string // disconnected, connecting, connected, failed
 	since    time.Time
 	lastErr  string
-	dnsSet   bool
+	physical []netip.Addr // the physical DNS of the last attempt
+	gen      uint64       // bumped by every request that changes the connection
 	failures []time.Time
 	closing  bool
+	// wake tells monitor the connection changed, so it watches the new
+	// resolver session.
+	wake chan struct{}
 }
 
 // New prepares a daemon: directories, permissions, stored files. It also
-// clears a resolver key a killed predecessor may have left, 6.3.
+// removes a resolver key an older build may have left; the key this build
+// sets goes by itself with the session holding it, 6.4.
 func New(opts Options) (*Daemon, error) {
 	if opts.Authorize == nil {
-		opts.Authorize = defaultAuthorize
+		opts.Authorize = consoleOrRoot
 	}
-	if opts.SetDNS == nil {
-		opts.SetDNS = sysdns.Set
-	}
-	if opts.ClearDNS == nil {
-		opts.ClearDNS = sysdns.Clear
+	if opts.System == nil {
+		opts.System = macOS{}
 	}
 	if opts.ExcludeFromBackup == nil {
 		opts.ExcludeFromBackup = excludeFromBackup
@@ -110,12 +117,13 @@ func New(opts Options) (*Daemon, error) {
 			return nil, err
 		}
 	}
-	d := &Daemon{opts: opts, status: "disconnected", since: time.Now(), secrets: map[string]Secret{}}
+	trimDaemonLog(l.DaemonLog())
+	d := &Daemon{opts: opts, sys: opts.System, status: "disconnected", since: time.Now(), secrets: map[string]Secret{}, wake: make(chan struct{}, 1)}
 	d.events = newEventLog(l.Events())
 	if err := opts.ExcludeFromBackup(l.Private()); err != nil {
 		d.events.add("backup_exclusion_failed", map[string]any{"error": err.Error()})
 	}
-	if err := opts.ClearDNS(l.DNSKey()); err != nil {
+	if err := d.sys.ClearStale(l.DNSKey()); err != nil {
 		d.events.add("dns_clear_failed", map[string]any{"error": err.Error()})
 	}
 	if err := store.ReadJSON(l.State(), &d.state); err != nil {
@@ -140,7 +148,7 @@ func New(opts Options) (*Daemon, error) {
 }
 
 // Run serves the local API until ctx ends, resuming a connection the state
-// says was up. On the way out it disconnects without changing the desired
+// says the user wants. On the way out it disconnects without changing that
 // state, so the next start resumes it.
 func (d *Daemon) Run(ctx context.Context) error {
 	listener, err := d.listen()
@@ -148,22 +156,33 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	d.events.add("daemon_started", nil)
+	d.ctl.Lock()
 	d.mu.Lock()
-	if d.state.Connected && d.cfg != nil {
-		if err := d.connectLocked(d.state.Scenario); err != nil {
-			d.lastErr = err.Error()
+	resume, scenario := d.state.Connected && d.cfg != nil, d.state.Scenario
+	d.mu.Unlock()
+	if resume {
+		if err := d.connectLocked(scenario); err != nil {
+			d.retryLocked(err.Error())
 		}
 	}
-	d.mu.Unlock()
+	d.ctl.Unlock()
+	monitorDone := make(chan struct{})
+	go func() {
+		d.monitor(ctx)
+		close(monitorDone)
+	}()
 	go func() {
 		<-ctx.Done()
 		listener.Close()
 	}()
 	err = d.serve(listener)
+	<-monitorDone
+	d.ctl.Lock()
 	d.mu.Lock()
 	d.closing = true
-	d.teardownLocked()
 	d.mu.Unlock()
+	d.disconnectLocked()
+	d.ctl.Unlock()
 	d.events.add("daemon_stopped", nil)
 	if ctx.Err() != nil {
 		return nil
@@ -171,14 +190,63 @@ func (d *Daemon) Run(ctx context.Context) error {
 	return err
 }
 
-func (d *Daemon) saveState() error {
-	return store.WriteJSON(d.opts.Layout.State(), d.state, 0o600)
+// monitor calls reconcile on every change the resolver session reports,
+// once the burst settles, and every checkInterval.
+func (d *Daemon) monitor(ctx context.Context) {
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+	for {
+		var changes, done <-chan struct{}
+		d.mu.Lock()
+		if d.conn != nil && d.conn.resolver != nil {
+			changes, done = d.conn.resolver.Changes(), d.conn.resolver.Done()
+		}
+		d.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return
+		case <-d.wake:
+			continue
+		case <-ticker.C:
+		case <-done:
+		case <-changes:
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(settleDelay):
+			}
+		}
+		d.reconcile()
+	}
 }
 
+// trimDaemonLog keeps launchd's stdout and stderr file, which only panics
+// reach, from growing without bound: past 1 MiB it moves to .1 and starts
+// again. launchd appends, so truncating in place is safe.
+func trimDaemonLog(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= 1<<20 {
+		return
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = os.WriteFile(path+".1", data, 0o600)
+	}
+	_ = os.Truncate(path, 0)
+}
+
+func (d *Daemon) saveState() error {
+	d.mu.Lock()
+	state := d.state
+	d.mu.Unlock()
+	return store.WriteJSON(d.opts.Layout.State(), state, 0o600)
+}
+
+// saveSecrets is called with d.mu held.
 func (d *Daemon) saveSecrets() error {
 	return store.WriteJSON(d.opts.Layout.Secrets(), d.secrets, 0o600)
 }
 
+// revision is called with d.mu held.
 func (d *Daemon) revision() string {
 	if d.cfg == nil {
 		return ""
@@ -187,6 +255,8 @@ func (d *Daemon) revision() string {
 }
 
 func (d *Daemon) setStatus(status, lastErr string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.status = status
 	d.since = time.Now()
 	d.lastErr = lastErr

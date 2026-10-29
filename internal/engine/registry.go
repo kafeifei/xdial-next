@@ -11,7 +11,6 @@ import (
 	"github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport"
-	"github.com/sagernet/sing-box/dns/transport/local"
 	"github.com/sagernet/sing-box/protocol/anytls"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
@@ -52,7 +51,7 @@ func Context(ctx context.Context, allowed ...string) context.Context {
 	tailscale.RegisterEndpoint(endpoints)
 
 	resolvers := dns.NewTransportRegistry()
-	local.RegisterTransport(resolvers)
+	transport.RegisterUDP(resolvers)
 	transport.RegisterHTTPS(resolvers)
 	openconnect.RegisterDNSTransport(resolvers)
 	tailscale.RegistryTransport(resolvers)

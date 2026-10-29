@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"time"
 
@@ -42,37 +43,52 @@ func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 
 func (d *Daemon) version(json.RawMessage) reply {
 	return reply{schema: SchemaDaemonVersion, result: map[string]any{
-		"version": buildinfo.Version, "revision": buildinfo.Revision(), "sing_box": buildinfo.SingBox(), "api": 1,
+		"version": buildinfo.Version, "revision": buildinfo.Revision(), "build": buildinfo.Build(), "sing_box": buildinfo.SingBox(), "api": 1,
 	}}
 }
 
-// Status is the result of status and of the methods that change it.
+// Status is the result of status and of the methods that change it,
+// ARCHITECTURE.md 6.3. State is what is true now; Intent is what the user
+// asked for, which the daemon keeps working towards.
 type Status struct {
-	State     string    `json:"state"`
-	Connected bool      `json:"connected"`
-	Scenario  string    `json:"scenario"`
-	Revision  string    `json:"revision"`
-	Since     time.Time `json:"since"`
-	LastError string    `json:"last_error"`
-	SystemDNS bool      `json:"system_dns"`
-	EnginePID int       `json:"engine_pid"`
+	State       string    `json:"state"`
+	Intent      string    `json:"intent"`
+	Connected   bool      `json:"connected"`
+	Scenario    string    `json:"scenario"`
+	Revision    string    `json:"revision"`
+	Since       time.Time `json:"since"`
+	LastError   string    `json:"last_error"`
+	SystemDNS   bool      `json:"system_dns"`
+	PhysicalDNS []string  `json:"physical_dns"`
+	EnginePID   int       `json:"engine_pid"`
 }
 
 func (d *Daemon) statusLocked() Status {
 	s := Status{
-		State: d.status, Connected: d.status == "connected", Scenario: d.state.Scenario,
-		Revision: d.revision(), Since: d.since.UTC(), LastError: d.lastErr, SystemDNS: d.dnsSet,
+		State: d.status, Intent: "disconnected", Connected: d.status == "connected", Scenario: d.state.Scenario,
+		Revision: d.revision(), Since: d.since.UTC(), LastError: d.lastErr, PhysicalDNS: []string{},
 	}
-	if d.engine != nil {
-		s.EnginePID = d.engine.pid
+	if d.state.Connected {
+		s.Intent = "connected"
+	}
+	for _, a := range d.physical {
+		s.PhysicalDNS = append(s.PhysicalDNS, a.String())
+	}
+	if c := d.conn; c != nil {
+		s.EnginePID = c.engine.pid
+		s.SystemDNS = c.first == resolverAddress.String()
 	}
 	return s
 }
 
-func (d *Daemon) statusMethod(json.RawMessage) reply {
+func (d *Daemon) currentStatus() Status {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return reply{schema: SchemaStatus, result: d.statusLocked()}
+	return d.statusLocked()
+}
+
+func (d *Daemon) statusMethod(json.RawMessage) reply {
+	return reply{schema: SchemaStatus, result: d.currentStatus()}
 }
 
 func (d *Daemon) export(json.RawMessage) reply {
@@ -144,28 +160,29 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 		return reply{err: &cli.Error{Code: cli.CodeConfigInvalid, Message: fmt.Sprintf("配置有 %d 处问题", len(verification.Problems)), Problems: verification.Problems}}
 	}
 
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if p.IfMatch != "" && p.IfMatch != d.revision() {
-		return reply{err: cli.Errorf(cli.CodeConfigConflict, "重新 xdial config export 后再改", "配置已经被改过：现在是 %s", d.revision())}
+	revision, current, secrets := d.revision(), d.cfg, maps.Clone(d.secrets)
+	connected := d.conn != nil
+	scenario := d.state.Scenario
+	d.mu.Unlock()
+	if p.IfMatch != "" && p.IfMatch != revision {
+		return reply{err: cli.Errorf(cli.CodeConfigConflict, "重新 xdial config export 后再改", "配置已经被改过：现在是 %s", revision)}
 	}
-	connected := d.state.Connected && d.status == "connected"
 	scenarioGone := true
 	for _, s := range c.Scenarios {
-		scenarioGone = scenarioGone && s.ID != d.state.Scenario
+		scenarioGone = scenarioGone && s.ID != scenario
 	}
 	if connected && scenarioGone {
-		return reply{err: cli.Errorf(cli.CodeConfigConflict, "先 xdial scenario use 切到别的场景", "新配置删掉了正在用的场景 %q", d.state.Scenario)}
+		return reply{err: cli.Errorf(cli.CodeConfigConflict, "先 xdial scenario use 切到别的场景", "新配置删掉了正在用的场景 %q", scenario)}
 	}
-	if err := d.checkFormats(c, func(name string) (string, bool) {
-		s, ok := d.secrets[name]
-		return s.Value, ok
-	}); err != nil {
+	if err := checkFormats(c, secrets); err != nil {
 		return reply{err: err}
 	}
 	result := ApplyResult{
-		Revision: c.Root.Revision(), PreviousRevision: d.revision(),
-		Changes: diff(d.cfg, c), Secrets: d.secretRefs(c), Pending: verification.Pending,
+		Revision: c.Root.Revision(), PreviousRevision: revision,
+		Changes: diff(current, c), Secrets: secretRefs(c, secrets), Pending: verification.Pending,
 		MissingSecrets: []string{},
 	}
 	for _, s := range result.Secrets {
@@ -177,19 +194,26 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 		return reply{schema: SchemaConfigApply, result: result}
 	}
 
+	// Connected, the new configuration must come up before it is stored;
+	// if it does not, the old one comes back and nothing changes, 4.1.
+	d.mu.Lock()
 	previous, previousRaw := d.cfg, d.raw
 	d.cfg, d.raw = c, c.Root.Canonical()
+	d.mu.Unlock()
 	if connected {
-		if err := d.connectLocked(d.state.Scenario); err != nil {
+		d.gen++
+		if err := d.connectLocked(scenario); err != nil {
+			d.mu.Lock()
 			d.cfg, d.raw = previous, previousRaw
-			if restoreErr := d.connectLocked(d.state.Scenario); restoreErr != nil {
-				d.lastErr = "新配置没能启动，旧配置也没能恢复：" + restoreErr.Error()
+			d.mu.Unlock()
+			if restoreErr := d.connectLocked(scenario); restoreErr != nil {
+				d.retryLocked("新配置没能启动，旧配置也没能恢复：" + restoreErr.Error())
 			}
 			return reply{err: err}
 		}
 		result.Reloaded = true
 	}
-	if err := store.WriteFile(d.opts.Layout.Config(), d.raw, 0o600); err != nil {
+	if err := store.WriteFile(d.opts.Layout.Config(), c.Root.Canonical(), 0o600); err != nil {
 		return reply{err: err}
 	}
 	result.Applied = true
@@ -241,14 +265,14 @@ func diff(old, next *config.Config) []Change {
 	return changes
 }
 
-func (d *Daemon) secretRefs(c *config.Config) []SecretRef {
+func secretRefs(c *config.Config, secrets map[string]Secret) []SecretRef {
 	refs := map[string][]string{}
 	if c != nil {
 		for _, use := range c.Secrets {
 			refs[use.Name] = append(refs[use.Name], use.Path)
 		}
 	}
-	for name := range d.secrets {
+	for name := range secrets {
 		if _, ok := refs[name]; !ok {
 			refs[name] = []string{}
 		}
@@ -261,7 +285,7 @@ func (d *Daemon) secretRefs(c *config.Config) []SecretRef {
 	out := make([]SecretRef, 0, len(names))
 	for _, name := range names {
 		r := SecretRef{Name: name, References: refs[name]}
-		if s, ok := d.secrets[name]; ok {
+		if s, ok := secrets[name]; ok {
 			r.Set, r.Updated = true, s.Updated.UTC().Format(time.RFC3339)
 		}
 		out = append(out, r)
@@ -286,21 +310,22 @@ func (d *Daemon) secretSet(params json.RawMessage) reply {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.cfg != nil {
-		if err := d.checkFormats(d.cfg, func(name string) (string, bool) {
-			if name == p.Name {
-				return p.Value, true
-			}
-			return "", false
-		}); err != nil {
+		if err := checkFormats(d.cfg, map[string]Secret{p.Name: {Value: p.Value}}); err != nil {
 			return reply{err: err}
 		}
 	}
+	previous, had := d.secrets[p.Name]
 	d.secrets[p.Name] = Secret{Value: p.Value, Updated: time.Now()}
 	if err := d.saveSecrets(); err != nil {
+		if had {
+			d.secrets[p.Name] = previous
+		} else {
+			delete(d.secrets, p.Name)
+		}
 		return reply{err: err}
 	}
 	d.events.add("secret_set", map[string]any{"name": p.Name})
-	for _, r := range d.secretRefs(d.cfg) {
+	for _, r := range secretRefs(d.cfg, d.secrets) {
 		if r.Name == p.Name {
 			return reply{schema: SchemaSecret, result: r}
 		}
@@ -311,7 +336,7 @@ func (d *Daemon) secretSet(params json.RawMessage) reply {
 func (d *Daemon) secretList(json.RawMessage) reply {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return reply{schema: SchemaSecretList, result: map[string]any{"secrets": d.secretRefs(d.cfg)}}
+	return reply{schema: SchemaSecretList, result: map[string]any{"secrets": secretRefs(d.cfg, d.secrets)}}
 }
 
 func (d *Daemon) secretRemove(params json.RawMessage) reply {
@@ -323,7 +348,7 @@ func (d *Daemon) secretRemove(params json.RawMessage) reply {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, r := range d.secretRefs(d.cfg) {
+	for _, r := range secretRefs(d.cfg, d.secrets) {
 		if r.Name == p.Name && len(r.References) > 0 {
 			return reply{err: cli.Errorf(cli.CodeSecretInUse, "先改掉这些引用", "凭据 %s 仍被引用：%v", p.Name, r.References)}
 		}
@@ -331,14 +356,20 @@ func (d *Daemon) secretRemove(params json.RawMessage) reply {
 	if _, ok := d.secrets[p.Name]; !ok {
 		return reply{err: cli.Errorf(cli.CodeSecretMissing, "", "没有凭据 %s", p.Name)}
 	}
+	previous := d.secrets[p.Name]
 	delete(d.secrets, p.Name)
 	if err := d.saveSecrets(); err != nil {
+		d.secrets[p.Name] = previous
 		return reply{err: err}
 	}
 	d.events.add("secret_removed", map[string]any{"name": p.Name})
 	return reply{schema: SchemaSecret, result: SecretRef{Name: p.Name, References: []string{}}}
 }
 
+// connect brings up a scenario, or the last one. Connecting again to the
+// connection that is up changes nothing. A connect that fails leaves what
+// the user asked for as it was: only a connection that came up is resumed
+// after a restart, 6.3.
 func (d *Daemon) connect(params json.RawMessage) reply {
 	var p struct {
 		Scenario string `json:"scenario"`
@@ -346,32 +377,47 @@ func (d *Daemon) connect(params json.RawMessage) reply {
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
 	}
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	scenario := p.Scenario
 	if scenario == "" {
 		scenario = d.state.Scenario
 	}
+	c, revision := d.conn, d.revision()
+	d.mu.Unlock()
+	if c != nil && c.scenario == scenario && c.revision == revision {
+		return reply{schema: SchemaStatus, result: d.currentStatus()}
+	}
+	d.gen++
+	d.failures = nil
 	if err := d.connectLocked(scenario); err != nil {
 		return reply{err: err}
 	}
-	d.failures = nil
-	return reply{schema: SchemaStatus, result: d.statusLocked()}
+	d.events.add("connected", map[string]any{"scenario": scenario})
+	return reply{schema: SchemaStatus, result: d.currentStatus()}
 }
 
+// disconnect stores the user's intent before taking anything down, so a
+// daemon killed halfway does not reconnect when it comes back, and drops
+// any retry that is pending, 6.3.
 func (d *Daemon) disconnect(json.RawMessage) reply {
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
+	d.gen++
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.teardownLocked()
 	d.state.Connected = false
+	d.mu.Unlock()
 	if err := d.saveState(); err != nil {
 		return reply{err: err}
 	}
+	d.disconnectLocked()
 	d.setStatus("disconnected", "")
 	d.events.add("disconnected", nil)
-	return reply{schema: SchemaStatus, result: d.statusLocked()}
+	return reply{schema: SchemaStatus, result: d.currentStatus()}
 }
 
+// scenarioUse switches the scenario; connected, it reloads.
 func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 	var p struct {
 		ID string `json:"id"`
@@ -379,30 +425,70 @@ func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
 	}
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.cfg == nil {
+	cfg, connected := d.cfg, d.conn != nil
+	d.mu.Unlock()
+	if cfg == nil {
 		return reply{err: cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")}
 	}
 	found := false
-	for _, s := range d.cfg.Scenarios {
+	for _, s := range cfg.Scenarios {
 		found = found || s.ID == p.ID
 	}
 	if !found {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "", "场景 %q 不存在", p.ID)}
 	}
-	if d.state.Connected && d.status == "connected" {
+	if connected {
+		d.gen++
 		if err := d.connectLocked(p.ID); err != nil {
 			return reply{err: err}
 		}
 	} else {
+		d.mu.Lock()
 		d.state.Scenario = p.ID
+		d.mu.Unlock()
 		if err := d.saveState(); err != nil {
 			return reply{err: err}
 		}
 	}
 	d.events.add("scenario_used", map[string]any{"scenario": p.ID})
-	return reply{schema: SchemaStatus, result: d.statusLocked()}
+	return reply{schema: SchemaStatus, result: d.currentStatus()}
+}
+
+// checkSecrets reports the secrets a compilation needs that are not set,
+// and checks the ones that are against the fields that use them, without
+// ever echoing a value.
+func checkSecrets(c *config.Config, secrets map[string]Secret, used []string) error {
+	var missing []string
+	for _, name := range used {
+		if _, ok := secrets[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return cli.Errorf(cli.CodeSecretMissing, "用 xdial secret set <名字> 设置", "还没设置的凭据：%v", missing)
+	}
+	return checkFormats(c, secrets)
+}
+
+// checkFormats checks each set secret against every field that uses it.
+func checkFormats(c *config.Config, secrets map[string]Secret) error {
+	var problems []cli.Problem
+	for _, use := range c.Secrets {
+		s, ok := secrets[use.Name]
+		if !ok || use.Spec.Format == nil {
+			continue
+		}
+		if msg := use.Spec.Format(s.Value, use.Parent); msg != "" {
+			problems = append(problems, cli.Problem{Code: cli.CodeConfigValue, Path: use.Path, Object: use.Object, Message: "凭据 " + use.Name + " 的格式不对：" + msg})
+		}
+	}
+	if len(problems) > 0 {
+		return &cli.Error{Code: cli.CodeSecretFormat, Message: fmt.Sprintf("%d 处凭据格式不对", len(problems)), Problems: problems}
+	}
+	return nil
 }
 
 func validSecretName(name string) bool {

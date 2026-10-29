@@ -1,6 +1,7 @@
 // Package paths names every file and directory a daemon identity owns,
 // ARCHITECTURE.md 6.1. Release and Debug builds are separate identities
-// with separate paths, so both can be installed side by side.
+// with separate paths, so both can be installed side by side; only the
+// connection lock is shared, so only one of them is connected at a time.
 package paths
 
 import "path/filepath"
@@ -67,3 +68,7 @@ func (l Layout) Socket() string { return filepath.Join(l.SocketDir(), "api.sock"
 
 // DNSKey is the dynamic-store key of the system resolver, 6.4.
 func (l Layout) DNSKey() string { return "State:/Network/Service/" + l.ID + "/DNS" }
+
+// ConnectionLock is shared by every identity: a daemon holds it, with its
+// engine and resolver session, for as long as it is connected, 6.1.
+func (l Layout) ConnectionLock() string { return l.at("var", "run", Release+".connection.lock") }

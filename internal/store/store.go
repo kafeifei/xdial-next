@@ -62,7 +62,8 @@ func ReadJSON(path string, v any) error {
 }
 
 // EnsureDir creates dir with perm and enforces perm on an existing one, so
-// a directory created looser by someone else is tightened.
+// a directory created looser by someone else is tightened. A symlink in its
+// place is refused; run as root, the directory is made root's.
 func EnsureDir(dir string, perm os.FileMode) error {
 	if err := os.MkdirAll(dir, perm); err != nil {
 		return err
@@ -73,6 +74,11 @@ func EnsureDir(dir string, perm os.FileMode) error {
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("%s 不是目录", dir)
+	}
+	if os.Geteuid() == 0 {
+		if err := os.Lchown(dir, 0, 0); err != nil {
+			return err
+		}
 	}
 	return os.Chmod(dir, perm)
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/kafeifei/xdial-next/internal/cli"
+	"github.com/kafeifei/xdial-next/internal/peercred"
 )
 
 // Version is the protocol's major version.
@@ -67,17 +68,25 @@ type Client struct {
 	timeout time.Duration
 }
 
-// Dial connects to the daemon's socket. The errors are registered codes the
+// Dial connects to the daemon's socket and checks, before anything is sent,
+// that the process listening is owned by server: root for an installed
+// daemon. A socket someone else put in the daemon's place never receives a
+// request, a secret least of all, 6.2. The errors are registered codes the
 // CLI prints as they are.
-func Dial(socket string) (*Client, error) {
+func Dial(socket string, server uint32) (*Client, error) {
 	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
 	if err != nil {
 		switch {
 		case errors.Is(err, os.ErrPermission), errors.Is(err, syscall.EACCES):
-			return nil, cli.Errorf(cli.CodeAPIPermission, "用 admin 组的账户运行，或者加 sudo", "没有权限连接 daemon")
+			return nil, cli.Errorf(cli.CodeAPIPermission, "", "没有权限连接 daemon：%v", err)
 		default:
 			return nil, cli.Errorf(cli.CodeDaemonUnreachable, "先运行 sudo xdial daemon install，或者确认 daemon 在运行", "连不上 daemon：%v", err)
 		}
+	}
+	uid, err := peercred.UID(conn.(*net.UnixConn))
+	if err != nil || uid != server {
+		conn.Close()
+		return nil, cli.Errorf(cli.CodeDaemonUntrusted, "运行 sudo xdial daemon install 重新安装", "%s 上监听的不是 daemon（属主 uid %d）", socket, uid)
 	}
 	return &Client{conn: conn, reader: bufio.NewReaderSize(conn, 64<<10), timeout: 2 * time.Minute}, nil
 }

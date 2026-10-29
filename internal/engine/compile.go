@@ -6,6 +6,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -32,9 +33,16 @@ const proxyDNSServer = "1.1.1.1"
 // the test VM measured every stack working.
 const DefaultStack = "mixed"
 
-// ddrName is where a system discovers an encrypted upgrade of its resolver,
-// which would take DNS past sing-box, ARCHITECTURE.md 6.4.
-const ddrName = "_dns.resolver.arpa"
+// Names sing-box answers NXDOMAIN itself, ARCHITECTURE.md 6.4: where a
+// system discovers an encrypted upgrade of its resolver (DDR), and the
+// canary that turns off Firefox's own DNS over HTTPS. Either would take DNS
+// past sing-box. The daemon also asks the first to check the path into
+// sing-box.
+var localNXDOMAIN = []string{"_dns.resolver.arpa", "use-application-dns.net"}
+
+// checkPhysicalDNS stands in for the physical network's DNS when checking:
+// an address that is never dialled, from TEST-NET-1.
+var checkPhysicalDNS = netip.MustParseAddr("192.0.2.53")
 
 // placeholderRule stands in for a remote rule set whose content is not at
 // hand: it can never match, ARCHITECTURE.md 4.1.
@@ -58,6 +66,11 @@ type Options struct {
 	Stack string
 	// LogLevel is the sing-box log level XDial sets explicitly, 4.3.
 	LogLevel string
+	// PhysicalDNS is the physical network's DNS server, read before the
+	// system resolver points into TUN, 3.3. direct and the lines' own
+	// server names are resolved there, dialled on the physical interface.
+	// Unset, as in checks, a placeholder is compiled.
+	PhysicalDNS netip.Addr
 }
 
 // Placeholder is the Secret function for checks.
@@ -400,12 +413,17 @@ func (k *compiler) route(scenario *config.Scenario, endpointIDs []string, ruleSe
 func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map[string]dnsSet) (map[string]any, []string) {
 	var used []string
 	seen := map[string]bool{}
-	servers := []any{map[string]any{"type": "local", "tag": tagDNSLocal}}
+	physical := k.opts.PhysicalDNS
+	if !physical.IsValid() {
+		physical = checkPhysicalDNS
+	}
+	servers := []any{map[string]any{"type": "udp", "tag": tagDNSLocal, "server": physical.String()}}
 	via := map[string]bool{}
 	server := func(line string) string {
 		o := k.c.Line(line)
-		// direct and block use local; endpoints answer only the names their
-		// VPN pushed, so other names chosen for them use local too, 3.3.
+		// direct and block use the physical DNS; endpoints answer only the
+		// names their VPN pushed, so other names chosen for them use it too,
+		// 3.3.
 		if o == nil || (o.Kind == "line" && isEndpoint(o.Type)) {
 			return tagDNSLocal
 		}
@@ -421,7 +439,7 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 	if len(endpointIDs) > 0 {
 		rules = append(rules, map[string]any{"inbound": endpointIDs, "action": "reject"})
 	}
-	rules = append(rules, map[string]any{"domain": []string{ddrName}, "action": "predefined", "rcode": "NXDOMAIN"})
+	rules = append(rules, map[string]any{"domain": localNXDOMAIN, "action": "predefined", "rcode": "NXDOMAIN"})
 	final := tagDNSLocal
 	if scenario != nil {
 		for _, r := range scenario.Rules {

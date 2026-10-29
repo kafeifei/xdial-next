@@ -58,6 +58,10 @@ const (
 	CodeSecretInUse       = "secret.in_use"
 	CodeSecretFormat      = "secret.format"
 	CodeEngineFailed      = "engine.failed"
+	CodeDaemonUntrusted   = "daemon.untrusted"
+	CodeDaemonBusy        = "daemon.busy"
+	CodeEngineBusy        = "engine.busy"
+	CodeConfirmRequired   = "api.confirm_required"
 )
 
 var codes = map[string]Code{}
@@ -91,13 +95,17 @@ func init() {
 	register(Code{Name: CodeConfigMore, Problem: true, Summary: "问题太多，只列出了前面的，这一条给出没列出的数量"})
 
 	register(Code{Name: CodeDaemonUnreachable, Exit: ExitMissing, Summary: "daemon 没在运行，或者连不上 socket", Hint: "先运行 sudo xdial daemon install"})
-	register(Code{Name: CodeAPIPermission, Exit: ExitPermission, Summary: "调用方不是 root 或 admin 组成员", Hint: "用 admin 组的账户运行，或者加 sudo"})
-	register(Code{Name: CodeAPIVersion, Exit: ExitNegative, Summary: "请求的协议版本 daemon 不认识", Hint: "让 xdial 和 daemon 用同一个版本"})
+	register(Code{Name: CodeDaemonUntrusted, Exit: ExitMissing, Summary: "socket 上监听的进程不属于 root，不是安装的 daemon；请求没有发出", Hint: "运行 sudo xdial daemon install 重新安装"})
+	register(Code{Name: CodeDaemonBusy, Exit: ExitConflict, Summary: "daemon 的连接数已满", Hint: "关掉多余的 xdial logs --follow 后重试"})
+	register(Code{Name: CodeAPIPermission, Exit: ExitPermission, Summary: "调用方不是 root，也不是当前在屏幕前登录的用户", Hint: "在屏幕前登录的账户里运行，或者加 sudo"})
+	register(Code{Name: CodeAPIVersion, Exit: ExitMissing, Summary: "请求的协议版本 daemon 不认识", Hint: "用 sudo xdial daemon install 让 daemon 和 xdial 同一个版本"})
+	register(Code{Name: CodeConfirmRequired, Exit: ExitPermission, Summary: "这次操作要先在本机上确认；第一版不产生", Hint: "按 message 的说明确认后重试"})
 	register(Code{Name: CodeConfigConflict, Exit: ExitConflict, Summary: "配置已被别人改过，或者操作和当前状态冲突", Hint: "重新 export 后再改"})
-	register(Code{Name: CodeSecretMissing, Exit: ExitNegative, Summary: "用到的凭据还没设置", Hint: "用 xdial secret set <名字> 设置"})
+	register(Code{Name: CodeSecretMissing, Exit: ExitMissing, Summary: "用到的凭据还没设置", Hint: "用 xdial secret set <名字> 设置"})
 	register(Code{Name: CodeSecretInUse, Exit: ExitConflict, Summary: "凭据仍被引用，不能删除", Hint: "先改掉引用它的配置"})
 	register(Code{Name: CodeSecretFormat, Exit: ExitNegative, Summary: "凭据的格式不符合引用它的字段", Hint: "按提示改正后重新设置"})
-	register(Code{Name: CodeEngineFailed, Exit: ExitNegative, Summary: "引擎没能启动，或者启动后很快退出", Hint: "用 xdial status 看原因"})
+	register(Code{Name: CodeEngineFailed, Exit: ExitNegative, Summary: "没能连上：引擎没能启动、启动后很快退出，或者 DNS 没能接管", Hint: "用 xdial status 看原因"})
+	register(Code{Name: CodeEngineBusy, Exit: ExitConflict, Summary: "另一个 XDial 身份（正式版或 Debug）正连着", Hint: "先在另一个身份里 xdial disconnect"})
 }
 
 // Lookup returns the registration of a code.

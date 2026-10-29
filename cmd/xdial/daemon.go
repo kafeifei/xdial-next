@@ -23,8 +23,12 @@ import (
 	"github.com/kafeifei/xdial-next/internal/sysdns"
 )
 
-// layoutRoot prefixes every daemon path; only tests set it.
-var layoutRoot string
+// layoutRoot prefixes every daemon path and daemonUID is the owner the
+// daemon's socket must have; only tests change them.
+var (
+	layoutRoot string
+	daemonUID  uint32
+)
 
 func layout() paths.Layout { return paths.Layout{ID: buildinfo.Identity, Root: layoutRoot} }
 
@@ -71,7 +75,7 @@ func daemonCommands() []*command {
 // call runs one API method and prints the reply: as it came with --json,
 // through text otherwise.
 func call(ctx *context_, method string, params any, text func(io.Writer, json.RawMessage)) int {
-	client, err := api.Dial(layout().Socket())
+	client, err := api.Dial(layout().Socket(), daemonUID)
 	if err != nil {
 		return ctx.out.Fail(err)
 	}
@@ -244,6 +248,11 @@ func runDaemon(ctx *context_) int {
 	return ctx.out.Succeed("xdial.daemon.run/v1", map[string]any{"stopped": true}, nil)
 }
 
+// plistTemplate is the launchd job, 6.1. launchd kills what is left of the
+// daemon's process group when it exits (AbandonProcessGroup false), so an
+// engine or resolver session cannot outlive it; ThrottleInterval spaces
+// restarts; ExitTimeOut leaves room for a disconnect before SIGKILL. Only
+// panics reach stderr; the daemon trims the file when it starts.
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -260,6 +269,12 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>AbandonProcessGroup</key>
+	<false/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>ExitTimeOut</key>
+	<integer>20</integer>
 	<key>ProcessType</key>
 	<string>Interactive</string>
 	<key>StandardOutPath</key>
@@ -279,7 +294,9 @@ type installReport struct {
 
 // runDaemonInstall copies the running binary to a root-owned path, writes
 // the launchd job and starts it, ARCHITECTURE.md 6.1. An installed daemon
-// is booted out first, so this also upgrades.
+// is booted out first, which disconnects it, so installing again upgrades:
+// the binary is replaced by rename, never overwritten in place, and the
+// new daemon resumes the connection if it was up.
 func runDaemonInstall(ctx *context_) int {
 	if err := requireRoot(); err != nil {
 		return ctx.out.Fail(err)
@@ -290,28 +307,18 @@ func runDaemonInstall(ctx *context_) int {
 		return ctx.out.Fail(err)
 	}
 	_ = exec.Command("/bin/launchctl", "bootout", "system/"+l.ID).Run()
-	for _, dir := range []string{l.Data(), filepath.Dir(l.Bin())} {
-		if err := store.EnsureDir(dir, 0o755); err != nil {
-			return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "建目录 %s 失败：%v", dir, err))
+	for _, dir := range []struct {
+		path string
+		perm os.FileMode
+	}{{l.Data(), 0o755}, {filepath.Dir(l.Bin()), 0o755}, {l.Private(), 0o700}, {filepath.Dir(l.Plist()), 0o755}} {
+		if err := store.EnsureDir(dir.path, dir.perm); err != nil {
+			return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "准备目录 %s 失败：%v", dir.path, err))
 		}
-		if err := os.Chown(dir, 0, 0); err != nil {
-			return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "%v", err))
-		}
 	}
-	if err := store.EnsureDir(l.Private(), 0o700); err != nil {
-		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "%v", err))
-	}
-	binary, err := os.ReadFile(exe)
-	if err != nil {
-		return ctx.out.Fail(cli.Errorf(cli.CodeInputRead, "", "读 %s 出错：%v", exe, err))
-	}
-	if err := store.WriteFile(l.Bin(), binary, 0o755); err != nil {
-		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "拷贝二进制失败：%v", err))
+	if err := installBinary(exe, l.Bin()); err != nil {
+		return ctx.out.Fail(err)
 	}
 	plist := fmt.Sprintf(plistTemplate, l.ID, l.Bin(), l.DaemonLog(), l.DaemonLog())
-	if err := store.EnsureDir(filepath.Dir(l.Plist()), 0o755); err != nil {
-		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "%v", err))
-	}
 	if err := store.WriteFile(l.Plist(), []byte(plist), 0o644); err != nil {
 		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "写 launchd 配置失败：%v", err))
 	}
@@ -319,20 +326,65 @@ func runDaemonInstall(ctx *context_) int {
 		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "launchctl bootstrap 失败：%v：%s", err, strings.TrimSpace(string(out))))
 	}
 	deadline := time.Now().Add(15 * time.Second)
-	for {
-		if c, err := api.Dial(l.Socket()); err == nil {
+	var build string
+	for build == "" {
+		if c, err := api.Dial(l.Socket(), daemonUID); err == nil {
+			_ = c.Call("version", nil, func(r api.Response) bool {
+				var v struct {
+					Build string `json:"build"`
+				}
+				if r.OK && json.Unmarshal(r.Result, &v) == nil {
+					build = v.Build
+				}
+				return true
+			})
 			c.Close()
-			break
 		}
-		if time.Now().After(deadline) {
+		if build == "" && time.Now().After(deadline) {
 			return ctx.out.Fail(cli.Errorf(cli.CodeDaemonUnreachable, "看 "+l.DaemonLog(), "daemon 装好了，但 15 秒内没有起来"))
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	if build != buildinfo.Build() {
+		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "起来的 daemon 是 %s，不是刚装的 %s", build, buildinfo.Build()))
 	}
 	report := installReport{Identity: l.ID, Binary: l.Bin(), Plist: l.Plist(), Socket: l.Socket()}
 	return ctx.out.Succeed("xdial.daemon.install/v1", report, func(w io.Writer) {
 		fmt.Fprintf(w, "daemon %s 已安装并启动\n", l.ID)
 	})
+}
+
+// installBinary copies src, the xdial being run, to dst in the root-owned
+// bin directory, 6.1. The source is opened without following a symlink and
+// must be a regular file only its owner can write; the copy goes to a fresh
+// temporary file beside dst and replaces it by rename, so launchd never
+// starts a half-written file. Signed builds also check the copy's signature
+// before the rename (M6).
+func installBinary(src, dst string) error {
+	resolved, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return cli.Errorf(cli.CodeInputRead, "", "找不到 %s：%v", src, err)
+	}
+	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return cli.Errorf(cli.CodeInputRead, "", "打不开 %s：%v", resolved, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return cli.Errorf(cli.CodeInputRead, "", "%v", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
+		return cli.Errorf(cli.CodeInputPermission, "chmod go-w 之后再装", "%s 不是普通文件，或者属主以外的人能改它", resolved)
+	}
+	binary, err := io.ReadAll(io.LimitReader(f, 1<<30))
+	if err != nil {
+		return cli.Errorf(cli.CodeInputRead, "", "读 %s 出错：%v", resolved, err)
+	}
+	if err := store.WriteFile(dst, binary, 0o755); err != nil {
+		return cli.Errorf(cli.CodeInternal, "", "拷贝二进制失败：%v", err)
+	}
+	return nil
 }
 
 // runDaemonUninstall boots the daemon out, which makes it disconnect, then
@@ -343,8 +395,8 @@ func runDaemonUninstall(ctx *context_) int {
 	}
 	l := layout()
 	_ = exec.Command("/bin/launchctl", "bootout", "system/"+l.ID).Run()
-	// The daemon clears its resolver when it stops; clear it again in case
-	// it was not running to do so.
+	// The resolver key goes with the daemon's session; remove it again in
+	// case an older daemon left one that is not temporary.
 	_ = sysdns.Clear(l.DNSKey())
 	_, purge := ctx.options["--purge"]
 	removed := []string{}

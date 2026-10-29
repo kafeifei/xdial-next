@@ -393,7 +393,8 @@ func TestHiddenCommandsAreDispatched(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(exe, engine.EngineCommand)
-	cmd.Stdin = strings.NewReader(`{"log": {"level": "error"}, "outbounds": [{"type": "direct", "tag": "direct"}]}`)
+	cmd.Stdin = strings.NewReader(`{"log": {"level": "error"}, "outbounds": [{"type": "direct", "tag": "direct"}],
+		"dns": {"servers": [{"type": "udp", "tag": "d", "server": "192.0.2.53"}], "final": "d"}}`)
 	stdout, _ := cmd.StdoutPipe()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

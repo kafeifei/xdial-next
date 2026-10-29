@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -56,16 +57,95 @@ func (l *dnsLog) String() string {
 	return strings.Join(l.calls, " ")
 }
 
+// fakeSystem stands in for scutil and the DNS probe.
+type fakeSystem struct {
+	log      *dnsLog
+	mu       sync.Mutex
+	physical []netip.Addr
+	hidden   bool // the key reads as missing once
+	resolver *fakeResolver
+	onClose  func()
+}
+
+func (f *fakeSystem) PhysicalDNS() ([]netip.Addr, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.physical, nil
+}
+
+func (f *fakeSystem) setPhysical(addr string) {
+	f.mu.Lock()
+	f.physical = []netip.Addr{netip.MustParseAddr(addr)}
+	f.mu.Unlock()
+}
+
+func (f *fakeSystem) Hold(key string, lock *os.File) (Resolver, error) {
+	f.log.add("hold")
+	r := &fakeResolver{sys: f, changes: make(chan struct{}, 1), done: make(chan struct{})}
+	f.mu.Lock()
+	f.resolver = r
+	f.mu.Unlock()
+	return r, nil
+}
+
+func (f *fakeSystem) current() *fakeResolver {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resolver
+}
+
+func (f *fakeSystem) Resolver(string) (bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.hidden {
+		f.hidden = false
+		return false, "192.0.2.1", nil
+	}
+	return true, "172.19.0.2", nil
+}
+
+func (f *fakeSystem) Probe() error            { return nil }
+func (f *fakeSystem) ClearStale(string) error { return nil }
+
+type fakeResolver struct {
+	sys     *fakeSystem
+	changes chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (r *fakeResolver) Changes() <-chan struct{} { return r.changes }
+func (r *fakeResolver) Done() <-chan struct{}    { return r.done }
+func (r *fakeResolver) Republish() error         { r.sys.log.add("republish"); return nil }
+func (r *fakeResolver) Close() {
+	r.once.Do(func() {
+		if r.sys.onClose != nil {
+			r.sys.onClose()
+		}
+		r.sys.log.add("close")
+		close(r.done)
+	})
+}
+
+// notify is what a dynamic-store notification looks like to the daemon.
+func (r *fakeResolver) notify() {
+	select {
+	case r.changes <- struct{}{}:
+	default:
+	}
+}
+
 type harness struct {
 	t      *testing.T
 	layout paths.Layout
 	dns    *dnsLog
+	sys    *fakeSystem
 	client *api.Client
 	cancel context.CancelFunc
 	done   chan error
 }
 
-func start(t *testing.T, authorize func(uint32, []uint32) bool) *harness {
+func start(t *testing.T, authorize func(uint32) bool) *harness {
 	t.Helper()
 	// Unix socket paths are short on macOS; keep the root under /tmp.
 	root, err := os.MkdirTemp("/tmp", "xd")
@@ -73,18 +153,26 @@ func start(t *testing.T, authorize func(uint32, []uint32) bool) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(root) })
+	return startAt(t, root, "com.kafeifei.xdial.test", authorize)
+}
+
+func startAt(t *testing.T, root, id string, authorize func(uint32) bool) *harness {
+	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if authorize == nil {
-		authorize = func(uint32, []uint32) bool { return true }
+		authorize = func(uint32) bool { return true }
 	}
-	h := &harness{t: t, layout: paths.Layout{ID: "com.kafeifei.xdial.test", Root: root}, dns: &dnsLog{}, done: make(chan error, 1)}
+	if err := os.MkdirAll(filepath.Join(root, "var", "run"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	log := &dnsLog{}
+	sys := &fakeSystem{log: log, physical: []netip.Addr{netip.MustParseAddr("192.0.2.1")}}
+	h := &harness{t: t, layout: paths.Layout{ID: id, Root: root}, dns: log, sys: sys, done: make(chan error, 1)}
 	d, err := New(Options{
-		Layout: h.layout, Executable: exe, Authorize: authorize, NoTUN: true,
-		SetDNS:            func(key string, server netip.Addr) error { h.dns.add("set:" + server.String()); return nil },
-		ClearDNS:          func(key string) error { h.dns.add("clear"); return nil },
+		Layout: h.layout, Executable: exe, Authorize: authorize, NoTUN: true, System: sys,
 		ExcludeFromBackup: func(string) error { return nil },
 	})
 	if err != nil {
@@ -95,7 +183,7 @@ func start(t *testing.T, authorize func(uint32, []uint32) bool) *harness {
 	go func() { h.done <- d.Run(ctx) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		h.client, err = api.Dial(h.layout.Socket())
+		h.client, err = api.Dial(h.layout.Socket(), uint32(os.Getuid()))
 		if err == nil {
 			break
 		}
@@ -171,8 +259,15 @@ func TestConnectDisconnect(t *testing.T) {
 	if status["state"] != "connected" || status["system_dns"] != true || status["engine_pid"].(float64) == 0 {
 		t.Fatalf("connect: %v", status)
 	}
-	if got := h.dns.String(); !strings.HasSuffix(got, "set:172.19.0.2") {
+	if got := h.dns.String(); got != "hold" {
 		t.Errorf("dns calls %q", got)
+	}
+	if status["intent"] != "connected" || len(status["physical_dns"].([]any)) != 1 {
+		t.Errorf("connect: %v", status)
+	}
+	// Connecting again to what is up changes nothing.
+	if again := h.ok("connect", map[string]any{"scenario": "s"}); again["engine_pid"] != status["engine_pid"] {
+		t.Errorf("a second connect restarted the engine: %v", again)
 	}
 
 	// Removing the scenario in use is refused while connected.
@@ -184,11 +279,18 @@ func TestConnectDisconnect(t *testing.T) {
 		t.Fatalf("scenario.use: %v", s)
 	}
 
+	// The intent is stored before anything is taken down, 6.3.
+	h.sys.onClose = func() {
+		state, _ := os.ReadFile(h.layout.State())
+		if !strings.Contains(string(state), `"connected": false`) {
+			t.Errorf("the resolver went before the intent was stored: %s", state)
+		}
+	}
 	status = h.ok("disconnect", nil)
-	if status["state"] != "disconnected" || status["system_dns"] != false {
+	if status["state"] != "disconnected" || status["system_dns"] != false || status["intent"] != "disconnected" {
 		t.Fatalf("disconnect: %v", status)
 	}
-	if got := h.dns.String(); !strings.HasSuffix(got, "clear") {
+	if got := h.dns.String(); !strings.HasSuffix(got, "close") {
 		t.Errorf("dns not cleared last: %q", got)
 	}
 
@@ -219,49 +321,131 @@ func TestConnectDisconnect(t *testing.T) {
 	}
 }
 
-func TestEngineCrashClearsDNSAndReconnects(t *testing.T) {
-	h := start(t, nil)
+func (h *harness) connected() int {
+	h.t.Helper()
 	h.ok("config.apply", map[string]any{"content": doc})
 	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
-	pid := int(h.ok("connect", map[string]any{"scenario": "s"})["engine_pid"].(float64))
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
-		t.Fatal(err)
-	}
+	return int(h.ok("connect", map[string]any{"scenario": "s"})["engine_pid"].(float64))
+}
+
+func (h *harness) waitFor(what string, ok func(map[string]any) bool) map[string]any {
+	h.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		s := h.ok("status", nil)
-		if s["state"] == "connected" && int(s["engine_pid"].(float64)) != pid {
-			break
+		if ok(s) {
+			return s
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no reconnect: %v", s)
+			h.t.Fatalf("%s: %v", what, s)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
-	// The resolver went before the restart: set, clear, set.
-	if got := h.dns.String(); !strings.Contains(got, "set:172.19.0.2 clear set:172.19.0.2") {
+}
+
+func TestEngineCrashClearsDNSAndReconnects(t *testing.T) {
+	h := start(t, nil)
+	pid := h.connected()
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	h.waitFor("reconnect", func(s map[string]any) bool {
+		return s["state"] == "connected" && int(s["engine_pid"].(float64)) != pid
+	})
+	// The resolver went before the restart: hold, close, hold.
+	if got := h.dns.String(); got != "hold close hold" {
 		t.Errorf("dns calls %q", got)
 	}
 }
 
-func TestRestartResumesAndClearsStaleDNS(t *testing.T) {
+func TestDisconnectDropsPendingRetry(t *testing.T) {
 	h := start(t, nil)
-	h.ok("config.apply", map[string]any{"content": doc})
-	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
-	h.ok("connect", map[string]any{"scenario": "s"})
+	pid := h.connected()
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	h.waitFor("retry scheduled", func(s map[string]any) bool { return s["state"] == "connecting" })
+	h.ok("disconnect", nil)
+	time.Sleep(1500 * time.Millisecond)
+	if s := h.ok("status", nil); s["state"] != "disconnected" || s["engine_pid"].(float64) != 0 {
+		t.Fatalf("a retry outlived disconnect: %v", s)
+	}
+}
+
+func TestPhysicalDNSChangeReloads(t *testing.T) {
+	h := start(t, nil)
+	pid := h.connected()
+	h.sys.setPhysical("192.0.2.2")
+	h.sys.current().notify()
+	s := h.waitFor("reload", func(s map[string]any) bool {
+		return s["state"] == "connected" && int(s["engine_pid"].(float64)) != pid
+	})
+	if dns := s["physical_dns"].([]any); len(dns) != 1 || dns[0] != "192.0.2.2" {
+		t.Errorf("physical dns %v", dns)
+	}
+}
+
+func TestLostKeyIsRepublished(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
+	h.sys.mu.Lock()
+	h.sys.hidden = true
+	h.sys.mu.Unlock()
+	h.sys.current().notify()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(h.dns.String(), "republish") {
+		if time.Now().After(deadline) {
+			t.Fatalf("dns calls %q", h.dns.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestDeadSessionIsReplaced(t *testing.T) {
+	h := start(t, nil)
+	pid := h.connected()
+	h.sys.current().Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.dns.String() != "hold close hold" {
+		if time.Now().After(deadline) {
+			t.Fatalf("dns calls %q", h.dns.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if s := h.ok("status", nil); s["state"] != "connected" || int(s["engine_pid"].(float64)) != pid {
+		t.Errorf("replacing the session touched the engine: %v", s)
+	}
+}
+
+func TestOneIdentityConnectedAtATime(t *testing.T) {
+	a := start(t, nil)
+	a.connected()
+	b := startAt(t, a.layout.Root, "com.kafeifei.xdial.other", nil)
+	b.ok("config.apply", map[string]any{"content": doc})
+	b.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	b.fails("connect", map[string]any{"scenario": "s"}, cli.CodeEngineBusy)
+	a.ok("disconnect", nil)
+	b.ok("connect", map[string]any{"scenario": "s"})
+}
+
+func TestRestartResumes(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
 	h.stop()
-	if got := h.dns.String(); !strings.HasSuffix(got, "clear") {
+	if got := h.dns.String(); !strings.HasSuffix(got, "close") {
 		t.Errorf("stopping did not clear dns: %q", got)
 	}
 	state, _ := os.ReadFile(h.layout.State())
 	if !strings.Contains(string(state), `"connected": true`) {
-		t.Errorf("stopping changed the desired state: %s", state)
+		t.Errorf("stopping changed the intent: %s", state)
 	}
+	again := startAt(t, h.layout.Root, h.layout.ID, nil)
+	again.waitFor("resume", func(s map[string]any) bool { return s["state"] == "connected" })
 }
 
 func TestPeerCredentialsAreChecked(t *testing.T) {
 	var seen uint32 = 1<<32 - 1
-	h := start(t, func(uid uint32, _ []uint32) bool { seen = uid; return false })
+	h := start(t, func(uid uint32) bool { seen = uid; return false })
 	r := h.call("status", nil)
 	if r.OK || r.Error.Code != cli.CodeAPIPermission {
 		t.Fatalf("unauthorized peer got %+v", r)
@@ -297,25 +481,50 @@ func TestProtocolLimits(t *testing.T) {
 
 func TestSocketPermissions(t *testing.T) {
 	h := start(t, nil)
-	info, err := os.Stat(h.layout.SocketDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o750 {
-		t.Errorf("socket directory mode %v", info.Mode().Perm())
-	}
-	info, err = os.Stat(h.layout.Socket())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o660 {
-		t.Errorf("socket mode %v", info.Mode().Perm())
-	}
-	for _, path := range []string{h.layout.Private(), h.layout.Tailscale()} {
+	for path, want := range map[string]os.FileMode{
+		h.layout.SocketDir(): 0o755, h.layout.Socket(): 0o666, h.layout.Private(): 0o700, h.layout.Tailscale(): 0o700,
+	} {
 		info, err := os.Stat(path)
-		if err != nil || info.Mode().Perm() != 0o700 {
-			t.Errorf("%s: %v %v", path, err, info.Mode().Perm())
+		if err != nil || info.Mode().Perm() != want {
+			t.Errorf("%s: %v %v, want %v", path, err, info.Mode().Perm(), want)
 		}
+	}
+}
+
+func TestClientChecksTheDaemon(t *testing.T) {
+	h := start(t, nil)
+	if _, err := api.Dial(h.layout.Socket(), uint32(os.Getuid())+1); !cli.Is(err, cli.CodeDaemonUntrusted) {
+		t.Errorf("a daemon of another uid was trusted: %v", err)
+	}
+}
+
+func TestConnectionLimit(t *testing.T) {
+	h := start(t, nil)
+	var conns []net.Conn
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	for range maxConnections - 1 {
+		c, err := net.Dial("unix", h.layout.Socket())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+	extra, err := api.Dial(h.layout.Socket(), uint32(os.Getuid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Close()
+	var got api.Response
+	if err := extra.Call("status", nil, func(r api.Response) bool { got = r; return true }); err != nil {
+		t.Fatal(err)
+	}
+	if got.OK || got.Error.Code != cli.CodeDaemonBusy || got.ID != 1 {
+		t.Errorf("over the limit: %+v", got)
 	}
 }
 

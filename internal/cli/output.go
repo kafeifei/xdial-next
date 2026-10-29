@@ -35,6 +35,12 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
+// Is reports whether err is an *Error with code.
+func Is(err error, code string) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Code == code
+}
+
 // Errorf builds an Error with a registered code.
 func Errorf(code, hint, format string, args ...any) *Error {
 	return &Error{Code: code, Message: fmt.Sprintf(format, args...), Hint: hint}

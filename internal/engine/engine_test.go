@@ -306,7 +306,7 @@ func TestDNSOrderAndUsedSetsOnly(t *testing.T) {
 		t.Errorf("DNS rule order %q", got)
 	}
 	// DDR discovery must fail, or the system upgrades past sing-box, 6.4.
-	if dns[1]["rcode"] != "NXDOMAIN" || dns[1]["domain"].([]any)[0] != ddrName {
+	if dns[1]["rcode"] != "NXDOMAIN" || dns[1]["domain"].([]any)[0] != localNXDOMAIN[0] {
 		t.Errorf("DDR rule %v", dns[1])
 	}
 	// corp is an endpoint: names chosen for it resolve locally, 3.3.

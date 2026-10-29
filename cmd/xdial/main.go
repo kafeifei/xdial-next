@@ -290,7 +290,6 @@ func runConfigCheck(ctx *context_) int {
 	})
 }
 
-
 // readFile reads the file the caller named, as the caller: the daemon never
 // opens a path a caller supplies, ARCHITECTURE.md 4.1.
 func readFile(path string) ([]byte, error) {

@@ -10,7 +10,7 @@ import (
 // .github/build-tags.txt must list exactly these, and missingtags_test.go
 // fails the build of the tests when any is absent.
 var requiredTags = []string{
-	"with_gvisor", "with_utls", "with_dhcp",
+	"with_gvisor", "with_utls",
 	"ts_omit_peerapiserver", "ts_omit_c2n", "ts_omit_debug", "ts_omit_portmapper",
 	"ts_omit_logtail", "ts_omit_netlog", "ts_omit_ssh", "ts_omit_webclient",
 	"ts_omit_drive", "ts_omit_taildrop",

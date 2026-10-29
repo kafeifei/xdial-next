@@ -1,4 +1,4 @@
-package daemon
+package peercred
 
 import (
 	"net"
@@ -20,12 +20,11 @@ const (
 	localPeerCred = 1 // LOCAL_PEERCRED
 )
 
-// peerCredentials returns the uid and groups of the process at the other
-// end of a Unix socket, as the kernel recorded them when it connected.
-func peerCredentials(conn *net.UnixConn) (uint32, []uint32, error) {
+// UID returns the effective uid of the process at the other end.
+func UID(conn *net.UnixConn) (uint32, error) {
 	raw, err := conn.SyscallConn()
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
 	var cred xucred
 	var sysErr error
@@ -38,14 +37,7 @@ func peerCredentials(conn *net.UnixConn) (uint32, []uint32, error) {
 		}
 	})
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
-	if sysErr != nil {
-		return 0, nil, sysErr
-	}
-	n := int(cred.NGroups)
-	if n < 0 || n > len(cred.Groups) {
-		n = 0
-	}
-	return cred.UID, append([]uint32(nil), cred.Groups[:n]...), nil
+	return cred.UID, sysErr
 }

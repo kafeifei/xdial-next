@@ -10,29 +10,35 @@ import (
 
 	"github.com/kafeifei/xdial-next/internal/api"
 	"github.com/kafeifei/xdial-next/internal/cli"
-	"github.com/kafeifei/xdial-next/internal/store"
+	"github.com/kafeifei/xdial-next/internal/peercred"
 )
 
 // Limits of the local API, ARCHITECTURE.md 6.2.
 const (
-	maxConnections = 16
+	maxConnections = 32
 	requestTimeout = 5 * time.Minute
 	writeTimeout   = 30 * time.Second
 )
 
-// listen creates the socket in a directory only root and admin can enter:
-// the directory is replaced, not reused, so nothing another user put there
-// survives, and the socket is created inside it.
+// listen creates the socket. Who may call is decided per request from the
+// kernel's peer credentials, so the socket is open to every local user and
+// an unauthorized caller gets api.permission rather than a bare EACCES. The
+// directory is root's and made fresh: whatever another user put at its
+// path is removed, and if something takes the path again before it is
+// made, listening fails instead of reusing it.
 func (d *Daemon) listen() (*net.UnixListener, error) {
 	dir := d.opts.Layout.SocketDir()
 	if err := os.RemoveAll(dir); err != nil {
 		return nil, err
 	}
-	if err := store.EnsureDir(dir, 0o750); err != nil {
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
 		return nil, err
 	}
 	if os.Geteuid() == 0 {
-		if err := os.Chown(dir, 0, adminGroup); err != nil {
+		if err := os.Chown(dir, 0, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -41,15 +47,9 @@ func (d *Daemon) listen() (*net.UnixListener, error) {
 		return nil, err
 	}
 	listener.SetUnlinkOnClose(true)
-	if err := os.Chmod(d.opts.Layout.Socket(), 0o660); err != nil {
+	if err := os.Chmod(d.opts.Layout.Socket(), 0o666); err != nil {
 		listener.Close()
 		return nil, err
-	}
-	if os.Geteuid() == 0 {
-		if err := os.Chown(d.opts.Layout.Socket(), 0, adminGroup); err != nil {
-			listener.Close()
-			return nil, err
-		}
 	}
 	return listener, nil
 }
@@ -71,24 +71,27 @@ func (d *Daemon) serve(listener *net.UnixListener) error {
 				d.handle(conn)
 			}()
 		default:
-			conn.Close()
+			go refuse(conn, cli.Errorf(cli.CodeDaemonBusy, "", "daemon 已有 %d 个连接", maxConnections))
 		}
 	}
 }
 
-// handle serves one connection after checking who is on the other end with
-// the kernel's credentials, not the socket's file permissions alone.
+// refuse answers the first request on a connection with err, by its id,
+// and hangs up.
+func refuse(conn *net.UnixConn, err error) {
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	req, _ := api.ReadRequest(bufio.NewReaderSize(conn, 64<<10))
+	writeResponse(conn, failure(req.ID, err))
+}
+
+// handle serves one connection, one request at a time and in order. Each
+// request is authorized again with the kernel's credentials of the peer,
+// not the socket's file permissions.
 func (d *Daemon) handle(conn *net.UnixConn) {
 	defer conn.Close()
 	reader := bufio.NewReaderSize(conn, 64<<10)
-	uid, groups, err := peerCredentials(conn)
-	if err != nil || !d.opts.Authorize(uid, groups) {
-		// Answer the first request by its id, then hang up.
-		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		req, _ := api.ReadRequest(reader)
-		writeResponse(conn, failure(req.ID, cli.Errorf(cli.CodeAPIPermission, "", "只有 root 和 admin 组成员能使用 daemon")))
-		return
-	}
+	uid, uidErr := peercred.UID(conn)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(requestTimeout))
 		req, err := api.ReadRequest(reader)
@@ -96,6 +99,10 @@ func (d *Daemon) handle(conn *net.UnixConn) {
 			if errors.Is(err, api.ErrTooLong) {
 				writeResponse(conn, api.Response{Schema: cli.ErrorSchema, Error: cli.Errorf(cli.CodeUsage, "", "请求超过 %d 字节", api.MaxMessage)})
 			}
+			return
+		}
+		if uidErr != nil || !d.opts.Authorize(uid) {
+			writeResponse(conn, failure(req.ID, cli.Errorf(cli.CodeAPIPermission, "", "uid %d 不能使用 daemon：只有 root 和当前在屏幕前登录的用户可以", uid)))
 			return
 		}
 		if !d.dispatch(conn, req) {
