@@ -2,108 +2,131 @@ package daemon
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
-// scrubber replaces secret values in text the engine writes, as they are
-// and in the encodings errors commonly carry them in, ARCHITECTURE.md 4.3.
-// It is a backstop: an error that carries only part of a value is not
-// caught, which is why callers get error codes, not engine text.
+// scrubber masks secret values in text the engine writes, as they are and
+// in the encodings errors commonly carry them in, ARCHITECTURE.md 4.3. It
+// is a backstop: an error that carries only part of a value is not caught,
+// which is why callers get error codes, not engine text.
+//
+// It masks every place any form occurs, overlapping occurrences included,
+// as one span each: replacing matches one at a time, left to right, would
+// leave the end of a secret that overlaps another one showing.
 type scrubber struct {
-	replacer *strings.Replacer
-	forms    []string // every form of every secret, longest first
+	forms []secretForm
 }
 
-// minScrubLength skips values too short to replace without mangling
+type secretForm struct {
+	text, name string
+}
+
+// minScrubLength skips values too short to mask without mangling
 // unrelated text; such values are not credentials in practice.
 const minScrubLength = 4
 
+// MaxSecretLength bounds a secret's value. Its longest form then stays
+// far below the 64 KiB the engine cuts a VPN server's text at, so a
+// secret that starts in what the daemon keeps of that text always ends
+// before the cut and is masked whole, 3.5.
+const MaxSecretLength = 8 << 10
+
 func newScrubber(secrets map[string]Secret) *scrubber {
-	type pair struct{ from, to string }
-	var pairs []pair
-	for name, s := range secrets {
-		if len(s.Value) < minScrubLength {
+	s := &scrubber{}
+	for name, secret := range secrets {
+		if len(secret.Value) < minScrubLength {
 			continue
 		}
-		to := "<secret:" + name + ">"
+		jsonForm, _ := json.Marshal(secret.Value)
+		seen := map[string]bool{}
 		for _, form := range []string{
-			s.Value,
-			url.QueryEscape(s.Value),
-			url.PathEscape(s.Value),
-			base64.StdEncoding.EncodeToString([]byte(s.Value)),
-			base64.RawURLEncoding.EncodeToString([]byte(s.Value)),
-			strings.Trim(quote(s.Value), `"`),
+			secret.Value,
+			url.QueryEscape(secret.Value),
+			url.PathEscape(secret.Value),
+			base64.StdEncoding.EncodeToString([]byte(secret.Value)),
+			base64.RawURLEncoding.EncodeToString([]byte(secret.Value)),
+			strings.Trim(string(jsonForm), `"`),
+			strings.Trim(strconv.Quote(secret.Value), `"`),
 		} {
-			if len(form) >= minScrubLength {
-				pairs = append(pairs, pair{form, to})
+			if len(form) >= minScrubLength && !seen[form] {
+				seen[form] = true
+				s.forms = append(s.forms, secretForm{form, name})
 			}
 		}
 	}
-	// Longer forms first, so a value inside another is not split.
-	sort.Slice(pairs, func(i, j int) bool { return len(pairs[i].from) > len(pairs[j].from) })
-	var args []string
-	for _, p := range pairs {
-		args = append(args, p.from, p.to)
-	}
-	forms := make([]string, len(pairs))
-	for i, p := range pairs {
-		forms[i] = p.from
-	}
-	return &scrubber{replacer: strings.NewReplacer(args...), forms: forms}
+	return s
 }
 
-func (s *scrubber) scrub(text string) string { return s.replacer.Replace(text) }
+type span struct {
+	start, end int
+	name       string
+}
+
+// spans returns where forms occur in text, overlapping occurrences merged
+// into one span, in order.
+func (s *scrubber) spans(text string) []span {
+	var all []span
+	for _, f := range s.forms {
+		for i := 0; i <= len(text)-len(f.text); {
+			j := strings.Index(text[i:], f.text)
+			if j < 0 {
+				break
+			}
+			start := i + j
+			all = append(all, span{start, start + len(f.text), f.name})
+			i = start + 1
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].start < all[j].start })
+	var merged []span
+	for _, sp := range all {
+		if n := len(merged); n > 0 && sp.start < merged[n-1].end {
+			merged[n-1].end = max(merged[n-1].end, sp.end)
+			continue
+		}
+		merged = append(merged, sp)
+	}
+	return merged
+}
+
+// scrub masks every span with the name of the secret it starts with.
+func (s *scrubber) scrub(text string) string {
+	spans := s.spans(text)
+	if len(spans) == 0 {
+		return text
+	}
+	var b strings.Builder
+	last := 0
+	for _, sp := range spans {
+		b.WriteString(text[last:sp.start])
+		b.WriteString("<secret:" + sp.name + ">")
+		last = sp.end
+	}
+	b.WriteString(text[last:])
+	return b.String()
+}
 
 // safeCut returns where to cut text to keep at most limit bytes without
-// splitting any form of any secret: at limit, or earlier at the start of
-// an occurrence that would straddle it, on a character boundary. What is
-// kept then holds only whole secrets, which scrubbing replaces whole.
+// splitting a span: at limit, or earlier at the start of the span that
+// would straddle it, on a character boundary.
 func (s *scrubber) safeCut(text string, limit int) int {
 	if len(text) <= limit {
 		return len(text)
 	}
 	cut := limit
-	for moved := true; moved; {
-		moved = false
-		for _, f := range s.forms {
-			// An occurrence straddles cut if it starts in [cut-len+1, cut).
-			from := max(0, cut-len(f)+1)
-			window := text[from:min(len(text), cut+len(f)-1)]
-			for i := strings.Index(window, f); i >= 0; {
-				start := from + i
-				if start < cut && start+len(f) > cut {
-					cut, moved = start, true
-					break
-				}
-				next := strings.Index(window[i+1:], f)
-				if next < 0 {
-					break
-				}
-				i += 1 + next
-			}
+	for _, sp := range s.spans(text) {
+		if sp.start < cut && sp.end > cut {
+			cut = sp.start
+			break
 		}
-		for cut > 0 && !utf8.RuneStart(text[cut]) {
-			cut--
-			moved = true
-		}
+	}
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
 	}
 	return cut
-}
-
-func quote(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return `"` + b.String() + `"`
 }

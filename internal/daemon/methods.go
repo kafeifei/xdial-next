@@ -358,6 +358,9 @@ func (d *Daemon) secretSet(params json.RawMessage) reply {
 	if p.Value == "" {
 		return reply{err: cli.Errorf(cli.CodeSecretFormat, "", "凭据的值不能为空")}
 	}
+	if len(p.Value) > MaxSecretLength {
+		return reply{err: cli.Errorf(cli.CodeSecretFormat, "", "凭据最长 %d 字节", MaxSecretLength)}
+	}
 	// Secrets are what connections are built from: change them in the
 	// control sequence, never in the middle of an apply or a reload.
 	d.ctl.Lock()
