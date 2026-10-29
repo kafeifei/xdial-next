@@ -1043,6 +1043,15 @@ func TestEndpointTextIsScrubbed(t *testing.T) {
 	if strings.Contains(e.Error+e.AuthMessage, "hunter2") || e.AuthURL == "" {
 		t.Errorf("scrubbed status: %+v", e)
 	}
+	// A secret the engine's cut split, behind copies the scrubber shortens.
+	cookie := strings.Repeat("c", 2048)
+	text := "login failed: " + strings.Repeat(cookie+" ", 32)
+	engineCut := strings.ToValidUTF8(text[:64<<10], "") + engine.TruncatedMark
+	split := map[string]engine.EndpointStatus{"corp": {Error: engineCut}}
+	scrubEndpoints(split, newScrubber(map[string]Secret{"corp": {Value: cookie}}))
+	if strings.Contains(split["corp"].Error, "cccc") {
+		t.Errorf("part of a split secret survived: %q", split["corp"].Error)
+	}
 	// A secret straddling the cut is scrubbed before it is cut.
 	long := map[string]engine.EndpointStatus{"corp": {Error: strings.Repeat("x", maxEndpointText-5) + "hunter2-secret"}}
 	scrubEndpoints(long, newScrubber(map[string]Secret{"corp": {Value: "hunter2-secret"}}))

@@ -668,7 +668,7 @@ func TestPlainMembersDoNotCountAgainstTheBudget(t *testing.T) {
 }
 
 func TestStatusTextIsBoundedButFarAboveWhatIsKept(t *testing.T) {
-	if got := bound(strings.Repeat("x", 2<<20)); len(got) != maxText {
+	if got := bound(strings.Repeat("x", 2<<20)); len(got) != maxText+len(TruncatedMark) || !strings.HasSuffix(got, TruncatedMark) {
 		t.Errorf("bounded to %d bytes", len(got))
 	}
 	if maxText <= 4096 {

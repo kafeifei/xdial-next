@@ -13,6 +13,7 @@ import (
 // caught, which is why callers get error codes, not engine text.
 type scrubber struct {
 	replacer *strings.Replacer
+	longest  int // the longest form any secret takes
 }
 
 // minScrubLength skips values too short to replace without mangling
@@ -46,7 +47,11 @@ func newScrubber(secrets map[string]Secret) *scrubber {
 	for _, p := range pairs {
 		args = append(args, p.from, p.to)
 	}
-	return &scrubber{replacer: strings.NewReplacer(args...)}
+	longest := 0
+	for _, p := range pairs {
+		longest = max(longest, len(p.from))
+	}
+	return &scrubber{replacer: strings.NewReplacer(args...), longest: longest}
 }
 
 func (s *scrubber) scrub(text string) string { return s.replacer.Replace(text) }
