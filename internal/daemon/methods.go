@@ -232,7 +232,10 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 // with a new one failed.
 func (d *Daemon) restoreLocked() {
 	if err := d.establishLocked(); err != nil {
-		d.retryLocked("新配置没能启动，旧配置也没能恢复：" + err.Error())
+		// Never leave the uncommitted configuration running: take it down
+		// and retry the stored one.
+		d.disconnectLocked()
+		d.retryLocked("新配置没能启动或保存，旧配置也没能恢复：" + err.Error())
 	}
 }
 

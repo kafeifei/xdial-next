@@ -70,9 +70,9 @@ func (l Layout) Socket() string { return filepath.Join(l.SocketDir(), "api.sock"
 func (l Layout) DNSKey() string { return "State:/Network/Service/" + l.ID + "/DNS" }
 
 // SharedDir is the one directory every identity shares, root's alone: it
-// holds the connection lock, 6.1. It is under /var/run, so a reboot clears
-// it.
-func (l Layout) SharedDir() string { return l.at("var", "run", Release+".shared") }
+// holds the connection lock, 6.1. It is not under /var/run, which the
+// daemon group can write, so no one but root can move it away.
+func (l Layout) SharedDir() string { return l.at("Library", "Application Support", Release+".shared") }
 
 // ConnectionLock is held by a daemon, with its engine and resolver
 // session, for as long as it is connected; only one identity is connected

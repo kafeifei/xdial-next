@@ -60,17 +60,23 @@ func (l *dnsLog) String() string {
 
 // fakeSystem stands in for scutil and the DNS probe.
 type fakeSystem struct {
-	log      *dnsLog
-	mu       sync.Mutex
-	physical []netip.Addr
-	hidden   bool // the key reads as missing once
-	resolver *fakeResolver
-	onClose  func()
+	log       *dnsLog
+	mu        sync.Mutex
+	physical  []netip.Addr
+	hidden    bool // the key reads as missing once
+	reads     int
+	emptyFrom int // from this read on the physical DNS is gone; 0 never
+	resolver  *fakeResolver
+	onClose   func()
 }
 
 func (f *fakeSystem) PhysicalDNS() ([]netip.Addr, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.reads++
+	if f.emptyFrom > 0 && f.reads >= f.emptyFrom {
+		return nil, nil
+	}
 	return f.physical, nil
 }
 
@@ -166,8 +172,10 @@ func startAt(t *testing.T, root, id string, authorize func(uint32) bool) *harnes
 	if authorize == nil {
 		authorize = func(uint32) bool { return true }
 	}
-	if err := os.MkdirAll(filepath.Join(root, "var", "run"), 0o755); err != nil {
-		t.Fatal(err)
+	for _, dir := range []string{filepath.Join(root, "var", "run"), filepath.Join(root, "Library", "Application Support")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	log := &dnsLog{}
 	sys := &fakeSystem{log: log, physical: []netip.Addr{netip.MustParseAddr("192.0.2.1")}}
@@ -657,4 +665,34 @@ func TestConnectionLockDirectoryMustBeOwnAndPrivate(t *testing.T) {
 	if _, err := acquireConnectionLock(link, filepath.Join(link, "connection.lock")); err == nil {
 		t.Error("a symlinked directory was accepted")
 	}
+}
+
+func TestFailedRollbackLeavesNothingUncommitted(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
+	before := h.ok("config.export", nil)["revision"]
+	data := filepath.Dir(h.layout.Config())
+	if err := os.Chmod(data, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(data, 0o755)
+	// The new configuration comes up, cannot be stored, and the old one
+	// cannot be prepared again because the physical DNS just went.
+	h.sys.mu.Lock()
+	h.sys.emptyFrom = h.sys.reads + 2
+	h.sys.mu.Unlock()
+	changed := strings.Replace(doc, `"final": "direct"},`, `"final": "hk"},`, 1)
+	if r := h.call("config.apply", map[string]any{"content": changed}); r.OK {
+		t.Fatal("apply succeeded without storing")
+	}
+	s := h.ok("status", nil)
+	if s["engine_pid"].(float64) != 0 || s["revision"] != before {
+		t.Fatalf("the uncommitted configuration kept running: %v", s)
+	}
+	h.sys.mu.Lock()
+	h.sys.emptyFrom = 0
+	h.sys.mu.Unlock()
+	h.waitFor("the stored configuration back", func(s map[string]any) bool {
+		return s["state"] == "connected" && s["revision"] == before
+	})
 }

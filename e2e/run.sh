@@ -98,8 +98,15 @@ check m2-connect "jq -e '.ok and .result.state == \"connected\" and .result.syst
 sleep 2
 during="$(facts)"
 check m2-connected-facts "jq -e --argjson b '$base' '.utun != \$b.utun and (.route | startswith(\"utun\")) and .resolver == \"172.19.0.2\" and .dns != \"\" and .http == \"200\"' <<< '$during' > /dev/null" "$during"
-dns_seen="$(sudo grep -c 'dns: exchange' "$data/private/engine.log" 2> /dev/null)"
-check m2-dns-in-singbox '[[ "${dns_seen:-0}" -gt 0 ]]' "dns exchange lines: $dns_seen"
+# 发一次系统查询，在引擎日志里看到它的应答，才算系统查询进了 sing-box。sing-box 在 info 级别只记有
+# 应答记录的查询，所以用一个真实存在、虚拟机平时不会查的名字，比较查询前后日志里它出现的行数。
+probe_name="example.org"
+before_probe="$(sudo grep -c "$probe_name" "$data/private/engine.log" 2> /dev/null)"
+dscacheutil -flushcache
+dscacheutil -q host -a name "$probe_name" > /dev/null 2>&1
+sleep 1
+after_probe="$(sudo grep -c "$probe_name" "$data/private/engine.log" 2> /dev/null)"
+check m2-dns-in-singbox '[[ "${after_probe:-0}" -gt "${before_probe:-0}" ]]' "lines with $probe_name: $before_probe -> $after_probe"
 probes="udp=$(dig +time=3 +tries=1 @172.19.0.2 www.apple.com A +short 2>&1 | tail -1) tcp=$(dig +tcp +time=3 +tries=1 @172.19.0.2 www.apple.com A +short 2>&1 | tail -1) ddr=$(dig +time=3 +tries=1 @172.19.0.2 _dns.resolver.arpa SVCB 2>&1 | awk '/status:/{print $6}') canary=$(dig +time=3 +tries=1 @172.19.0.2 use-application-dns.net A 2>&1 | awk '/status:/{print $6}')"
 check m2-dns-udp-tcp '[[ "$probes" =~ udp=[0-9] && "$probes" =~ tcp=[0-9] && "$probes" == *"ddr=NXDOMAIN,"* && "$probes" == *"canary=NXDOMAIN,"* ]]' "$probes"
 leak="$(sudo grep -c 'mixed-pass' "$data/private/engine.log" "$data/private/events.jsonl" 2> /dev/null | awk -F: '{s+=$2} END{print s+0}')"
@@ -188,7 +195,7 @@ check m2-reinstall-resumes "jq -e .ok <<< '$out' > /dev/null && jq -e '.result.s
 out="$(sudo "$xdial" daemon uninstall --purge --json 2>&1)"
 sleep 2
 final="$(facts)"
-left="$(ls -d "/Library/LaunchDaemons/$id.plist" "$data" "/var/run/$id" /var/run/com.kafeifei.xdial.shared 2> /dev/null | tr '\n' ';')$(pgrep -f 'xdial (daemon|__engine)' | tr '\n' ',')"
+left="$(ls -d "/Library/LaunchDaemons/$id.plist" "$data" "/var/run/$id" "/Library/Application Support/com.kafeifei.xdial.shared" 2> /dev/null | tr '\n' ';')$(pgrep -f 'xdial (daemon|__engine)' | tr '\n' ',')"
 check m2-uninstall-clean "jq -e .ok <<< '$out' > /dev/null && restored '$final' && [[ -z '$left' && \"\$(has_key)\" == 0 ]]" "left=[$left] $final"
 
 exit "$failed"

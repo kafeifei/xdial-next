@@ -26,7 +26,7 @@ ARCHITECTURE.md 第 6 节里标"实测"的结论，出处都在这里。环境�
 方法：TUN 起来后，用 scutil 在 `State:/Network/Service/<id>/DNS` 写 `ServerAddresses = [172.19.0.2]`、`SupplementalMatchDomains = [""]`。
 
 - `scutil --dns` 的 resolver #1 变成 172.19.0.2，标记 Supplemental；系统查询和 HTTPS 正常。
-- 系统查询确实进了 sing-box，由第 5 节 e2e 的断言证明（sing-box 日志里 DNS 交换的行数大于 0）；这一步的实验本身只记录了解析器的样子。
+- 系统查询确实进了 sing-box，由第 5 节 e2e 的断言证明：发一次 `example.org` 的系统查询，sing-box 日志里这个名字的行数随之增加（sing-box 在 info 级别只记有应答记录的查询，所以不能用随机生成、不存在的名字）；这一步的实验本身只记录了解析器的样子。
 - 删掉键之后，resolver #1 回到 192.168.64.1。
 - sing-box 的日志里能看到系统发出的 `_dns.resolver.arpa` 查询，即系统在找上游的加密 DNS（DDR）。
 
@@ -40,7 +40,7 @@ ARCHITECTURE.md 第 6 节里标"实测"的结论，出处都在这里。环境�
 | 被杀的会话 | 同上，然后 `kill -9` 这个 scutil | 键消失 |
 | 通知 | 同一会话 `n.add` 两个键再 `n.watch`，另一个会话改其中一个键 | 输出 `changedKey [0] = <键>`；开着通知时同一会话还能继续执行命令（又加了一个临时键） |
 | `State:/Network/Global/DNS` | 加上匹配所有域名的键前后各读一次 | 加之前是 192.168.64.1；加之后变成 172.19.0.2，来源标着 Supplemental。所以物理网络的 DNS 不能从它读 |
-| 上游失败时的回落 | daemon 连一个 `final` 线路不可达的场景，在 en0 上抓 53 端口，发起 6 次随机域名的系统查询 | 每次约 60 秒后失败；en0 上没有出现这些域名的查询，没有回落到 192.168.64.1 |
+| 上游失败时的回落 | 先做阳性对照：连接前发一次随机域名的系统查询，在 en0 上抓 53 端口。再让 daemon 连一个 `final` 线路不可达的场景，同样抓包，发起 6 次随机域名的系统查询 | 对照：连接前的查询在 en0 上抓到 2 个包，抓包有效。连接后每次约 60 秒后失败，en0 上没有出现这些域名的查询，没有回落到 192.168.64.1（2026-10-28 第一次运行没有对照，10-29 加上对照重跑，结果相同） |
 | UDP 和 TCP | daemon 用 `mixed` stack 连着，`dig` 和 `dig +tcp` 直接问 172.19.0.2 | 都得到回答；`_dns.resolver.arpa` 两种都回 NXDOMAIN；到 172.19.0.2 的路由是 utun |
 
 ## 5. daemon 的端到端用例（2026-10-28）

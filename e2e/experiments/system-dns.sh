@@ -82,6 +82,15 @@ cat > "$work/dead.jsonc" << 'EOF'
 EOF
 "$xdial" config apply "$work/dead.jsonc" --json > /dev/null 2>&1
 printf 'x\n' | "$xdial" secret set dead --json > /dev/null 2>&1
+# 阳性对照：连接前的系统查询在 en0 上抓得到，说明抓包本身有效。
+sudo tcpdump -i en0 -n -l "udp port 53 or tcp port 53" > "$work/control.txt" 2> /dev/null &
+tdc=$!
+sleep 1
+cname="control-$RANDOM$RANDOM.example.org"
+dscacheutil -q host -a name "$cname" > /dev/null 2>&1
+sleep 1
+sudo kill $tdc 2> /dev/null
+report e4-capture-control true "query_on_en0_before_connect=$(grep -c "$cname" "$work/control.txt")"
 out="$("$xdial" connect --scenario dead --json 2>&1)"
 report e4-connect "$(jq -e .ok <<< "$out" > /dev/null 2>&1 && echo true || echo false)" "$(jq -c '.result.state // .error' <<< "$out" 2> /dev/null)"
 gw="$(route -n get default 2> /dev/null | awk '/gateway:/{print $2}')"

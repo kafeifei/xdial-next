@@ -155,11 +155,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.events.add("daemon_started", nil)
 	// Resume in the control sequence while the API already answers, so
 	// status works during the up to half a minute a connection can take.
+	d.ctl.Lock()
+	gen := d.gen
+	d.ctl.Unlock()
 	go func() {
 		d.ctl.Lock()
 		defer d.ctl.Unlock()
 		d.mu.Lock()
-		resume := d.state.Connected && !d.closing
+		// A request that changed the connection first wins.
+		resume := d.state.Connected && !d.closing && d.conn == nil && d.gen == gen
 		d.mu.Unlock()
 		if resume {
 			if err := d.establishLocked(); err != nil {

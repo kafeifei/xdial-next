@@ -389,6 +389,7 @@ func (d *Daemon) reconcile() {
 	case <-c.resolver.Done():
 		// The session died without the daemon closing it; hold the key
 		// again in a new one.
+		c.resolver.Close()
 		r, err := d.sys.Hold(d.opts.Layout.DNSKey(), c.lock.file)
 		if err != nil {
 			d.events.add("dns_hold_failed", map[string]any{"error": err.Error()})

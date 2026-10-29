@@ -102,6 +102,7 @@ func Hold(key string, server netip.Addr, extra ...*os.File) (*Session, error) {
 	}()
 	go func() {
 		_ = cmd.Wait()
+		s.closeOnce.Do(func() { _ = s.stdin.Close() })
 		close(s.done)
 	}()
 	script := fmt.Sprintf("d.init\nd.add ServerAddresses * %s\nd.add SupplementalMatchDomains * \"\"\nadd %s temporary\n"+
@@ -198,27 +199,31 @@ func Physical() ([]netip.Addr, error) {
 		if err != nil {
 			return nil, err
 		}
-		servers := parseServers(blocks[0])
-		if len(servers) == 0 {
-			servers = parseServers(blocks[1])
-		}
 		v4, v6 := hasAddresses(blocks[2]), hasAddresses(blocks[3])
 		iface := parseValue(blocks[3], "InterfaceName")
 		if iface == "" {
 			iface = parseValue(blocks[2], "InterfaceName")
 		}
-		var usable []netip.Addr
-		for _, a := range servers {
-			if a.Is6() && a.IsLinkLocalUnicast() && a.Zone() == "" && iface != "" {
-				// A link-local server is only reachable on its interface.
-				a = a.WithZone(iface)
+		usable := func(block string) []netip.Addr {
+			var out []netip.Addr
+			for _, a := range parseServers(block) {
+				if a.Is6() && a.IsLinkLocalUnicast() && a.Zone() == "" && iface != "" {
+					// A link-local server is only reachable on its interface.
+					a = a.WithZone(iface)
+				}
+				if (a.Is4() && v4) || (a.Is6() && v6) {
+					out = append(out, a)
+				}
 			}
-			if (a.Is4() && v4) || (a.Is6() && v6) {
-				usable = append(usable, a)
-			}
+			return out
 		}
-		if len(usable) > 0 {
-			return usable, nil
+		// Each source is filtered first, as configd does: hand-set servers
+		// of a family the service lacks do not hide the ones from DHCP.
+		if servers := usable(blocks[0]); len(servers) > 0 {
+			return servers, nil
+		}
+		if servers := usable(blocks[1]); len(servers) > 0 {
+			return servers, nil
 		}
 	}
 	return nil, nil

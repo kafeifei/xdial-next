@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -392,6 +393,8 @@ func stageBinary(src, dir string) (string, error) {
 		return "", cli.Errorf(cli.CodeInputRead, "", "打不开 %s：%v", resolved, err)
 	}
 	defer f.Close()
+	// What is checked is the file that was opened and is read below, not
+	// whatever the path names by then.
 	info, err := f.Stat()
 	if err != nil {
 		return "", cli.Errorf(cli.CodeInputRead, "", "%v", err)
@@ -399,7 +402,7 @@ func stageBinary(src, dir string) (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", cli.Errorf(cli.CodeInputPermission, "", "%s 不是普通文件", resolved)
 	}
-	if err := ownedBy(resolved, owners, false); err != nil {
+	if err := ownedInfo(resolved, info, owners, false); err != nil {
 		return "", err
 	}
 	binary, err := io.ReadAll(io.LimitReader(f, 1<<30))
@@ -416,10 +419,14 @@ func stageBinary(src, dir string) (string, error) {
 // ownedBy refuses path unless one of owners owns it and nobody else can
 // write it; a directory with the sticky bit may be writable by others.
 func ownedBy(path string, owners []uint32, dir bool) error {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return cli.Errorf(cli.CodeInputRead, "", "%v", err)
 	}
+	return ownedInfo(path, info, owners, dir)
+}
+
+func ownedInfo(path string, info os.FileInfo, owners []uint32, dir bool) error {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !slices.Contains(owners, st.Uid) {
 		return cli.Errorf(cli.CodeInputPermission, "把 xdial 放到自己或 root 的目录里再装", "%s 的属主不是 root 也不是运行 sudo 的用户", path)
@@ -427,8 +434,24 @@ func ownedBy(path string, owners []uint32, dir bool) error {
 	if info.Mode().Perm()&0o022 != 0 && !(dir && info.Mode()&os.ModeSticky != 0) {
 		return cli.Errorf(cli.CodeInputPermission, "chmod go-w 之后再装", "%s 属主以外的人能改", path)
 	}
+	if hasACL(path) {
+		return cli.Errorf(cli.CodeInputPermission, "chmod -N 去掉 ACL 之后再装", "%s 带 ACL，别的用户可能改得了它", path)
+	}
 	return nil
 }
+
+// hasACL reports whether path carries an access control list; ls -le
+// prints its entries as numbered lines. Without cgo there is no direct
+// call, and any ACL is refused rather than interpreted.
+func hasACL(path string) bool {
+	out, err := exec.Command("/bin/ls", "-lde", path).Output()
+	if err != nil {
+		return false
+	}
+	return aclEntry.Match(out)
+}
+
+var aclEntry = regexp.MustCompile(`(?m)^\s*\d+: `)
 
 // runDaemonUninstall boots the daemon out, which makes it disconnect, then
 // removes what install put down; --purge removes the data too, 6.1.
