@@ -157,6 +157,26 @@ func (d *Daemon) fetchFor(cfg *config.Config, scenario string) error {
 			return prefixed(err, fmt.Sprintf("场景 %s 用到的规则集 %s 还没下载，下载失败：", scenario, o.ID))
 		}
 	}
+	// Subscriptions: the compiler says which the scenario reaches and the
+	// cache lacks. A downloaded one can reach lines that reach others, so
+	// repeat; each round downloads at least one, which bounds the rounds,
+	// 1.5.
+	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
+	for round := 0; round <= len(cfg.Subscriptions); round++ {
+		result, err := engine.Compile(cfg, engine.Options{Scenario: scenario, Subscription: source.get})
+		if err != nil || len(result.MissingSubscriptions) == 0 {
+			return nil
+		}
+		if source.err != nil {
+			return source.err
+		}
+		for _, id := range result.MissingSubscriptions {
+			if _, err := d.downloadSubscription(cfg, findSubscription(cfg, id), secrets); err != nil {
+				return prefixed(err, fmt.Sprintf("场景 %s 用到的订阅 %s 还没下载，下载失败：", scenario, id))
+			}
+			delete(source.content, id)
+		}
+	}
 	return nil
 }
 
@@ -728,7 +748,7 @@ func (d *Daemon) refreshResources() {
 		if err != nil {
 			continue
 		}
-		if c, _, ok := d.cachedSubscription(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) {
+		if c, ok := d.subscriptionMeta(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) {
 			continue
 		}
 		_, _ = d.downloadSubscription(cfg, o, secrets)

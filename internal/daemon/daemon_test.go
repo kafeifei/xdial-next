@@ -967,15 +967,16 @@ func TestCachedSubscriptionConnects(t *testing.T) {
 	}
 }
 
-func TestSubscriptionCacheWithSecretReferenceDoesNotCount(t *testing.T) {
+func TestSubscriptionCacheWithSecretReferenceIsNotConnectedFrom(t *testing.T) {
 	h := start(t, nil)
 	const url = "https://sub.example/token"
 	h.ok("config.apply", map[string]any{"content": subDoc})
+	h.ok("secret.set", map[string]any{"name": "jp", "value": "a-password"})
 	h.ok("secret.set", map[string]any{"name": "air-url", "value": url})
 	h.seedSubscription("air", url, strings.Replace(airCache, `"password": "node-secret"}}],`, `"password": {"secret": "jp"}}}],`, 1))
-	if l := h.ok("subscription.list", nil)["subscriptions"].([]any)[0].(map[string]any); l["cached"] != false {
-		t.Errorf("a cache whose node references a secret counted: %v", l)
-	}
+	// Compiling checks the cached content again: a node that references a
+	// secret is never compiled, so the scenario's subscription is missing.
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceDownload)
 }
 
 func TestMissingSubscriptionIsDownloadedFirst(t *testing.T) {

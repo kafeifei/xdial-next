@@ -78,6 +78,18 @@ func (d *Daemon) cachedSubscription(o *config.Object, url string) (*cachedSubscr
 	return &c, content, true
 }
 
+// subscriptionMeta reads what the cache says about a subscription without
+// checking its content again, for listing and for deciding whether to
+// download; compiling checks it.
+func (d *Daemon) subscriptionMeta(o *config.Object, url string) (*cachedSubscription, bool) {
+	fp := subscriptionFingerprint(o, url)
+	var c cachedSubscription
+	if err := store.ReadJSON(d.subscriptionPath(o.ID, fp), &c); err != nil || c.Fingerprint != fp {
+		return nil, false
+	}
+	return &c, true
+}
+
 // checkContent checks what a parse child returned: every node against the
 // node allow list, every rule against the headless rule classification. It
 // keeps what passes and counts what does not, under "node:invalid" and
@@ -404,7 +416,7 @@ func (d *Daemon) subscriptionList(json.RawMessage) reply {
 				info.DownloadVia = via.String
 			}
 			if url, err := remoteURL(cfg, o, secrets); err == nil {
-				if c, _, ok := d.cachedSubscription(o, url); ok {
+				if c, ok := d.subscriptionMeta(o, url); ok {
 					next := c.FetchedAt.Add(updateInterval(o))
 					info.Cached, info.Format = true, c.Content.Format
 					info.Nodes, info.Rules = len(c.Content.Nodes), len(c.Content.Rules)
@@ -451,7 +463,7 @@ func (d *Daemon) subscriptionShow(params json.RawMessage) reply {
 	if err != nil {
 		return reply{err: err}
 	}
-	c, _, ok := d.cachedSubscription(o, url)
+	c, ok := d.subscriptionMeta(o, url)
 	if !ok {
 		return reply{err: cli.Errorf(cli.CodeResourceMissing, "用 xdial subscription update "+o.ID+" 下载", "订阅 %s 还没下载", o.ID)}
 	}

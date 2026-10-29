@@ -137,9 +137,8 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Subscriptions the scenario reaches come from the cache; the compiler
-	// says which it needed and did not find, and those are downloaded
-	// before compiling again, 1.5.
+	// Subscriptions the scenario reaches come from the cache only; fetchFor
+	// has downloaded what was missing, outside the control sequence, 1.5.
 	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
 	opts := engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
@@ -151,21 +150,9 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 		},
 		Subscription: source.get,
 	}
-	// A downloaded subscription can reach lines that reach others, so
-	// compile until nothing new is missing; each round downloads at least
-	// one subscription, which bounds the rounds.
 	result, err := engine.Compile(cfg, opts)
-	for round := 0; err == nil && len(result.MissingSubscriptions) > 0 && round <= len(cfg.Subscriptions); round++ {
-		if source.err != nil {
-			return nil, source.err
-		}
-		for _, id := range result.MissingSubscriptions {
-			if _, err := d.downloadSubscription(cfg, findSubscription(cfg, id), secrets); err != nil {
-				return nil, prefixed(err, fmt.Sprintf("场景 %s 用到的订阅 %s 还没下载，下载失败：", scenario, id))
-			}
-			delete(source.content, id)
-		}
-		result, err = engine.Compile(cfg, opts)
+	if err == nil && source.err != nil {
+		return nil, source.err
 	}
 	if err != nil {
 		return nil, cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
@@ -176,7 +163,8 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 		return nil, cli.Errorf(cli.CodeResourceMissing, "", "场景 %s 用到的远程规则集还没下载：%v", scenario, result.MissingRuleSets)
 	}
 	if len(result.MissingSubscriptions) > 0 {
-		return nil, cli.Errorf(cli.CodeResourceMissing, "", "场景 %s 用到的订阅读不出来：%v", scenario, result.MissingSubscriptions)
+		d.wakeResources()
+		return nil, cli.Errorf(cli.CodeResourceMissing, "用 xdial subscription update 下载", "场景 %s 用到的订阅还没下载：%v", scenario, result.MissingSubscriptions)
 	}
 	if result.TooManyMembers {
 		return nil, cli.Errorf(cli.CodeResourceTooLarge, "用 filter 少选一些节点，或者少引用几次订阅", "线路组展开后的成员合计超过 %d 个", engine.MaxExpandedMembers)

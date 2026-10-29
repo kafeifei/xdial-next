@@ -168,7 +168,7 @@
   - 每条规则再过一遍和规则集相同的检查，没通过的按 `rule:invalid` 计数。最多 5 万条。所有规则共用一份正则预算（同一个规则集的预算），超了整份订阅不收。
 - **不悄悄丢掉**：上面所有没收的条目按类型计数，存在缓存里，`xdial subscription list`、`update` 的结果和事件日志里都有。
 - **缓存**：在 `private/resources/subscriptions/<id>.<指纹前 16 位>.json`，指纹是 url 和 User-Agent 的 SHA-256；写法、清理、`ETag` 同远程规则集（3.4）。
-- **什么时候下载**：同远程规则集。连接或切场景时，编译器报出场景用到而缓存里没有的订阅，先下载再编译一次；失败则这次请求失败。后台按 `update_interval` 更新，新内容在下一次连接或切场景时生效。
+- **什么时候下载**：同远程规则集，在控制序列之外（3.4、6.3）。连接或切场景时，编译器报出场景用到而缓存里没有的订阅，先下载再编译，直到不再缺；失败则这次请求失败。后台按 `update_interval` 更新，新内容在下一次连接或切场景时生效。
 - **命令**：`xdial subscription list`、`xdial subscription show <id>`、`xdial subscription update [<id>...]`，输出见 `xdial schema`。
 
 ### 1.6 第一版表达不了的
