@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -65,8 +66,15 @@ type URLTestCommand struct {
 // testURL is what a test fetches through a line, sing-box's default.
 const testURL = "https://www.gstatic.com/generate_204"
 
-// testTimeout bounds one line's test.
-const testTimeout = 10 * time.Second
+// Line tests, 3.6: each line has testTimeout and a whole test
+// TestDeadline; testWorkers lines are tested at a time, and a test covers
+// at most maxTested lines.
+const (
+	testTimeout  = 10 * time.Second
+	TestDeadline = time.Minute
+	testWorkers  = 16
+	maxTested    = 21 << 10
+)
 
 func runCommand(ctx context.Context, instance *box.Box, r *reporter, c Command, stderr io.Writer) {
 	switch {
@@ -76,10 +84,6 @@ func runCommand(ctx context.Context, instance *box.Box, r *reporter, c Command, 
 		if !ok || !isSelector || !selector.SelectOutbound(c.Select.Member) {
 			fmt.Fprintln(stderr, "engine: select: cannot select", c.Select.Member, "in", c.Select.Group)
 		}
-		r.poke()
-		return
-	case c.URLTest != nil:
-		_ = r.write(StatusLine{Test: &TestResult{ID: c.URLTest.ID, Results: urlTest(ctx, instance, r, c.URLTest.Tags)}})
 		r.poke()
 		return
 	case c.TailscaleLogout == "":
@@ -124,6 +128,11 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	// each, until the daemon goes away, 6.3.
 	orphaned := make(chan struct{})
 	commands := make(chan Command, 8)
+	// Tests take up to a minute; they have a queue of their own, so a
+	// switch or a logout never waits behind one. A test that finds the
+	// queue full is answered at once.
+	tests := make(chan *URLTestCommand, 4)
+	rejected := make(chan int, 64)
 	go func() {
 		defer close(orphaned)
 		in := json.NewDecoder(io.MultiReader(decoder.Buffered(), stdin))
@@ -132,6 +141,17 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 			if err := in.Decode(&c); err != nil {
 				_, _ = io.Copy(io.Discard, stdin)
 				return
+			}
+			if c.URLTest != nil {
+				select {
+				case tests <- c.URLTest:
+				default:
+					select {
+					case rejected <- c.URLTest.ID:
+					default:
+					}
+				}
+				continue
 			}
 			select {
 			case commands <- c:
@@ -165,7 +185,7 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 		return 1
 	}
 	// After the ready line, stdout carries status, 6.3.
-	reports := newReporter(instance, history, stdout)
+	reports := newReporter(instance, history, stdout, stderr)
 	go reports.run(ctx)
 	// Commands run one at a time in a worker of their own: a logout can
 	// wait on the control server, and the loop below must stay free for
@@ -178,6 +198,19 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 				return
 			case c := <-commands:
 				runCommand(commandCtx, instance, reports, c, stderr)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-commandCtx.Done():
+				return
+			case id := <-rejected:
+				_ = reports.write(StatusLine{Test: &TestResult{ID: id, Error: "测速太多，等前面的测完再试"}})
+			case t := <-tests:
+				_ = reports.write(StatusLine{Test: &TestResult{ID: t.ID, Results: urlTest(commandCtx, instance, reports, t.Tags)}})
+				reports.poke()
 			}
 		}
 	}()
@@ -194,39 +227,70 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	return 0
 }
 
-// urlTest measures each tag: a group's members, or the line itself. Every
-// result also goes into the history groups read, 3.6.
+// urlTest measures each tag: every line a group leads to, however deep,
+// or the line itself, testWorkers at a time, within TestDeadline. Lines
+// the deadline or maxTested leaves out say so. Every result also goes into
+// the history groups read, 3.6.
 func urlTest(ctx context.Context, instance *box.Box, r *reporter, tags []string) map[string]TestOutcome {
 	results := map[string]TestOutcome{}
-	var test func(tag string, depth int)
-	test = func(tag string, depth int) {
-		if _, done := results[tag]; done {
+	var lines []adapter.Outbound
+	seen := map[string]bool{}
+	var expand func(tag string)
+	expand = func(tag string) {
+		if seen[tag] {
 			return
 		}
+		seen[tag] = true
 		o, ok := instance.Outbound().Outbound(tag)
-		if !ok {
+		switch g, isGroup := o.(adapter.OutboundGroup); {
+		case !ok:
 			results[tag] = TestOutcome{Error: "没有这条线路"}
-			return
-		}
-		if g, isGroup := o.(adapter.OutboundGroup); isGroup && depth < 4 {
+		case isGroup:
 			for _, member := range g.All() {
-				test(member, depth+1)
+				expand(member)
 			}
-			return
+		case len(lines) < maxTested:
+			lines = append(lines, o)
+		default:
+			results[tag] = TestOutcome{Error: "一次测的线路太多，没有测"}
 		}
-		testCtx, cancel := context.WithTimeout(ctx, testTimeout)
-		defer cancel()
-		delay, err := urltest.URLTest(testCtx, testURL, o)
-		if err != nil {
-			results[tag] = TestOutcome{Error: "测不通"}
-			r.history.DeleteURLTestHistory(tag)
-			return
-		}
-		results[tag] = TestOutcome{DelayMS: int(delay)}
-		r.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
 	}
 	for _, tag := range tags {
-		test(tag, 0)
+		expand(tag)
 	}
+	ctx, cancel := context.WithTimeout(ctx, TestDeadline)
+	defer cancel()
+	var mu sync.Mutex
+	work := make(chan adapter.Outbound)
+	var wg sync.WaitGroup
+	for range min(testWorkers, len(lines)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for o := range work {
+				outcome := TestOutcome{Error: "没测完"}
+				if ctx.Err() == nil {
+					testCtx, cancelTest := context.WithTimeout(ctx, testTimeout)
+					delay, err := urltest.URLTest(testCtx, testURL, o)
+					cancelTest()
+					if err == nil {
+						outcome = TestOutcome{DelayMS: int(delay)}
+						r.history.StoreURLTestHistory(o.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
+					} else if ctx.Err() == nil {
+						outcome = TestOutcome{Error: "测不通"}
+						r.history.DeleteURLTestHistory(o.Tag())
+					}
+				}
+				mu.Lock()
+				results[o.Tag()] = outcome
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, o := range lines {
+		work <- o
+	}
+	close(work)
+	wg.Wait()
 	return results
 }
