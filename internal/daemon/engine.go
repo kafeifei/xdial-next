@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -34,6 +35,19 @@ type engineProc struct {
 
 	mu        sync.Mutex
 	endpoints map[string]engine.EndpointStatus // the last status line
+	stdinMu   sync.Mutex                       // commands, one at a time
+}
+
+// send writes one command to the engine's stdin, 6.3.
+func (p *engineProc) send(c engine.Command) error {
+	line, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	p.stdinMu.Lock()
+	defer p.stdinMu.Unlock()
+	_, err = p.stdin.Write(append(line, '\n'))
+	return err
 }
 
 // endpointStatus returns the last status the engine reported for its
@@ -85,7 +99,9 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 		scanner := bufio.NewScanner(errR)
 		scanner.Buffer(make([]byte, 64<<10), 1<<20)
 		for scanner.Scan() {
-			appendRotating(logPath, []byte(scrub.scrub(scanner.Text())+"\n"))
+			// Login links go first: scrubbing could break up the words the
+			// pattern looks for.
+			appendRotating(logPath, []byte(scrub.scrub(withoutLoginLinks(scanner.Text()))+"\n"))
 		}
 	}()
 	ready := make(chan engine.Ready, 1)
@@ -182,6 +198,15 @@ func (p *engineProc) stop() {
 		_ = p.cmd.Process.Kill()
 		<-p.done
 	}
+}
+
+// loginLink is sing-box's log line for a tailscale line waiting to log
+// in. The link logs whoever opens it into the account they choose, so it
+// stays out of the log; status has it, 3.5.
+var loginLink = regexp.MustCompile(`(Waiting for authentication: )\S+`)
+
+func withoutLoginLinks(line string) string {
+	return loginLink.ReplaceAllString(line, "${1}<登录链接见 xdial status>")
 }
 
 // scrubEndpoints bounds and scrubs what a VPN server says, which reaches

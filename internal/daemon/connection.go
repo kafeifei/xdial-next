@@ -34,6 +34,7 @@ type connection struct {
 	scenario  string
 	revision  string
 	digest    [32]byte
+	endpoints []string
 	physical  []netip.Addr
 	lock      *connectionLock
 	engine    *engineProc
@@ -45,12 +46,13 @@ type connection struct {
 // plan is a connection ready to come up: compiled and checked, with
 // nothing changed yet.
 type plan struct {
-	scenario string
-	revision string
-	physical []netip.Addr
-	compiled []byte
-	digest   [32]byte // of compiled: what the engine would run
-	secrets  map[string]Secret
+	scenario  string
+	revision  string
+	physical  []netip.Addr
+	compiled  []byte
+	digest    [32]byte // of compiled: what the engine would run
+	endpoints []string // AnyConnect and Tailscale lines compiled in
+	secrets   map[string]Secret
 }
 
 // defaultScenario is scenario, or the first one of cfg when none is named.
@@ -108,6 +110,13 @@ func (d *Daemon) resumeAfterFetch() {
 // DNS and checks everything that can be checked without touching the
 // running connection. A request that fails here changes nothing.
 func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
+	return d.prepareLogin(cfg, scenario, nil)
+}
+
+// prepareLogin is prepare with tailscale auth keys for some lines, by id,
+// for xdial tailscale login: they are compiled into this one configuration
+// only, and scrubbed from what the engine writes like secrets, 4.7.
+func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[string]string) (*plan, error) {
 	if cfg == nil {
 		return nil, cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")
 	}
@@ -121,6 +130,10 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	}
 	d.mu.Lock()
 	secrets := maps.Clone(d.secrets)
+	scrubbed := maps.Clone(secrets)
+	for line, key := range authKeys {
+		scrubbed["tailscale-auth-key:"+line] = Secret{Value: key}
+	}
 	d.mu.Unlock()
 	physical, err := d.sys.PhysicalDNS()
 	if err != nil {
@@ -142,8 +155,9 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
 	opts := engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
-		PhysicalDNS: physical[0],
-		Secret:      func(u config.SecretUse) string { return secrets[u.Name].Value },
+		TailscaleAuthKeys: authKeys,
+		PhysicalDNS:       physical[0],
+		Secret:            func(u config.SecretUse) string { return secrets[u.Name].Value },
 		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
 			rules, ok := ruleSets[o.ID]
 			return rules, ok
@@ -193,7 +207,7 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if err := checkSecrets(cfg, secrets, result.Secrets); err != nil {
 		return nil, err
 	}
-	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON), secrets: secrets}, nil
+	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON), endpoints: result.Endpoints, secrets: scrubbed}, nil
 }
 
 // bringUp replaces the connection with p, 6.3: take the connection lock,
@@ -206,7 +220,7 @@ func (d *Daemon) bringUp(p *plan) error {
 	old := d.conn
 	d.conn = nil
 	d.mu.Unlock()
-	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, physical: p.physical}
+	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, endpoints: p.endpoints, physical: p.physical}
 	if old != nil {
 		// A reload keeps the lock it holds rather than letting it go and
 		// taking it again.

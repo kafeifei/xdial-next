@@ -62,6 +62,9 @@ type Options struct {
 	RuleSet func(*config.Object) ([]*config.Value, bool)
 	// StateDirectory holds the tailscale state of each line, by id.
 	StateDirectory string
+	// TailscaleAuthKeys logs tailscale lines in with an auth key, by line
+	// id: given once by xdial tailscale login, never stored, 4.7.
+	TailscaleAuthKeys map[string]string
 	// TUN adds the TUN inbound, with Stack as its implementation.
 	TUN   bool
 	Stack string
@@ -101,6 +104,8 @@ type Result struct {
 	// EmptyGroups are groups none of whose members exist: every member
 	// came from subscriptions whose nodes the filters left out.
 	EmptyGroups []string
+	// Endpoints are the AnyConnect and Tailscale lines compiled in, by id.
+	Endpoints []string
 	// TooManyMembers is set when groups expand to more than
 	// MaxExpandedMembers members; the configuration is then not complete.
 	TooManyMembers bool
@@ -238,6 +243,9 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 			}
 			if o.Type == "tailscale" {
 				v = v.With("state_directory", config.String(filepath.Join(opts.StateDirectory, o.ID)))
+				if key, ok := opts.TailscaleAuthKeys[o.ID]; ok {
+					v = v.With("auth_key", config.String(key))
+				}
 			}
 			if o.Kind == "line" && isEndpoint(o.Type) {
 				endpoints = append(endpoints, v)
@@ -274,7 +282,7 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 	sort.Strings(k.missing)
 	sort.Strings(k.missingSubs)
 	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty,
-		TooManyMembers: k.tooMany, Secrets: k.usedSecrets()}, nil
+		TooManyMembers: k.tooMany, Endpoints: endpointIDs, Secrets: k.usedSecrets()}, nil
 }
 
 func newCompiler(c *config.Config, opts Options) *compiler {

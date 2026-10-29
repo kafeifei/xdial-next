@@ -1020,6 +1020,15 @@ func TestEndpointStatusIsReported(t *testing.T) {
 	}
 }
 
+func TestTailscaleLoginNeedsALineOfTheConnection(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
+	h.fails("tailscale.login", map[string]any{"line": "hk"}, cli.CodeConfigConflict)
+	h.fails("tailscale.login", map[string]any{"line": "nope", "auth_key": "k"}, cli.CodeConfigConflict)
+	h.fails("tailscale.login", map[string]any{"line": "nope", "auth_key": strings.Repeat("k", MaxSecretLength+1)}, cli.CodeSecretFormat)
+	h.fails("tailscale.logout", map[string]any{"line": "hk"}, cli.CodeConfigConflict)
+}
+
 func TestReadLineSkipsOnlyTheOverlongLine(t *testing.T) {
 	input := "short\n" + strings.Repeat("x", 300) + "\nnext\n"
 	r := bufio.NewReaderSize(strings.NewReader(input), 16)
@@ -1071,6 +1080,35 @@ func TestEndpointTextIsScrubbed(t *testing.T) {
 	scrubEndpoints(long, newScrubber(map[string]Secret{"corp": {Value: "hunter2-secret"}}))
 	if strings.Contains(long["corp"].Error, "hunt") {
 		t.Errorf("part of a secret survived the cut: %s", long["corp"].Error[maxEndpointText-10:])
+	}
+}
+
+func TestLoginLinksStayOutOfTheLog(t *testing.T) {
+	line := "INFO endpoint/tailscale[tailnet]: Waiting for authentication: https://login.tailscale.com/a/abc123"
+	if got := withoutLoginLinks(line); strings.Contains(got, "abc123") || !strings.Contains(got, "Waiting for authentication") {
+		t.Errorf("log line: %s", got)
+	}
+}
+
+func TestWaitAnswersForItsConnectionOnly(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
+	h.d.mu.Lock()
+	c := h.d.conn
+	h.d.mu.Unlock()
+	h.ok("disconnect", nil)
+	if _, err := h.d.waitLine(c, "tailnet", func(engine.EndpointStatus) bool { return false }); !cli.Is(err, cli.CodeConfigConflict) {
+		t.Errorf("waiting on a connection that is gone: %v", err)
+	}
+}
+
+func TestLoginLinksGoBeforeScrubbing(t *testing.T) {
+	// A stored secret "auth" would turn "authentication" into something
+	// the login link pattern no longer finds.
+	scrub := newScrubber(map[string]Secret{"old": {Value: "auth"}})
+	line := "Waiting for authentication: https://login.tailscale.com/a/abc123"
+	if got := scrub.scrub(withoutLoginLinks(line)); strings.Contains(got, "abc123") {
+		t.Errorf("log line: %s", got)
 	}
 }
 
