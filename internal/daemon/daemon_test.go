@@ -1228,6 +1228,48 @@ func TestSelectionOfARemovedMemberIsDropped(t *testing.T) {
 	})
 }
 
+func TestSelectionsSurviveAnApplyThatFails(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	h.ok("connect", map[string]any{"scenario": "s"})
+	h.ok("group.select", map[string]any{"group": "pick", "member": "b"})
+	// The new configuration comes up but cannot be stored: the old one
+	// comes back, and with it the choice its group had.
+	if err := os.Remove(h.layout.Config()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(h.layout.Config(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	without := strings.Replace(groupDoc, `"outbounds": ["a", "b"]},
+	           {"id": "fast"`, `"outbounds": ["a"]},
+	           {"id": "fast"`, 1)
+	if r := h.call("config.apply", map[string]any{"content": without}); r.OK {
+		t.Fatal("apply succeeded without storing")
+	}
+	if picked := h.d.selections(); picked["pick"] != "b" {
+		t.Errorf("after the failed apply: %v", picked)
+	}
+}
+
+func TestSelectionOutsideAFilterIsDropped(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://sub.example/token"
+	h.ok("config.apply", map[string]any{"content": subDoc})
+	h.ok("secret.set", map[string]any{"name": "air-url", "value": url})
+	h.seedSubscription("air", url, airCache)
+	h.ok("group.select", map[string]any{"group": "proxy", "member": "xdial:sub:air:香港 01"})
+	excluded := strings.Replace(subDoc, `"filter": "香港"}`, `"filter": "香港", "exclude": "01"}`, 1)
+	if excluded == subDoc {
+		t.Fatal("the test document changed")
+	}
+	h.ok("config.apply", map[string]any{"content": excluded})
+	if picked := h.d.selections(); len(picked) != 0 {
+		t.Errorf("a node the filter leaves out: %v", picked)
+	}
+}
+
 func TestSelectRightAfterConnectReachesTheEngine(t *testing.T) {
 	h := start(t, nil)
 	h.ok("config.apply", map[string]any{"content": groupDoc})
@@ -1250,6 +1292,9 @@ func TestLineTestAnswersThroughTheEngine(t *testing.T) {
 	h.ok("connect", map[string]any{"scenario": "s"})
 	// Only what the engine runs; an unknown id is not echoed back at length.
 	h.fails("line.test", map[string]any{"ids": []string{"pick", strings.Repeat("n", 1<<16)}}, cli.CodeConfigConflict)
+	if r := h.ok("line.test", map[string]any{"ids": []string{"direct"}}); r["results"].(map[string]any)["direct"] == nil {
+		t.Errorf("direct: %v", r)
+	}
 	r := h.ok("line.test", map[string]any{"ids": []string{"pick"}})
 	results := r["results"].(map[string]any)
 	// Nothing listens on port 9: each member answers with an error.
@@ -1412,7 +1457,7 @@ func TestExplainPointsOutContentNewerThanTheEngine(t *testing.T) {
 	h.seedRuleSet("r", url, `{"version": 3, "rules": [{"domain_suffix": ["example.com"]}]}`)
 	h.ok("connect", map[string]any{"scenario": "s"})
 	e := h.ok("explain", map[string]any{"target": "www.example.com"})
-	if e["rule"] == nil || strings.Contains(fmt.Sprint(e["notes"]), "更新过") {
+	if e["rule"] == nil || strings.Contains(fmt.Sprint(e["notes"]), "不是同一份") {
 		t.Errorf("before an update: %v", e)
 	}
 	// An update after the engine came up takes effect at the next connect:
@@ -1420,7 +1465,7 @@ func TestExplainPointsOutContentNewerThanTheEngine(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	h.seedRuleSet("r", url, `{"version": 3, "rules": [{"domain_suffix": ["other.example"]}]}`)
 	e = h.ok("explain", map[string]any{"target": "www.example.com"})
-	if e["rule"] != nil || !strings.Contains(fmt.Sprint(e["notes"]), "规则集 r 在连上之后更新过") {
+	if e["rule"] != nil || !strings.Contains(fmt.Sprint(e["notes"]), "规则集 r 和运行中的引擎用的不是同一份") {
 		t.Errorf("after an update: %v", e)
 	}
 }

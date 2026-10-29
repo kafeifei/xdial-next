@@ -184,28 +184,30 @@ func (d *Daemon) fetchFor(cfg *config.Config, scenario string) error {
 // from the cache only; prepare runs it under d.ctl, where nothing is
 // downloaded. Without them there is no connection: a rule set that never
 // matches would quietly send its traffic elsewhere, 3.4.
-func (d *Daemon) cachedRuleSets(cfg *config.Config, scenario string, secrets map[string]Secret) (map[string][]*config.Value, error) {
+func (d *Daemon) cachedRuleSets(cfg *config.Config, scenario string, secrets map[string]Secret) (map[string][]*config.Value, map[string]time.Time, error) {
 	content := map[string][]*config.Value{}
+	changed := map[string]time.Time{}
 	for _, o := range remoteRuleSets(cfg, scenario) {
 		url, err := remoteURL(cfg, o, secrets)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		_, rules, ok := d.cachedRules(o, url)
+		meta, rules, ok := d.cachedRules(o, url)
 		if !ok {
 			d.dropInvalid(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), func() bool {
 				_, _, ok := d.cachedRules(o, url)
 				return ok
 			})
 			d.wakeResources()
-			return nil, cli.Errorf(cli.CodeResourceMissing, "用 xdial rule-set update "+o.ID+" 下载", "场景 %s 用到的规则集 %s 还没下载", scenario, o.ID)
+			return nil, nil, cli.Errorf(cli.CodeResourceMissing, "用 xdial rule-set update "+o.ID+" 下载", "场景 %s 用到的规则集 %s 还没下载", scenario, o.ID)
 		}
 		// A cache in use is not collected, 3.4.
 		now := time.Now()
 		_ = os.Chtimes(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), now, now)
 		content[o.ID] = rules
+		changed[o.ID] = meta.ChangedAt
 	}
-	return content, nil
+	return content, changed, nil
 }
 
 // dropInvalid removes a cached file whose content no longer passes the
