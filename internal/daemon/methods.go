@@ -164,8 +164,7 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	defer d.ctl.Unlock()
 	d.mu.Lock()
 	revision, current, secrets := d.revision(), d.cfg, maps.Clone(d.secrets)
-	connected := d.conn != nil
-	scenario := d.state.Scenario
+	live, want, scenario := d.conn != nil, d.state.Connected, d.state.Scenario
 	d.mu.Unlock()
 	if p.IfMatch != "" && p.IfMatch != revision {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "重新 xdial config export 后再改", "配置已经被改过：现在是 %s", revision)}
@@ -174,7 +173,7 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	for _, s := range c.Scenarios {
 		scenarioGone = scenarioGone && s.ID != scenario
 	}
-	if connected && scenarioGone {
+	if want && scenarioGone {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "先 xdial scenario use 切到别的场景", "新配置删掉了正在用的场景 %q", scenario)}
 	}
 	if err := checkFormats(c, secrets); err != nil {
@@ -194,31 +193,43 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 		return reply{schema: SchemaConfigApply, result: result}
 	}
 
-	// Connected, the new configuration must come up before it is stored;
-	// if it does not, the old one comes back and nothing changes, 4.1.
-	d.mu.Lock()
-	previous, previousRaw := d.cfg, d.raw
-	d.cfg, d.raw = c, c.Root.Canonical()
-	d.mu.Unlock()
-	if connected {
+	// Connected, the new configuration must come up before it is stored,
+	// and stored before it is current; if either fails, the old one comes
+	// back and nothing changes, 4.1.
+	canonical := c.Root.Canonical()
+	if live {
+		reload, err := d.prepare(c, scenario)
+		if err != nil {
+			return reply{err: err}
+		}
 		d.gen++
-		if err := d.connectLocked(scenario); err != nil {
-			d.mu.Lock()
-			d.cfg, d.raw = previous, previousRaw
-			d.mu.Unlock()
-			if restoreErr := d.connectLocked(scenario); restoreErr != nil {
-				d.retryLocked("新配置没能启动，旧配置也没能恢复：" + restoreErr.Error())
-			}
+		if err := d.bringUp(reload); err != nil {
+			d.restoreLocked()
 			return reply{err: err}
 		}
 		result.Reloaded = true
 	}
-	if err := store.WriteFile(d.opts.Layout.Config(), c.Root.Canonical(), 0o600); err != nil {
-		return reply{err: err}
+	if err := store.WriteFile(d.opts.Layout.Config(), canonical, 0o600); err != nil {
+		if live {
+			d.gen++
+			d.restoreLocked()
+		}
+		return reply{err: cli.Errorf(cli.CodeInternal, "", "保存配置失败，配置没有变：%v", err)}
 	}
+	d.mu.Lock()
+	d.cfg, d.raw = c, canonical
+	d.mu.Unlock()
 	result.Applied = true
 	d.events.add("config_applied", map[string]any{"revision": result.Revision, "previous": result.PreviousRevision})
 	return reply{schema: SchemaConfigApply, result: result}
+}
+
+// restoreLocked brings the stored configuration back up after a reload
+// with a new one failed.
+func (d *Daemon) restoreLocked() {
+	if err := d.establishLocked(); err != nil {
+		d.retryLocked("新配置没能启动，旧配置也没能恢复：" + err.Error())
+	}
 }
 
 // diff lists the objects an apply adds, removes or changes, by kind and id.
@@ -307,6 +318,10 @@ func (d *Daemon) secretSet(params json.RawMessage) reply {
 	if p.Value == "" {
 		return reply{err: cli.Errorf(cli.CodeSecretFormat, "", "凭据的值不能为空")}
 	}
+	// Secrets are what connections are built from: change them in the
+	// control sequence, never in the middle of an apply or a reload.
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.cfg != nil {
@@ -346,6 +361,8 @@ func (d *Daemon) secretRemove(params json.RawMessage) reply {
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
 	}
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, r := range secretRefs(d.cfg, d.secrets) {
@@ -367,9 +384,9 @@ func (d *Daemon) secretRemove(params json.RawMessage) reply {
 }
 
 // connect brings up a scenario, or the last one. Connecting again to the
-// connection that is up changes nothing. A connect that fails leaves what
-// the user asked for as it was: only a connection that came up is resumed
-// after a restart, 6.3.
+// connection that is up changes nothing. A connect that fails before
+// anything changed leaves everything as it was; one that fails later
+// leaves the daemon working towards what the user asked for before, 6.3.
 func (d *Daemon) connect(params json.RawMessage) reply {
 	var p struct {
 		Scenario string `json:"scenario"`
@@ -380,44 +397,47 @@ func (d *Daemon) connect(params json.RawMessage) reply {
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
 	d.mu.Lock()
-	scenario := p.Scenario
+	cfg, c, scenario := d.cfg, d.conn, p.Scenario
 	if scenario == "" {
 		scenario = d.state.Scenario
 	}
-	c, revision := d.conn, d.revision()
 	d.mu.Unlock()
-	if c != nil && c.scenario == scenario && c.revision == revision {
-		return reply{schema: SchemaStatus, result: d.currentStatus()}
-	}
-	d.gen++
-	d.failures = nil
-	if err := d.connectLocked(scenario); err != nil {
+	next, err := d.prepare(cfg, scenario)
+	if err != nil {
 		return reply{err: err}
 	}
-	d.events.add("connected", map[string]any{"scenario": scenario})
+	if c != nil && c.scenario == next.scenario && c.revision == next.revision && sameServers(c.physical, next.physical) {
+		return reply{schema: SchemaStatus, result: d.currentStatus()}
+	}
+	if err := d.switchLocked(next); err != nil {
+		return reply{err: err}
+	}
+	d.events.add("connected", map[string]any{"scenario": next.scenario})
 	return reply{schema: SchemaStatus, result: d.currentStatus()}
 }
 
 // disconnect stores the user's intent before taking anything down, so a
-// daemon killed halfway does not reconnect when it comes back, and drops
-// any retry that is pending, 6.3.
+// daemon killed halfway does not reconnect when it comes back; if storing
+// fails, nothing changes. Any retry pending is dropped, 6.3.
 func (d *Daemon) disconnect(json.RawMessage) reply {
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
-	d.gen++
 	d.mu.Lock()
-	d.state.Connected = false
+	next := d.state
 	d.mu.Unlock()
-	if err := d.saveState(); err != nil {
-		return reply{err: err}
+	next.Connected = false
+	if err := d.persist(next); err != nil {
+		return reply{err: cli.Errorf(cli.CodeInternal, "", "保存断开状态失败，连接没有动：%v", err)}
 	}
+	d.gen++
 	d.disconnectLocked()
 	d.setStatus("disconnected", "")
 	d.events.add("disconnected", nil)
 	return reply{schema: SchemaStatus, result: d.currentStatus()}
 }
 
-// scenarioUse switches the scenario; connected, it reloads.
+// scenarioUse switches the scenario. While the user wants to be connected,
+// it is a connect to the new scenario.
 func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 	var p struct {
 		ID string `json:"id"`
@@ -428,7 +448,7 @@ func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
 	d.mu.Lock()
-	cfg, connected := d.cfg, d.conn != nil
+	cfg, want := d.cfg, d.state.Connected
 	d.mu.Unlock()
 	if cfg == nil {
 		return reply{err: cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")}
@@ -440,18 +460,16 @@ func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 	if !found {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "", "场景 %q 不存在", p.ID)}
 	}
-	if connected {
-		d.gen++
-		if err := d.connectLocked(p.ID); err != nil {
+	if want {
+		next, err := d.prepare(cfg, p.ID)
+		if err != nil {
 			return reply{err: err}
 		}
-	} else {
-		d.mu.Lock()
-		d.state.Scenario = p.ID
-		d.mu.Unlock()
-		if err := d.saveState(); err != nil {
+		if err := d.switchLocked(next); err != nil {
 			return reply{err: err}
 		}
+	} else if err := d.persist(State{Scenario: p.ID}); err != nil {
+		return reply{err: cli.Errorf(cli.CodeInternal, "", "保存场景失败：%v", err)}
 	}
 	d.events.add("scenario_used", map[string]any{"scenario": p.ID})
 	return reply{schema: SchemaStatus, result: d.currentStatus()}

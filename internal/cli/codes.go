@@ -62,6 +62,7 @@ const (
 	CodeDaemonBusy        = "daemon.busy"
 	CodeEngineBusy        = "engine.busy"
 	CodeConfirmRequired   = "api.confirm_required"
+	CodeResourceMissing   = "resource.missing"
 )
 
 var codes = map[string]Code{}
@@ -105,6 +106,7 @@ func init() {
 	register(Code{Name: CodeSecretInUse, Exit: ExitConflict, Summary: "凭据仍被引用，不能删除", Hint: "先改掉引用它的配置"})
 	register(Code{Name: CodeSecretFormat, Exit: ExitNegative, Summary: "凭据的格式不符合引用它的字段", Hint: "按提示改正后重新设置"})
 	register(Code{Name: CodeEngineFailed, Exit: ExitNegative, Summary: "没能连上：引擎没能启动、启动后很快退出，或者 DNS 没能接管", Hint: "用 xdial status 看原因"})
+	register(Code{Name: CodeResourceMissing, Exit: ExitMissing, Summary: "场景用到的远程规则集或订阅还没下载", Hint: "等下载完成后再连接"})
 	register(Code{Name: CodeEngineBusy, Exit: ExitConflict, Summary: "另一个 XDial 身份（正式版或 Debug）正连着", Hint: "先在另一个身份里 xdial disconnect"})
 }
 

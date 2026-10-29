@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -537,5 +538,123 @@ func TestScrubber(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, " ab") {
 		t.Errorf("short values must not be replaced: %q", got)
+	}
+}
+
+func TestMissingRemoteRuleSetRefusesToConnect(t *testing.T) {
+	h := start(t, nil)
+	remote := strings.Replace(doc, `{"id": "r", "type": "inline", "rules": [{"domain_suffix": ["example.com"]}]}`,
+		`{"id": "r", "type": "remote", "format": "source", "url": "https://rules.example.com/r.json"}`, 1)
+	h.ok("config.apply", map[string]any{"content": remote})
+	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceMissing)
+	if s := h.ok("status", nil); s["state"] != "disconnected" || s["intent"] != "disconnected" {
+		t.Errorf("a refused connect changed the state: %v", s)
+	}
+	// A scenario that does not use it still connects.
+	h.ok("connect", map[string]any{"scenario": "t"})
+}
+
+func TestInvalidConnectKeepsPendingRetry(t *testing.T) {
+	h := start(t, nil)
+	pid := h.connected()
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	h.waitFor("retry scheduled", func(s map[string]any) bool { return s["state"] == "connecting" })
+	h.fails("connect", map[string]any{"scenario": "nope"}, cli.CodeConfigConflict)
+	h.waitFor("the retry still runs", func(s map[string]any) bool {
+		return s["state"] == "connected" && s["scenario"] == "s"
+	})
+}
+
+func TestDisconnectThatCannotBeStoredChangesNothing(t *testing.T) {
+	h := start(t, nil)
+	pid := h.connected()
+	data := filepath.Dir(h.layout.State())
+	if err := os.Chmod(data, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(data, 0o755)
+	h.fails("disconnect", nil, cli.CodeInternal)
+	if s := h.ok("status", nil); s["state"] != "connected" || int(s["engine_pid"].(float64)) != pid || s["intent"] != "connected" {
+		t.Errorf("a failed disconnect changed the connection: %v", s)
+	}
+}
+
+func TestApplyThatCannotBeStoredRestoresTheOldConfiguration(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
+	before := h.ok("config.export", nil)["revision"]
+	data := filepath.Dir(h.layout.Config())
+	if err := os.Chmod(data, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	changed := strings.Replace(doc, `"final": "direct"},`, `"final": "hk"},`, 1)
+	r := h.call("config.apply", map[string]any{"content": changed})
+	os.Chmod(data, 0o755)
+	if r.OK {
+		t.Fatal("apply succeeded without storing")
+	}
+	s := h.waitFor("old configuration back up", func(s map[string]any) bool { return s["state"] == "connected" })
+	if s["revision"] != before || h.ok("config.export", nil)["revision"] != before {
+		t.Errorf("revision moved: %v", s)
+	}
+}
+
+func TestUnauthorizedCallersCannotTakeTheSlots(t *testing.T) {
+	var open atomic.Bool
+	h := start(t, func(uint32) bool { return open.Load() })
+	var conns []net.Conn
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	for range maxConnections + maxRefusals + 8 {
+		c, err := net.Dial("unix", h.layout.Socket())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+	open.Store(true)
+	c, err := api.Dial(h.layout.Socket(), uint32(os.Getuid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var got api.Response
+	if err := c.Call("status", nil, func(r api.Response) bool { got = r; return true }); err != nil || !got.OK {
+		t.Fatalf("an authorized caller was crowded out: %v %+v", err, got)
+	}
+}
+
+func TestConnectionLockDirectoryMustBeOwnAndPrivate(t *testing.T) {
+	dir := t.TempDir()
+	shared := filepath.Join(dir, "shared")
+	l, err := acquireConnectionLock(shared, filepath.Join(shared, "connection.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.release()
+	info, _ := os.Stat(shared)
+	lock, _ := os.Stat(filepath.Join(shared, "connection.lock"))
+	if info.Mode().Perm() != 0o700 || lock.Mode().Perm() != 0o600 {
+		t.Errorf("modes %v %v", info.Mode(), lock.Mode())
+	}
+	if err := os.Chmod(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireConnectionLock(shared, filepath.Join(shared, "connection.lock")); err == nil {
+		t.Error("a directory others can enter was accepted")
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(shared, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireConnectionLock(link, filepath.Join(link, "connection.lock")); err == nil {
+		t.Error("a symlinked directory was accepted")
 	}
 }

@@ -16,13 +16,15 @@ import (
 // Limits of the local API, ARCHITECTURE.md 6.2.
 const (
 	maxConnections = 32
+	maxRefusals    = 8
 	requestTimeout = 5 * time.Minute
+	refuseTimeout  = 5 * time.Second
 	writeTimeout   = 30 * time.Second
 )
 
-// listen creates the socket. Who may call is decided per request from the
-// kernel's peer credentials, so the socket is open to every local user and
-// an unauthorized caller gets api.permission rather than a bare EACCES. The
+// listen creates the socket. Who may call is decided from the kernel's peer
+// credentials, so the socket is open to every local user and an
+// unauthorized caller gets api.permission rather than a bare EACCES. The
 // directory is root's and made fresh: whatever another user put at its
 // path is removed, and if something takes the path again before it is
 // made, listening fails instead of reusing it.
@@ -54,8 +56,24 @@ func (d *Daemon) listen() (*net.UnixListener, error) {
 	return listener, nil
 }
 
+// serve authorizes each connection as it is accepted, before it takes one
+// of the maxConnections slots, so callers who may not use the daemon cannot
+// crowd out those who may. Refusals have their own small pool with a short
+// deadline; past it, a connection is closed without an answer.
 func (d *Daemon) serve(listener *net.UnixListener) error {
 	slots := make(chan struct{}, maxConnections)
+	refusals := make(chan struct{}, maxRefusals)
+	refuse := func(conn *net.UnixConn, err error) {
+		select {
+		case refusals <- struct{}{}:
+			go func() {
+				defer func() { <-refusals }()
+				answer(conn, err)
+			}()
+		default:
+			conn.Close()
+		}
+	}
 	for {
 		conn, err := listener.AcceptUnix()
 		if err != nil {
@@ -64,34 +82,42 @@ func (d *Daemon) serve(listener *net.UnixListener) error {
 			}
 			return err
 		}
+		uid, err := peercred.UID(conn)
+		if err != nil || !d.opts.Authorize(uid) {
+			refuse(conn, permissionError(uid))
+			continue
+		}
 		select {
 		case slots <- struct{}{}:
 			go func() {
 				defer func() { <-slots }()
-				d.handle(conn)
+				d.handle(conn, uid)
 			}()
 		default:
-			go refuse(conn, cli.Errorf(cli.CodeDaemonBusy, "", "daemon 已有 %d 个连接", maxConnections))
+			refuse(conn, cli.Errorf(cli.CodeDaemonBusy, "", "daemon 已有 %d 个连接", maxConnections))
 		}
 	}
 }
 
-// refuse answers the first request on a connection with err, by its id,
+func permissionError(uid uint32) error {
+	return cli.Errorf(cli.CodeAPIPermission, "", "uid %d 不能使用 daemon：只有 root 和当前在屏幕前登录的用户可以", uid)
+}
+
+// answer replies to the first request on a connection with err, by its id,
 // and hangs up.
-func refuse(conn *net.UnixConn, err error) {
+func answer(conn *net.UnixConn, err error) {
 	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	req, _ := api.ReadRequest(bufio.NewReaderSize(conn, 64<<10))
+	_ = conn.SetReadDeadline(time.Now().Add(refuseTimeout))
+	req, _ := api.ReadRequest(bufio.NewReaderSize(conn, 4<<10))
 	writeResponse(conn, failure(req.ID, err))
 }
 
 // handle serves one connection, one request at a time and in order. Each
-// request is authorized again with the kernel's credentials of the peer,
-// not the socket's file permissions.
-func (d *Daemon) handle(conn *net.UnixConn) {
+// request is authorized again, so a user who is no longer at the console
+// is refused from the next request on.
+func (d *Daemon) handle(conn *net.UnixConn, uid uint32) {
 	defer conn.Close()
 	reader := bufio.NewReaderSize(conn, 64<<10)
-	uid, uidErr := peercred.UID(conn)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(requestTimeout))
 		req, err := api.ReadRequest(reader)
@@ -101,8 +127,8 @@ func (d *Daemon) handle(conn *net.UnixConn) {
 			}
 			return
 		}
-		if uidErr != nil || !d.opts.Authorize(uid) {
-			writeResponse(conn, failure(req.ID, cli.Errorf(cli.CodeAPIPermission, "", "uid %d 不能使用 daemon：只有 root 和当前在屏幕前登录的用户可以", uid)))
+		if !d.opts.Authorize(uid) {
+			writeResponse(conn, failure(req.ID, permissionError(uid)))
 			return
 		}
 		if !d.dispatch(conn, req) {

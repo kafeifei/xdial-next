@@ -17,7 +17,8 @@ ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
 
 mkdir -p "$out_dir/share"
 GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$out_dir/share/xdial" ./cmd/xdial
-cp e2e/*.sh "$out_dir/share/"
+# 默认跑 e2e/run.sh；XDIAL_E2E_CASES 可以换成别的用例文件，例如 e2e/experiments/ 下的实验。
+cp "${XDIAL_E2E_CASES:-e2e/run.sh}" "$out_dir/share/run.sh"
 
 # 远端脚本自己负责清理和释放锁；这里只再兜一次底，删掉虚拟机和文件，不碰锁。
 cleanup() {

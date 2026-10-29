@@ -166,7 +166,7 @@ check m2-reinstall-resumes "jq -e .ok <<< '$out' > /dev/null && jq -e '.result.s
 out="$(sudo "$xdial" daemon uninstall --purge --json 2>&1)"
 sleep 2
 final="$(facts)"
-left="$(ls -d "/Library/LaunchDaemons/$id.plist" "$data" "/var/run/$id" 2> /dev/null | tr '\n' ';')$(pgrep -f 'xdial (daemon|__engine)' | tr '\n' ',')"
+left="$(ls -d "/Library/LaunchDaemons/$id.plist" "$data" "/var/run/$id" /var/run/com.kafeifei.xdial.shared 2> /dev/null | tr '\n' ';')$(pgrep -f 'xdial (daemon|__engine)' | tr '\n' ',')"
 check m2-uninstall-clean "jq -e .ok <<< '$out' > /dev/null && restored '$final' && [[ -z '$left' && \"\$(has_key)\" == 0 ]]" "left=[$left] $final"
 
 exit "$failed"

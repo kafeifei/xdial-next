@@ -2,6 +2,7 @@ package sysdns
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -137,24 +138,81 @@ func TestBuildQuery(t *testing.T) {
 	}
 }
 
-func TestPhysicalPrefersManualServers(t *testing.T) {
-	stores := map[string]string{
-		"show State:/Network/Global/IPv4\n":               "<dictionary> {\n  PrimaryInterface : en0\n  PrimaryService : F05D4BF0-6219\n  Router : 192.168.64.1\n}\n",
-		"show Setup:/Network/Service/F05D4BF0-6219/DNS\n": "  No such key\n",
-		"show State:/Network/Service/F05D4BF0-6219/DNS\n": "<dictionary> {\n  ServerAddresses : <array> {\n    0 : 192.168.64.1\n  }\n}\n",
-		"show State:/Network/Global/IPv6\n":               "  No such key\n",
+// fakeStore answers scutil shows from a map, as scutil prints them.
+func fakeStore(t *testing.T, stores map[string]string) {
+	t.Helper()
+	previous := Runner
+	t.Cleanup(func() { Runner = previous })
+	Runner = func(script string, _ ...string) (string, error) {
+		var out strings.Builder
+		for _, line := range strings.Split(strings.TrimSpace(script), "\n") {
+			key := strings.TrimPrefix(line, "show ")
+			if v, ok := stores[key]; ok {
+				out.WriteString(v)
+			} else {
+				out.WriteString("  No such key\n")
+			}
+		}
+		return out.String(), nil
 	}
-	defer func(r func(string, ...string) (string, error)) { Runner = r }(Runner)
-	Runner = func(script string, _ ...string) (string, error) { return stores[script], nil }
-	if got, err := Physical(); err != nil || len(got) != 1 || got[0].String() != "192.168.64.1" {
-		t.Errorf("dhcp: %v %v", got, err)
+}
+
+func dict(lines ...string) string {
+	return "<dictionary> {\n" + strings.Join(lines, "\n") + "\n}\n"
+}
+
+func servers(addrs ...string) string {
+	s := "  ServerAddresses : <array> {\n"
+	for i, a := range addrs {
+		s += fmt.Sprintf("    %d : %s\n", i, a)
 	}
-	stores["show Setup:/Network/Service/F05D4BF0-6219/DNS\n"] = "<dictionary> {\n  ServerAddresses : <array> {\n    0 : 223.5.5.5\n  }\n}\n"
-	if got, err := Physical(); err != nil || len(got) != 1 || got[0].String() != "223.5.5.5" {
-		t.Errorf("manual: %v %v", got, err)
+	return s + "  }"
+}
+
+const v4 = "  Addresses : <array> {\n    0 : 192.168.64.2\n  }"
+
+func TestPhysical(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stores map[string]string
+		want   string
+	}{
+		{"dhcp", map[string]string{
+			"State:/Network/Global/IPv4":    dict("  PrimaryService : A"),
+			"State:/Network/Service/A/DNS":  dict(servers("192.168.64.1")),
+			"State:/Network/Service/A/IPv4": dict(v4),
+		}, "[192.168.64.1]"},
+		{"manual wins", map[string]string{
+			"State:/Network/Global/IPv4":    dict("  PrimaryService : A"),
+			"Setup:/Network/Service/A/DNS":  dict(servers("223.5.5.5")),
+			"State:/Network/Service/A/DNS":  dict(servers("192.168.64.1")),
+			"State:/Network/Service/A/IPv4": dict(v4),
+		}, "[223.5.5.5]"},
+		{"no network", map[string]string{}, "[]"},
+		{"ipv4 primary without dns, ipv6 primary with", map[string]string{
+			"State:/Network/Global/IPv4":    dict("  PrimaryService : A"),
+			"State:/Network/Global/IPv6":    dict("  PrimaryService : B"),
+			"State:/Network/Service/A/IPv4": dict(v4),
+			"State:/Network/Service/B/DNS":  dict(servers("2001:db8::53")),
+			"State:/Network/Service/B/IPv6": dict("  Addresses : <array> {\n    0 : 2001:db8::2\n  }"),
+		}, "[2001:db8::53]"},
+		{"manual ipv4 dns on an ipv6-only service", map[string]string{
+			"State:/Network/Global/IPv6":    dict("  PrimaryService : B"),
+			"Setup:/Network/Service/B/DNS":  dict(servers("1.1.1.1", "2606:4700:4700::1111")),
+			"State:/Network/Service/B/IPv6": dict("  Addresses : <array> {\n    0 : 2001:db8::2\n  }"),
+		}, "[2606:4700:4700::1111]"},
+	} {
+		fakeStore(t, tc.stores)
+		got, err := Physical()
+		if err != nil || fmt.Sprint(got) != tc.want {
+			t.Errorf("%s: %v %v, want %s", tc.name, got, err, tc.want)
+		}
 	}
-	stores["show State:/Network/Global/IPv4\n"] = "  No such key\n"
-	if got, err := Physical(); err != nil || len(got) != 0 {
-		t.Errorf("no network: %v %v", got, err)
+}
+
+func TestSplitBlocks(t *testing.T) {
+	out := dict("  A : <dictionary> {", "    B : 1", "  }") + "  No such key\n" + dict("  C : 2")
+	if blocks := splitBlocks(out); len(blocks) != 3 || blocks[1] != "" || !strings.Contains(blocks[0], "B : 1") {
+		t.Errorf("blocks %q", blocks)
 	}
 }

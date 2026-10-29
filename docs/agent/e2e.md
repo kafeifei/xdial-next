@@ -24,6 +24,7 @@ make e2e
 ## 写用例
 
 - 用例写在 [e2e/run.sh](../../e2e/run.sh) 里，用 `report <名字> <true|false> <细节>` 输出结果。
+- 一次性的实验放在 [e2e/experiments/](../../e2e/experiments/)，不进 `make check`，用 `XDIAL_E2E_CASES=e2e/experiments/<文件> make e2e` 跑；结果和结论记在 `docs/verification/`。
 - 用例以 `lume` 用户运行。这个账号有免密 sudo，需要 root 的步骤（装 daemon、建 TUN）直接用 `sudo`。
 - 虚拟机自带 `jq`。
 - 每次运行都是新克隆的虚拟机，用例不需要清理系统状态。但"断开或卸载后没有残留"这类检查，要在同一次运行里由用例自己完成。

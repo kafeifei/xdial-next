@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -355,15 +357,26 @@ func runDaemonInstall(ctx *context_) int {
 }
 
 // installBinary copies src, the xdial being run, to dst in the root-owned
-// bin directory, 6.1. The source is opened without following a symlink and
-// must be a regular file only its owner can write; the copy goes to a fresh
-// temporary file beside dst and replaces it by rename, so launchd never
-// starts a half-written file. Signed builds also check the copy's signature
-// before the rename (M6).
+// bin directory, 6.1. The trust in what is copied rests on whoever controls
+// src: the file must be a regular file owned by root or by the user who ran
+// sudo, writable by nobody else, in a directory nobody else can change (or
+// one with the sticky bit, where nobody else can replace it). It is opened
+// without following a symlink, copied to a fresh temporary file beside dst
+// and renamed over it, so launchd never starts a half-written file. A
+// process of that same user could still swap src just before; it could as
+// well have swapped it before sudo ran, so this does not try to stop it.
+// Signed builds check the copy's signature before the rename (M6).
 func installBinary(src, dst string) error {
 	resolved, err := filepath.EvalSymlinks(src)
 	if err != nil {
 		return cli.Errorf(cli.CodeInputRead, "", "找不到 %s：%v", src, err)
+	}
+	owners := []uint32{0}
+	if id, err := strconv.ParseUint(os.Getenv("SUDO_UID"), 10, 32); err == nil {
+		owners = append(owners, uint32(id))
+	}
+	if err := ownedBy(filepath.Dir(resolved), owners, true); err != nil {
+		return err
 	}
 	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
@@ -374,8 +387,11 @@ func installBinary(src, dst string) error {
 	if err != nil {
 		return cli.Errorf(cli.CodeInputRead, "", "%v", err)
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
-		return cli.Errorf(cli.CodeInputPermission, "chmod go-w 之后再装", "%s 不是普通文件，或者属主以外的人能改它", resolved)
+	if !info.Mode().IsRegular() {
+		return cli.Errorf(cli.CodeInputPermission, "", "%s 不是普通文件", resolved)
+	}
+	if err := ownedBy(resolved, owners, false); err != nil {
+		return err
 	}
 	binary, err := io.ReadAll(io.LimitReader(f, 1<<30))
 	if err != nil {
@@ -383,6 +399,23 @@ func installBinary(src, dst string) error {
 	}
 	if err := store.WriteFile(dst, binary, 0o755); err != nil {
 		return cli.Errorf(cli.CodeInternal, "", "拷贝二进制失败：%v", err)
+	}
+	return nil
+}
+
+// ownedBy refuses path unless one of owners owns it and nobody else can
+// write it; a directory with the sticky bit may be writable by others.
+func ownedBy(path string, owners []uint32, dir bool) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return cli.Errorf(cli.CodeInputRead, "", "%v", err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !slices.Contains(owners, st.Uid) {
+		return cli.Errorf(cli.CodeInputPermission, "把 xdial 放到自己或 root 的目录里再装", "%s 的属主不是 root 也不是运行 sudo 的用户", path)
+	}
+	if info.Mode().Perm()&0o022 != 0 && !(dir && info.Mode()&os.ModeSticky != 0) {
+		return cli.Errorf(cli.CodeInputPermission, "chmod go-w 之后再装", "%s 属主以外的人能改", path)
 	}
 	return nil
 }
@@ -401,6 +434,15 @@ func runDaemonUninstall(ctx *context_) int {
 	_, purge := ctx.options["--purge"]
 	removed := []string{}
 	targets := []string{l.Plist(), filepath.Dir(l.Bin()), l.SocketDir()}
+	// The shared directory holds only the connection lock; it goes with the
+	// last identity installed.
+	other := paths.Layout{ID: paths.Release, Root: l.Root}
+	if l.ID == paths.Release {
+		other.ID = paths.Debug
+	}
+	if _, err := os.Lstat(other.Plist()); errors.Is(err, os.ErrNotExist) {
+		targets = append(targets, l.SharedDir())
+	}
 	if purge {
 		targets = append(targets, l.Data())
 	}

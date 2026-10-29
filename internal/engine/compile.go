@@ -87,6 +87,9 @@ type Result struct {
 	// Pending lists what could not be checked, such as remote rule sets
 	// compiled with a placeholder, ARCHITECTURE.md 4.2.
 	Pending []string
+	// MissingRuleSets are the remote rule sets compiled with a placeholder.
+	// A placeholder is for checks only; connecting refuses it.
+	MissingRuleSets []string
 	// Secrets names the secrets the compiled objects use, sorted.
 	Secrets []string
 }
@@ -96,6 +99,7 @@ type compiler struct {
 	opts     Options
 	replace  map[*config.Value]string
 	pending  []string
+	missing  []string
 	lines    map[string]bool // outbounds to compile
 	ruleSets map[string]bool
 }
@@ -193,7 +197,8 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 		return nil, err
 	}
 	sort.Strings(k.pending)
-	return &Result{JSON: out, Pending: k.pending, Secrets: k.usedSecrets()}, nil
+	sort.Strings(k.missing)
+	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, Secrets: k.usedSecrets()}, nil
 }
 
 func isEndpoint(typ string) bool { return typ == "openconnect" || typ == "tailscale" }
@@ -298,6 +303,7 @@ func (k *compiler) compileRuleSets() (route []any, dns map[string]dnsSet) {
 		} else {
 			rules = []*config.Value{placeholderRule()}
 			k.pending = append(k.pending, fmt.Sprintf("规则集 %s 的内容还没下载，检查时用了占位规则", o.ID))
+			k.missing = append(k.missing, o.ID)
 		}
 		route = append(route, map[string]any{"type": "inline", "tag": o.ID, "rules": rules})
 

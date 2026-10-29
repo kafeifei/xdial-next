@@ -118,7 +118,13 @@ func (c *Client) Call(method string, params any, each func(Response) bool) error
 		return cli.Errorf(cli.CodeDaemonUnreachable, "", "发给 daemon 时出错：%v", err)
 	}
 	for {
-		_ = c.conn.SetReadDeadline(time.Now().Add(c.timeout))
+		// logs may follow for as long as the caller likes, with nothing to
+		// say in between: no read deadline there.
+		deadline := time.Now().Add(c.timeout)
+		if method == "logs" {
+			deadline = time.Time{}
+		}
+		_ = c.conn.SetReadDeadline(deadline)
 		resp, err := ReadResponse(c.reader)
 		if err != nil {
 			if errors.Is(err, io.EOF) {

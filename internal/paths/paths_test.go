@@ -22,7 +22,7 @@ func TestPathsAreAbsolute(t *testing.T) {
 
 func TestConnectionLockIsShared(t *testing.T) {
 	release, debug := Layout{ID: Release}, Layout{ID: Debug}
-	if release.ConnectionLock() != debug.ConnectionLock() || release.ConnectionLock() != "/var/run/com.kafeifei.xdial.connection.lock" {
+	if release.ConnectionLock() != debug.ConnectionLock() || release.ConnectionLock() != "/var/run/com.kafeifei.xdial.shared/connection.lock" {
 		t.Errorf("lock %s / %s", release.ConnectionLock(), debug.ConnectionLock())
 	}
 }

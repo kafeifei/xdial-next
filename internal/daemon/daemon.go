@@ -158,10 +158,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.events.add("daemon_started", nil)
 	d.ctl.Lock()
 	d.mu.Lock()
-	resume, scenario := d.state.Connected && d.cfg != nil, d.state.Scenario
+	resume := d.state.Connected
 	d.mu.Unlock()
 	if resume {
-		if err := d.connectLocked(scenario); err != nil {
+		if err := d.establishLocked(); err != nil {
 			d.retryLocked(err.Error())
 		}
 	}
@@ -234,11 +234,16 @@ func trimDaemonLog(path string) {
 	_ = os.Truncate(path, 0)
 }
 
-func (d *Daemon) saveState() error {
+// persist stores what the user asks for and then takes it as current;
+// storing is the commit point, so a failed write changes nothing.
+func (d *Daemon) persist(next State) error {
+	if err := store.WriteJSON(d.opts.Layout.State(), next, 0o600); err != nil {
+		return err
+	}
 	d.mu.Lock()
-	state := d.state
+	d.state = next
 	d.mu.Unlock()
-	return store.WriteJSON(d.opts.Layout.State(), state, 0o600)
+	return nil
 }
 
 // saveSecrets is called with d.mu held.

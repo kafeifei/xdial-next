@@ -12,10 +12,10 @@ import (
 )
 
 // Connection control, ARCHITECTURE.md 6.3. Every step that starts, stops or
-// replaces the connection runs under d.ctl, one at a time: user requests,
-// reloads, retries after a crash and the periodic checks. A retry carries
-// the generation it was scheduled in and is dropped if a user request came
-// since.
+// replaces the connection, or changes what it is built from, runs under
+// d.ctl, one at a time: user requests, reloads, retries after a crash and
+// the periodic checks. A retry carries the generation it was scheduled in
+// and is dropped if a user request changed the connection since.
 const (
 	failWindow    = 5 * time.Minute
 	maxFailures   = 5
@@ -37,18 +37,22 @@ type connection struct {
 	probeMiss int
 }
 
-// connectLocked brings up scenario with the current configuration,
-// replacing any connection, 6.3: compile with the real secrets and the
-// physical DNS, take the connection lock, start the engine, check through
-// TUN that queries reach sing-box, and only then publish the resolver key.
-// Between the old connection going and the new one coming up, traffic goes
-// direct. Callers hold d.ctl.
-func (d *Daemon) connectLocked(scenario string) error {
-	d.mu.Lock()
-	cfg, secrets := d.cfg, maps.Clone(d.secrets)
-	d.mu.Unlock()
+// plan is a connection ready to come up: compiled and checked, with
+// nothing changed yet.
+type plan struct {
+	scenario string
+	revision string
+	physical []netip.Addr
+	compiled []byte
+	secrets  map[string]Secret
+}
+
+// prepare compiles scenario of cfg with the real secrets and the physical
+// DNS and checks everything that can be checked without touching the
+// running connection. A request that fails here changes nothing.
+func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if cfg == nil {
-		return cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")
+		return nil, cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")
 	}
 	if scenario == "" && len(cfg.Scenarios) > 0 {
 		scenario = cfg.Scenarios[0].ID
@@ -58,78 +62,134 @@ func (d *Daemon) connectLocked(scenario string) error {
 		found = found || s.ID == scenario
 	}
 	if !found {
-		return cli.Errorf(cli.CodeConfigConflict, "用 xdial scenario use <id> 选一个存在的场景", "场景 %q 不存在", scenario)
+		return nil, cli.Errorf(cli.CodeConfigConflict, "用 xdial scenario use <id> 选一个存在的场景", "场景 %q 不存在", scenario)
 	}
+	d.mu.Lock()
+	secrets := maps.Clone(d.secrets)
+	d.mu.Unlock()
 	physical, err := d.sys.PhysicalDNS()
 	if err != nil {
-		return d.failLocked(fmt.Sprintf("读不到物理网络的 DNS：%v", err))
+		return nil, cli.Errorf(cli.CodeEngineFailed, "", "读不到物理网络的 DNS：%v", err)
 	}
 	physical = usablePhysical(physical)
 	d.mu.Lock()
 	d.physical = physical
 	d.mu.Unlock()
 	if len(physical) == 0 {
-		return d.failLocked("物理网络还没有 DNS 服务器，网络就绪后自动重试")
+		return nil, cli.Errorf(cli.CodeEngineFailed, "网络就绪后会自动重试", "物理网络还没有 DNS 服务器")
 	}
-	opts := engine.Options{
+	result, err := engine.Compile(cfg, engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
 		PhysicalDNS: physical[0],
 		Secret:      func(u config.SecretUse) string { return secrets[u.Name].Value },
-	}
-	result, err := engine.Compile(cfg, opts)
+	})
 	if err != nil {
-		return cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
+		return nil, cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
+	}
+	// Placeholders are for checks only: a rule set that never matches would
+	// quietly send its traffic elsewhere, 3.4.
+	if len(result.MissingRuleSets) > 0 {
+		return nil, cli.Errorf(cli.CodeResourceMissing, "远程规则集的下载在 M3 实现，现在只能用 inline 规则集", "场景 %s 用到的远程规则集还没下载：%v", scenario, result.MissingRuleSets)
 	}
 	if err := checkSecrets(cfg, secrets, result.Secrets); err != nil {
-		return err
+		return nil, err
 	}
+	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, secrets: secrets}, nil
+}
 
+// bringUp replaces the connection with p, 6.3: take the connection lock,
+// start the engine, check through TUN that queries reach sing-box, and only
+// then publish the resolver key. Between the old connection going and the
+// new one coming up, traffic goes direct. It does not change what the user
+// asked for. Callers hold d.ctl.
+func (d *Daemon) bringUp(p *plan) error {
 	d.disconnectLocked()
 	d.setStatus("connecting", "")
-	c := &connection{scenario: scenario, revision: cfg.Root.Revision(), physical: physical}
+	c := &connection{scenario: p.scenario, revision: p.revision, physical: p.physical}
+	var err error
 	// Busy means the other identity is connected, or, right after a
 	// restart, this daemon's previous engine is still exiting; retries
 	// cover the latter.
-	c.lock, err = acquireConnectionLock(d.opts.Layout.ConnectionLock())
+	c.lock, err = acquireConnectionLock(d.opts.Layout.SharedDir(), d.opts.Layout.ConnectionLock())
 	if err != nil {
 		d.setStatus("failed", err.Error())
 		return err
 	}
-	c.engine, err = d.startEngine(result.JSON, c.lock.file, newScrubber(secrets))
+	c.engine, err = d.startEngine(p.compiled, c.lock.file, newScrubber(p.secrets))
 	if err != nil {
 		c.lock.release()
-		d.events.add("engine_failed", map[string]any{"scenario": scenario})
-		return d.failLocked(err.Error())
+		d.events.add("engine_failed", map[string]any{"scenario": p.scenario})
+		return d.fail(err.Error())
 	}
-	d.events.add("engine_started", map[string]any{"scenario": scenario, "pid": c.engine.pid})
+	d.events.add("engine_started", map[string]any{"scenario": p.scenario, "pid": c.engine.pid})
 	if err := d.probe(); err != nil {
 		d.teardown(c)
-		return d.failLocked("查询进不了 sing-box：" + err.Error())
+		return d.fail("查询进不了 sing-box：" + err.Error())
 	}
 	c.resolver, err = d.sys.Hold(d.opts.Layout.DNSKey(), c.lock.file)
 	if err != nil {
 		d.teardown(c)
-		return d.failLocked("设置系统 DNS 失败：" + err.Error())
+		return d.fail("设置系统 DNS 失败：" + err.Error())
 	}
 	published, first := d.checkResolver()
 	if !published {
 		d.teardown(c)
-		return d.failLocked("系统 DNS 设置后没有生效")
+		return d.fail("系统 DNS 设置后没有生效")
 	}
 	c.first = first
-	d.events.add("dns_set", map[string]any{"first": first, "physical": physical})
-
+	d.events.add("dns_set", map[string]any{"first": first, "physical": p.physical})
 	d.mu.Lock()
 	d.conn = c
-	d.state.Scenario, d.state.Connected = scenario, true
 	d.mu.Unlock()
 	d.wakeMonitor()
-	if err := d.saveState(); err != nil {
-		d.events.add("state_save_failed", map[string]any{"error": err.Error()})
-	}
 	d.setStatus("connected", "")
 	go d.watch(c.engine)
 	return nil
+}
+
+// establishLocked brings up what the user asked for with the stored
+// configuration: for resuming, retries and reloads.
+func (d *Daemon) establishLocked() error {
+	d.mu.Lock()
+	cfg, scenario := d.cfg, d.state.Scenario
+	d.mu.Unlock()
+	p, err := d.prepare(cfg, scenario)
+	if err != nil {
+		d.setStatus("failed", err.Error())
+		return err
+	}
+	return d.bringUp(p)
+}
+
+// switchLocked brings up p for a user request and stores it as what the
+// user asks for; storing is the commit point. If either fails, the request
+// fails, and what the user asked for before is worked towards again.
+func (d *Daemon) switchLocked(p *plan) error {
+	d.gen++
+	d.failures = nil
+	if err := d.bringUp(p); err != nil {
+		d.resumeIntentLocked(err.Error())
+		return err
+	}
+	if err := d.persist(State{Scenario: p.scenario, Connected: true}); err != nil {
+		d.disconnectLocked()
+		d.resumeIntentLocked("保存连接状态失败：" + err.Error())
+		return cli.Errorf(cli.CodeInternal, "", "保存连接状态失败，已断开：%v", err)
+	}
+	return nil
+}
+
+// resumeIntentLocked leaves a failed request in a definite state: retrying
+// towards a connection the user still wants, or failed.
+func (d *Daemon) resumeIntentLocked(reason string) {
+	d.mu.Lock()
+	want := d.state.Connected
+	d.mu.Unlock()
+	if want {
+		d.retryLocked(reason)
+		return
+	}
+	d.setStatus("failed", reason)
 }
 
 func (d *Daemon) wakeMonitor() {
@@ -139,8 +199,8 @@ func (d *Daemon) wakeMonitor() {
 	}
 }
 
-// failLocked records why a connection attempt failed.
-func (d *Daemon) failLocked(reason string) error {
+// fail records why a connection attempt failed.
+func (d *Daemon) fail(reason string) error {
 	d.setStatus("failed", reason)
 	return cli.Errorf(cli.CodeEngineFailed, "看 xdial status 和 xdial logs", "%s", reason)
 }
@@ -238,28 +298,26 @@ func (d *Daemon) retryLocked(reason string) {
 		defer d.ctl.Unlock()
 		d.mu.Lock()
 		stale := d.gen != gen || d.closing || !d.state.Connected || d.conn != nil
-		scenario := d.state.Scenario
 		d.mu.Unlock()
 		if stale {
 			return
 		}
-		if err := d.connectLocked(scenario); err != nil {
+		if err := d.establishLocked(); err != nil {
 			d.retryLocked(err.Error())
 		}
 	})
 }
 
 // reconcile runs on every change notification and every checkInterval
-// while the daemon wants to be connected, 6.4: a changed physical DNS
-// reloads the engine with it, a lost resolver key is published again, and
-// an engine that stops answering is restarted. A connection that gave up
-// starts again when the physical network changes.
+// while the user wants to be connected, 6.4: a changed physical DNS reloads
+// the engine with it, a lost resolver key is published again, and an engine
+// that stops answering is restarted. A connection that gave up starts again
+// when the physical network changes.
 func (d *Daemon) reconcile() {
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
 	d.mu.Lock()
 	c, want, closing, status, last := d.conn, d.state.Connected, d.closing, d.status, d.physical
-	scenario := d.state.Scenario
 	d.mu.Unlock()
 	if closing || !want {
 		return
@@ -274,7 +332,7 @@ func (d *Daemon) reconcile() {
 			d.events.add("physical_dns_changed", map[string]any{"servers": physical})
 			d.failures = nil
 			d.gen++
-			if err := d.connectLocked(scenario); err != nil {
+			if err := d.establishLocked(); err != nil {
 				d.retryLocked(err.Error())
 			}
 		}
@@ -283,7 +341,7 @@ func (d *Daemon) reconcile() {
 	if !sameServers(physical, c.physical) {
 		d.events.add("physical_dns_changed", map[string]any{"servers": physical})
 		d.gen++
-		if err := d.connectLocked(c.scenario); err != nil {
+		if err := d.establishLocked(); err != nil {
 			d.retryLocked(err.Error())
 		}
 		return
@@ -312,7 +370,7 @@ func (d *Daemon) reconcile() {
 		// configd lost it, as when configd restarts.
 		_ = c.resolver.Republish()
 		d.events.add("dns_republished", nil)
-		published, first = d.checkResolver()
+		_, first = d.checkResolver()
 	}
 	if first != c.first {
 		d.events.add("dns_first_changed", map[string]any{"first": first})

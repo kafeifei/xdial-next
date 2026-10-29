@@ -9,6 +9,7 @@ package sysdns
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -40,13 +42,21 @@ var keyPattern = regexp.MustCompile(`^State:/Network/Service/[A-Za-z0-9.\-]+/DNS
 // Session is a running scutil that holds the resolver key and reports
 // changes to it and to the physical DNS.
 type Session struct {
-	key     string
-	cmd     *exec.Cmd
-	mu      sync.Mutex
-	stdin   io.WriteCloser
-	done    chan struct{}
-	changes chan struct{}
+	key       string
+	cmd       *exec.Cmd
+	writeMu   sync.Mutex
+	stdin     *os.File
+	closeOnce sync.Once
+	done      chan struct{}
+	changes   chan struct{}
 }
+
+// Time limits, so a stuck scutil or configd cannot hold up the daemon.
+const (
+	commandTimeout = 5 * time.Second
+	writeTimeout   = 2 * time.Second
+	closeTimeout   = 3 * time.Second
+)
 
 // Hold starts a session that adds key as a temporary value pointing at
 // server for every domain, then watches what the physical DNS is read
@@ -57,21 +67,28 @@ func Hold(key string, server netip.Addr, extra ...*os.File) (*Session, error) {
 	if !keyPattern.MatchString(key) {
 		return nil, fmt.Errorf("sysdns: bad key %q", key)
 	}
-	cmd := exec.Command(scutil)
-	cmd.ExtraFiles = extra
-	stdin, err := cmd.StdinPipe()
+	// A pipe of our own, not StdinPipe, so writes can have a deadline.
+	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
+	cmd := exec.Command(scutil)
+	cmd.Stdin = r
+	cmd.ExtraFiles = extra
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		r.Close()
+		w.Close()
 		return nil, err
 	}
 	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	r.Close()
+	if err != nil {
+		w.Close()
 		return nil, err
 	}
-	s := &Session{key: key, cmd: cmd, stdin: stdin, done: make(chan struct{}), changes: make(chan struct{}, 1)}
+	s := &Session{key: key, cmd: cmd, stdin: w, done: make(chan struct{}), changes: make(chan struct{}, 1)}
 	go func() {
 		// Notifications and errors are the only output; any line means
 		// something may have changed, and the daemon reads the store again.
@@ -98,15 +115,16 @@ func Hold(key string, server netip.Addr, extra ...*os.File) (*Session, error) {
 }
 
 func (s *Session) write(script string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_ = s.stdin.SetWriteDeadline(time.Now().Add(writeTimeout))
 	_, err := io.WriteString(s.stdin, script)
 	return err
 }
 
 // Republish adds the key again, for when configd lost it (a configd
 // restart drops every key). The current dictionary of the session is still
-// the resolver's.
+// the resolver's: notifications do not change it.
 func (s *Session) Republish() error {
 	return s.write(fmt.Sprintf("add %s temporary\n", s.key))
 }
@@ -118,23 +136,26 @@ func (s *Session) Changes() <-chan struct{} { return s.changes }
 // Done is closed when the session has ended.
 func (s *Session) Done() <-chan struct{} { return s.done }
 
-// Close ends the session, which removes the key, and waits for it.
+// Close ends the session, which removes the key, and waits for it. It does
+// not wait for a write in progress: closing the pipe ends that write too,
+// and a session that does not exit is killed.
 func (s *Session) Close() {
-	s.mu.Lock()
-	_ = s.stdin.Close()
-	s.mu.Unlock()
+	s.closeOnce.Do(func() { _ = s.stdin.Close() })
 	select {
 	case <-s.done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(closeTimeout):
 		_ = s.cmd.Process.Kill()
 		<-s.done
 	}
 }
 
-// Runner executes scutil with a script on stdin and returns its output;
-// tests replace it.
+// Runner executes scutil with a script on stdin and returns its output,
+// within commandTimeout; tests replace it.
 var Runner = func(script string, args ...string) (string, error) {
-	cmd := exec.Command(scutil, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, scutil, args...)
+	cmd.WaitDelay = time.Second
 	cmd.Stdin = strings.NewReader(script)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -154,33 +175,92 @@ func Present(key string) (bool, error) {
 	return strings.Contains(out, "ServerAddresses"), nil
 }
 
-// Physical returns the DNS servers of the primary network service, as
-// configd merges them: servers set by hand in Setup: win over those from
-// DHCP or router advertisements in State:.
+// Physical returns the DNS servers of the physical network, close to how
+// configd picks the default resolver: the primary services for IPv4 and
+// IPv6, each with servers set by hand (Setup:) winning over those from DHCP
+// or router advertisements (State:), keeping only the address families the
+// service has an address in; the first service left with servers wins.
 func Physical() ([]netip.Addr, error) {
-	var service string
-	for _, key := range []string{primaryIPv4, primaryIPv6} {
-		out, err := Runner(fmt.Sprintf("show %s\n", key))
+	globals, err := showAll(primaryIPv4, primaryIPv6)
+	if err != nil {
+		return nil, err
+	}
+	var services []string
+	for _, g := range globals {
+		service := parseValue(g, "PrimaryService")
+		if service != "" && !strings.ContainsAny(service, " \n/") && !slices.Contains(services, service) {
+			services = append(services, service)
+		}
+	}
+	for _, service := range services {
+		base := "/Network/Service/" + service + "/"
+		blocks, err := showAll("Setup:"+base+"DNS", "State:"+base+"DNS", "State:"+base+"IPv4", "State:"+base+"IPv6")
 		if err != nil {
 			return nil, err
 		}
-		if service = parseValue(out, "PrimaryService"); service != "" {
-			break
+		servers := parseServers(blocks[0])
+		if len(servers) == 0 {
+			servers = parseServers(blocks[1])
 		}
-	}
-	if service == "" || strings.ContainsAny(service, " \n/") {
-		return nil, nil
-	}
-	for _, prefix := range []string{"Setup:", "State:"} {
-		out, err := Runner(fmt.Sprintf("show %s/Network/Service/%s/DNS\n", prefix, service))
-		if err != nil {
-			return nil, err
+		v4, v6 := hasAddresses(blocks[2]), hasAddresses(blocks[3])
+		var usable []netip.Addr
+		for _, a := range servers {
+			if (a.Is4() && v4) || (a.Is6() && v6) {
+				usable = append(usable, a)
+			}
 		}
-		if servers := parseServers(out); len(servers) > 0 {
-			return servers, nil
+		if len(usable) > 0 {
+			return usable, nil
 		}
 	}
 	return nil, nil
+}
+
+func hasAddresses(block string) bool {
+	return strings.Contains(block, "Addresses : <array>")
+}
+
+// showAll shows several keys in one scutil run and returns one block per
+// key, empty for a key that does not exist.
+func showAll(keys ...string) ([]string, error) {
+	var script strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&script, "show %s\n", k)
+	}
+	out, err := Runner(script.String())
+	if err != nil {
+		return nil, err
+	}
+	blocks := splitBlocks(out)
+	if len(blocks) != len(keys) {
+		return nil, fmt.Errorf("scutil: %d 个键得到 %d 段输出", len(keys), len(blocks))
+	}
+	return blocks, nil
+}
+
+// splitBlocks splits the output of several shows: each is a dictionary
+// that ends with a "}" in the first column, or "No such key".
+func splitBlocks(out string) []string {
+	var blocks []string
+	var current strings.Builder
+	in := false
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case in:
+			current.WriteString(line + "\n")
+			if line == "}" {
+				blocks = append(blocks, current.String())
+				current.Reset()
+				in = false
+			}
+		case strings.HasPrefix(line, "<dictionary> {"):
+			in = true
+			current.WriteString(line + "\n")
+		case strings.Contains(line, "No such key"):
+			blocks = append(blocks, "")
+		}
+	}
+	return blocks
 }
 
 // parseValue reads a scalar of scutil's dictionary output.
