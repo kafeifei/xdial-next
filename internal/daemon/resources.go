@@ -748,7 +748,8 @@ func (d *Daemon) refreshResources() {
 		if err != nil {
 			continue
 		}
-		if c, ok := d.subscriptionMeta(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) {
+		marked := d.markedInvalid(d.subscriptionPath(o.ID, subscriptionFingerprint(o, url)))
+		if c, ok := d.subscriptionMeta(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) && !marked {
 			continue
 		}
 		_, _ = d.downloadSubscription(cfg, o, secrets)
