@@ -76,7 +76,7 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	d.physical = physical
 	d.mu.Unlock()
 	if len(physical) == 0 {
-		return nil, cli.Errorf(cli.CodeEngineFailed, "网络就绪后会自动重试", "物理网络还没有 DNS 服务器")
+		return nil, cli.Errorf(cli.CodeEngineFailed, "连上网络后再试；已经连着时，网络就绪后会自动重连", "物理网络还没有 DNS 服务器")
 	}
 	result, err := engine.Compile(cfg, engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
@@ -103,17 +103,28 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 // new one coming up, traffic goes direct. It does not change what the user
 // asked for. Callers hold d.ctl.
 func (d *Daemon) bringUp(p *plan) error {
-	d.disconnectLocked()
-	d.setStatus("connecting", "")
+	d.mu.Lock()
+	old := d.conn
+	d.conn = nil
+	d.mu.Unlock()
 	c := &connection{scenario: p.scenario, revision: p.revision, physical: p.physical}
+	if old != nil {
+		// A reload keeps the lock it holds rather than letting it go and
+		// taking it again.
+		d.teardown(old, true)
+		c.lock = old.lock
+	}
+	d.setStatus("connecting", "")
 	var err error
-	// Busy means the other identity is connected, or, right after a
-	// restart, this daemon's previous engine is still exiting; retries
-	// cover the latter.
-	c.lock, err = acquireConnectionLock(d.opts.Layout.SharedDir(), d.opts.Layout.ConnectionLock())
-	if err != nil {
-		d.setStatus("failed", err.Error())
-		return err
+	if c.lock == nil {
+		// Busy means the other identity is connected, or, right after a
+		// restart, this daemon's previous engine is still exiting; retries
+		// cover the latter.
+		c.lock, err = acquireConnectionLock(d.opts.Layout.SharedDir(), d.opts.Layout.ConnectionLock())
+		if err != nil {
+			d.setStatus("failed", err.Error())
+			return err
+		}
 	}
 	c.engine, err = d.startEngine(p.compiled, c.lock.file, newScrubber(p.secrets))
 	if err != nil {
@@ -123,26 +134,29 @@ func (d *Daemon) bringUp(p *plan) error {
 	}
 	d.events.add("engine_started", map[string]any{"scenario": p.scenario, "pid": c.engine.pid})
 	if err := d.probe(); err != nil {
-		d.teardown(c)
+		d.teardown(c, false)
 		return d.fail("查询进不了 sing-box：" + err.Error())
 	}
 	c.resolver, err = d.sys.Hold(d.opts.Layout.DNSKey(), c.lock.file)
 	if err != nil {
-		d.teardown(c)
+		d.teardown(c, false)
 		return d.fail("设置系统 DNS 失败：" + err.Error())
 	}
 	published, first := d.checkResolver()
 	if !published {
-		d.teardown(c)
+		d.teardown(c, false)
 		return d.fail("系统 DNS 设置后没有生效")
 	}
 	c.first = first
 	d.events.add("dns_set", map[string]any{"first": first, "physical": p.physical})
+	if err := d.sys.FlushCache(); err != nil {
+		d.events.add("dns_flush_failed", map[string]any{"error": err.Error()})
+	}
 	d.mu.Lock()
 	d.conn = c
 	d.mu.Unlock()
 	d.wakeMonitor()
-	d.setStatus("connected", "")
+	d.setStatus("connected", notFirst(first))
 	go d.watch(c.engine)
 	return nil
 }
@@ -190,6 +204,16 @@ func (d *Daemon) resumeIntentLocked(reason string) {
 		return
 	}
 	d.setStatus("failed", reason)
+}
+
+// notFirst explains a connection whose resolver key is published but not
+// first, as when another VPN's resolver also matches every domain: system
+// queries may not reach sing-box, 6.4.
+func notFirst(first string) string {
+	if first == resolverAddress.String() {
+		return ""
+	}
+	return fmt.Sprintf("系统的第一解析器是 %s，不是 XDial 的，系统查询可能不经过 sing-box", first)
 }
 
 func (d *Daemon) wakeMonitor() {
@@ -243,11 +267,13 @@ func (d *Daemon) disconnectLocked() {
 	d.conn = nil
 	d.mu.Unlock()
 	if c != nil {
-		d.teardown(c)
+		d.teardown(c, false)
 	}
 }
 
-func (d *Daemon) teardown(c *connection) {
+// teardown stops c; keepLock leaves the lock held for the connection that
+// replaces it.
+func (d *Daemon) teardown(c *connection, keepLock bool) {
 	if c.resolver != nil {
 		c.resolver.Close()
 		d.events.add("dns_cleared", nil)
@@ -256,7 +282,9 @@ func (d *Daemon) teardown(c *connection) {
 		c.engine.stop()
 		d.events.add("engine_stopped", map[string]any{"pid": c.engine.pid})
 	}
-	c.lock.release()
+	if !keepLock {
+		c.lock.release()
+	}
 }
 
 // watch handles an engine that exits on its own: the resolver key goes,
@@ -338,10 +366,21 @@ func (d *Daemon) reconcile() {
 		}
 		return
 	}
-	if !sameServers(physical, c.physical) {
+	if len(physical) > 0 && physical[0] != c.physical[0] {
+		// Only the first server is compiled in, 3.3. While the network
+		// changes the key can be gone for a moment: an empty reading, or
+		// one that cannot be prepared, keeps the connection as it is.
+		d.mu.Lock()
+		cfg := d.cfg
+		d.mu.Unlock()
+		next, err := d.prepare(cfg, c.scenario)
+		if err != nil {
+			d.events.add("reload_skipped", map[string]any{"error": err.Error()})
+			return
+		}
 		d.events.add("physical_dns_changed", map[string]any{"servers": physical})
 		d.gen++
-		if err := d.establishLocked(); err != nil {
+		if err := d.bringUp(next); err != nil {
 			d.retryLocked(err.Error())
 		}
 		return
@@ -367,13 +406,29 @@ func (d *Daemon) reconcile() {
 	}
 	published, first, err := d.sys.Resolver(d.opts.Layout.DNSKey())
 	if err == nil && !published {
-		// configd lost it, as when configd restarts.
+		// configd lost it, as when configd restarts. If adding it again in
+		// the same session does not take, start a new session.
 		_ = c.resolver.Republish()
 		d.events.add("dns_republished", nil)
-		_, first = d.checkResolver()
+		if published, first = d.checkResolver(); !published {
+			c.resolver.Close()
+			r, err := d.sys.Hold(d.opts.Layout.DNSKey(), c.lock.file)
+			if err != nil {
+				d.gen++
+				d.disconnectLocked()
+				d.retryLocked("系统 DNS 补写后仍没生效，会话也没能重建")
+				return
+			}
+			d.mu.Lock()
+			c.resolver = r
+			d.mu.Unlock()
+			d.wakeMonitor()
+			_, first = d.checkResolver()
+		}
 	}
 	if first != c.first {
 		d.events.add("dns_first_changed", map[string]any{"first": first})
+		d.setStatus("connected", notFirst(first))
 	}
 	d.mu.Lock()
 	c.first = first

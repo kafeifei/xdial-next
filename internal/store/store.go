@@ -12,29 +12,37 @@ import (
 
 // WriteFile replaces path with data, mode perm.
 func WriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
+	tmp, err := Stage(filepath.Dir(path), filepath.Base(path), data, perm)
 	if err != nil {
 		return err
 	}
-	tmp := f.Name()
 	defer os.Remove(tmp)
-	if err := f.Chmod(perm); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
 	return os.Rename(tmp, path)
+}
+
+// Stage writes data to a new temporary file in dir, mode perm, synced and
+// closed, for the caller to rename into place.
+func Stage(dir, name string, data []byte, perm os.FileMode) (string, error) {
+	f, err := os.CreateTemp(dir, "."+name+".*")
+	if err != nil {
+		return "", err
+	}
+	tmp := f.Name()
+	err = f.Chmod(perm)
+	if err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	return tmp, nil
 }
 
 // WriteJSON replaces path with v encoded as JSON.

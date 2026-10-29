@@ -308,7 +308,9 @@ func runDaemonInstall(ctx *context_) int {
 	if err != nil {
 		return ctx.out.Fail(err)
 	}
-	_ = exec.Command("/bin/launchctl", "bootout", "system/"+l.ID).Run()
+	// Everything that can fail on the caller's input is checked and the
+	// copy staged before the running daemon is stopped, so a bad source
+	// leaves the installed daemon running.
 	for _, dir := range []struct {
 		path string
 		perm os.FileMode
@@ -317,8 +319,14 @@ func runDaemonInstall(ctx *context_) int {
 			return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "准备目录 %s 失败：%v", dir.path, err))
 		}
 	}
-	if err := installBinary(exe, l.Bin()); err != nil {
+	staged, err := stageBinary(exe, filepath.Dir(l.Bin()))
+	if err != nil {
 		return ctx.out.Fail(err)
+	}
+	defer os.Remove(staged)
+	_ = exec.Command("/bin/launchctl", "bootout", "system/"+l.ID).Run()
+	if err := os.Rename(staged, l.Bin()); err != nil {
+		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "替换二进制失败：%v", err))
 	}
 	plist := fmt.Sprintf(plistTemplate, l.ID, l.Bin(), l.DaemonLog(), l.DaemonLog())
 	if err := store.WriteFile(l.Plist(), []byte(plist), 0o644); err != nil {
@@ -356,51 +364,53 @@ func runDaemonInstall(ctx *context_) int {
 	})
 }
 
-// installBinary copies src, the xdial being run, to dst in the root-owned
-// bin directory, 6.1. The trust in what is copied rests on whoever controls
+// stageBinary copies src, the xdial being run, to a new temporary file in
+// dir, the root-owned bin directory, and returns its path, 6.1. The trust in what is copied rests on whoever controls
 // src: the file must be a regular file owned by root or by the user who ran
 // sudo, writable by nobody else, in a directory nobody else can change (or
 // one with the sticky bit, where nobody else can replace it). It is opened
-// without following a symlink, copied to a fresh temporary file beside dst
-// and renamed over it, so launchd never starts a half-written file. A
+// without following a symlink and copied, synced and closed before the
+// caller renames it into place, so launchd never starts a half-written
+// file. A
 // process of that same user could still swap src just before; it could as
 // well have swapped it before sudo ran, so this does not try to stop it.
 // Signed builds check the copy's signature before the rename (M6).
-func installBinary(src, dst string) error {
+func stageBinary(src, dir string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(src)
 	if err != nil {
-		return cli.Errorf(cli.CodeInputRead, "", "找不到 %s：%v", src, err)
+		return "", cli.Errorf(cli.CodeInputRead, "", "找不到 %s：%v", src, err)
 	}
 	owners := []uint32{0}
 	if id, err := strconv.ParseUint(os.Getenv("SUDO_UID"), 10, 32); err == nil {
 		owners = append(owners, uint32(id))
 	}
 	if err := ownedBy(filepath.Dir(resolved), owners, true); err != nil {
-		return err
+		return "", err
 	}
 	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return cli.Errorf(cli.CodeInputRead, "", "打不开 %s：%v", resolved, err)
+		return "", cli.Errorf(cli.CodeInputRead, "", "打不开 %s：%v", resolved, err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return cli.Errorf(cli.CodeInputRead, "", "%v", err)
+		return "", cli.Errorf(cli.CodeInputRead, "", "%v", err)
 	}
 	if !info.Mode().IsRegular() {
-		return cli.Errorf(cli.CodeInputPermission, "", "%s 不是普通文件", resolved)
+		return "", cli.Errorf(cli.CodeInputPermission, "", "%s 不是普通文件", resolved)
 	}
 	if err := ownedBy(resolved, owners, false); err != nil {
-		return err
+		return "", err
 	}
 	binary, err := io.ReadAll(io.LimitReader(f, 1<<30))
 	if err != nil {
-		return cli.Errorf(cli.CodeInputRead, "", "读 %s 出错：%v", resolved, err)
+		return "", cli.Errorf(cli.CodeInputRead, "", "读 %s 出错：%v", resolved, err)
 	}
-	if err := store.WriteFile(dst, binary, 0o755); err != nil {
-		return cli.Errorf(cli.CodeInternal, "", "拷贝二进制失败：%v", err)
+	staged, err := store.Stage(dir, "xdial", binary, 0o755)
+	if err != nil {
+		return "", cli.Errorf(cli.CodeInternal, "", "拷贝二进制失败：%v", err)
 	}
-	return nil
+	return staged, nil
 }
 
 // ownedBy refuses path unless one of owners owns it and nobody else can

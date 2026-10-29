@@ -22,9 +22,9 @@ type System interface {
 	Resolver(key string) (published bool, first string, err error)
 	// Probe checks that a query to the resolver address reaches sing-box.
 	Probe() error
-	// ClearStale removes a key that does not go by itself, as older builds
-	// set it.
-	ClearStale(key string) error
+	// FlushCache drops the system's DNS cache, so answers cached before the
+	// resolver pointed into TUN do not outlive it, 3.3.
+	FlushCache() error
 }
 
 // Resolver is a published resolver key.
@@ -59,7 +59,7 @@ func (macOS) Resolver(key string) (bool, string, error) {
 
 func (macOS) Probe() error { return sysdns.Probe(resolverAddress, time.Second) }
 
-func (macOS) ClearStale(key string) error { return sysdns.Clear(key) }
+func (macOS) FlushCache() error { return sysdns.FlushCache() }
 
 // usablePhysical picks the servers the engine can dial directly: global
 // addresses first, link-local ones only when there is nothing else.

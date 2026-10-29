@@ -45,12 +45,14 @@ ARCHITECTURE.md 第 6 节里标"实测"的结论，出处都在这里。环境�
 
 ## 5. daemon 的端到端用例（2026-10-28）
 
-[e2e/run.sh](../../e2e/run.sh) 的 M2 部分，每次 `make e2e` 都跑。2026-10-28 的一次结果是 21/21 通过，其中：
+[e2e/run.sh](../../e2e/run.sh) 的 M2 部分，每次 `make e2e` 都跑。2026-10-29 的一次结果是 25/25 通过，其中：
 
 - 不是控制台用户的 `nobody` 调用 `status`，收到 `api.permission`；
 - 连接后路由进 utun，resolver #1 是 172.19.0.2，sing-box 日志里有 DNS 交换，`physical_dns` 是 192.168.64.1；
 - `networksetup -setdnsservers` 把 DNS 改成 1.1.1.1 后，daemon 用新服务器重载了引擎，resolver #1 仍是 172.19.0.2，HTTPS 正常；
-- 连接中 `kill -9` daemon：0.5 秒后键已经不在；launchd 拉起新的 daemon 后恢复连接，只有一个引擎；
+- 连接中切场景、连接中 apply（重载，结果带 `reloaded`）、再切回：都成功，`last_error` 为空，没有撞上连接锁；
+- 只 `kill -9` 持有临时键的 scutil 会话：daemon 开了新会话把键补回，事件日志有 `dns_session_restarted`，引擎没动；
+- 连接中 `kill -9` daemon：0.5 秒后键已经不在。新 daemon 启动时不删这个键，所以键是随旧会话消失的；launchd 拉起新的 daemon 后恢复连接，只有一个引擎；
 - `kill -9` 引擎：0.3 秒后键已经不在（放行直连），随后自动重连；
 - 连接中重新 `daemon install`：装完自动恢复连接；
 - 断开和 `uninstall --purge` 之后，utun 个数、默认路由、resolver #1、DNS 和 HTTPS 都回到连接前，没有留下文件和进程。

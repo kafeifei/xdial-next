@@ -131,7 +131,7 @@ func (d *Daemon) handle(conn *net.UnixConn, uid uint32) {
 			writeResponse(conn, failure(req.ID, permissionError(uid)))
 			return
 		}
-		if !d.dispatch(conn, req) {
+		if !d.dispatch(conn, req, uid) {
 			return
 		}
 	}
@@ -144,12 +144,12 @@ type reply struct {
 	err    error
 }
 
-func (d *Daemon) dispatch(conn *net.UnixConn, req api.Request) bool {
+func (d *Daemon) dispatch(conn *net.UnixConn, req api.Request, uid uint32) bool {
 	if req.V != api.Version {
 		return writeResponse(conn, failure(req.ID, cli.Errorf(cli.CodeAPIVersion, "", "协议版本 %d 不认识，daemon 用的是 %d", req.V, api.Version)))
 	}
 	if req.Method == "logs" {
-		return d.logs(conn, req)
+		return d.logs(conn, req, uid)
 	}
 	handler, ok := d.methods()[req.Method]
 	if !ok {
@@ -196,7 +196,7 @@ func decode(params json.RawMessage, v any) error {
 
 // logs streams events: the recent ones, then new ones while follow is set
 // and the client stays.
-func (d *Daemon) logs(conn *net.UnixConn, req api.Request) bool {
+func (d *Daemon) logs(conn *net.UnixConn, req api.Request, uid uint32) bool {
 	var params struct {
 		Lines  int  `json:"lines"`
 		Follow bool `json:"follow"`
@@ -235,6 +235,12 @@ func (d *Daemon) logs(conn *net.UnixConn, req api.Request) bool {
 	for {
 		select {
 		case e := <-sub:
+			// A follow outlives requests: ask again before every event, so
+			// a user who left the console stops receiving them.
+			if !d.opts.Authorize(uid) {
+				writeResponse(conn, failure(req.ID, permissionError(uid)))
+				return false
+			}
 			if !send(e) {
 				return false
 			}

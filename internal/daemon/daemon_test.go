@@ -105,8 +105,8 @@ func (f *fakeSystem) Resolver(string) (bool, string, error) {
 	return true, "172.19.0.2", nil
 }
 
-func (f *fakeSystem) Probe() error            { return nil }
-func (f *fakeSystem) ClearStale(string) error { return nil }
+func (f *fakeSystem) Probe() error      { return nil }
+func (f *fakeSystem) FlushCache() error { f.log.add("flush"); return nil }
 
 type fakeResolver struct {
 	sys     *fakeSystem
@@ -260,7 +260,7 @@ func TestConnectDisconnect(t *testing.T) {
 	if status["state"] != "connected" || status["system_dns"] != true || status["engine_pid"].(float64) == 0 {
 		t.Fatalf("connect: %v", status)
 	}
-	if got := h.dns.String(); got != "hold" {
+	if got := h.dns.String(); got != "hold flush" {
 		t.Errorf("dns calls %q", got)
 	}
 	if status["intent"] != "connected" || len(status["physical_dns"].([]any)) != 1 {
@@ -354,7 +354,7 @@ func TestEngineCrashClearsDNSAndReconnects(t *testing.T) {
 		return s["state"] == "connected" && int(s["engine_pid"].(float64)) != pid
 	})
 	// The resolver went before the restart: hold, close, hold.
-	if got := h.dns.String(); got != "hold close hold" {
+	if got := h.dns.String(); got != "hold flush close hold flush" {
 		t.Errorf("dns calls %q", got)
 	}
 }
@@ -407,7 +407,7 @@ func TestDeadSessionIsReplaced(t *testing.T) {
 	pid := h.connected()
 	h.sys.current().Close()
 	deadline := time.Now().Add(5 * time.Second)
-	for h.dns.String() != "hold close hold" {
+	for h.dns.String() != "hold flush close hold" {
 		if time.Now().After(deadline) {
 			t.Fatalf("dns calls %q", h.dns.String())
 		}

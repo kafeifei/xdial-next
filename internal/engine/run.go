@@ -35,6 +35,11 @@ type Ready struct {
 // sing-box logs go to stderr, which the daemon scrubs. allowed are the only
 // directories sing-box may touch.
 func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string) int {
+	// fd 3 is the connection lock the daemon passes down, ARCHITECTURE.md
+	// 6.1. The engine holds it by keeping it open; what sing-box starts,
+	// such as dscacheutil when TUN closes, must not inherit it, or the lock
+	// would outlive the engine.
+	syscall.CloseOnExec(3)
 	fail := func(stage string, err error) int {
 		fmt.Fprintf(stderr, "engine: %s: %v\n", stage, err)
 		_ = json.NewEncoder(stdout).Encode(Ready{Version: buildinfo.Build(), Error: stage + ": " + err.Error()})

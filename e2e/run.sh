@@ -81,7 +81,8 @@ cat > "$work/m2.jsonc" << 'EOF'
   "version": 1,
   "mixed": { "port": 17890, "username": "e2e", "password": { "secret": "mixed" } },
   "rule_sets": [{ "id": "apple", "type": "inline", "rules": [{ "domain_suffix": ["apple.com"] }] }],
-  "scenarios": [{ "id": "s", "rules": [{ "rule_set": "apple", "line": "direct" }], "final": "direct" }]
+  "scenarios": [{ "id": "s", "rules": [{ "rule_set": "apple", "line": "direct" }], "final": "direct" },
+                { "id": "t", "rules": [], "final": "direct" }]
 }
 EOF
 # 控制台用户不用 sudo 就能调用 daemon。
@@ -106,6 +107,27 @@ check m2-no-secret-in-logs '[[ "$leak" == 0 ]]' "lines with the secret: $leak"
 noauth="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -x http://127.0.0.1:17890 https://www.apple.com 2>&1 | tail -c 80)"
 withauth="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -x http://e2e:mixed-pass@127.0.0.1:17890 https://www.apple.com 2>&1)"
 check m2-mixed-auth '[[ "$noauth" != "200" && "$withauth" == "200" ]]' "without auth: $noauth; with auth: $withauth"
+
+# 连接中切场景、连接中 apply：都是重载，连接锁不放开，不会撞上 engine.busy。
+out="$("$xdial" scenario use t --json 2>&1)"
+check m2-reload-scenario "jq -e '.ok and .result.state == \"connected\" and .result.scenario == \"t\" and .result.system_dns' <<< '$out' > /dev/null" "$out"
+sed 's/"apple.com"/"apple.com", "icloud.com"/' "$work/m2.jsonc" > "$work/m2b.jsonc"
+out="$("$xdial" config apply "$work/m2b.jsonc" --json 2>&1)"
+check m2-reload-apply "jq -e '.ok and .result.applied and .result.reloaded' <<< '$out' > /dev/null" "$out"
+out="$("$xdial" scenario use s --json 2>&1)"
+st="$("$xdial" status --json 2>&1)"
+check m2-reload-back "jq -e '.ok and .result.scenario == \"s\"' <<< '$out' > /dev/null && jq -e '.result.state == \"connected\" and .result.last_error == \"\"' <<< '$st' > /dev/null" "$out | $st"
+
+# 只杀掉持有临时键的 scutil 会话：daemon 开新会话补回，引擎不动。
+epid="$("$xdial" status --json | jq -r .result.engine_pid)"
+sudo pkill -9 -x scutil
+for _ in $(seq 1 20); do
+  sleep 0.5
+  [[ "$(has_key)" == 1 ]] && break
+done
+st="$("$xdial" status --json 2>&1)"
+restarted="$("$xdial" logs --lines 50 --json 2>&1 | grep -c dns_session_restarted)"
+check m2-session-replaced "[[ '$restarted' -ge 1 && \"\$(has_key)\" == 1 ]] && jq -e --arg p '$epid' '.result.state == \"connected\" and .result.system_dns and (.result.engine_pid | tostring) == \$p' <<< '$st' > /dev/null" "restarted=$restarted $(jq -c '.result | {state, system_dns, engine_pid}' <<< "$st")"
 
 # 手动改物理网络的 DNS：daemon 用新的服务器重载引擎，系统解析器仍是 172.19.0.2。
 pid0="$("$xdial" status --json | jq -r .result.engine_pid)"

@@ -88,7 +88,7 @@ func Dial(socket string, server uint32) (*Client, error) {
 		conn.Close()
 		return nil, cli.Errorf(cli.CodeDaemonUntrusted, "运行 sudo xdial daemon install 重新安装", "%s 上监听的不是 daemon（属主 uid %d）", socket, uid)
 	}
-	return &Client{conn: conn, reader: bufio.NewReaderSize(conn, 64<<10), timeout: 2 * time.Minute}, nil
+	return &Client{conn: conn, reader: bufio.NewReaderSize(conn, 64<<10), timeout: 5 * time.Minute}, nil
 }
 
 // Close closes the connection.

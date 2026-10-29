@@ -1,6 +1,7 @@
 package peercred
 
 import (
+	"fmt"
 	"net"
 	"syscall"
 	"unsafe"
@@ -18,6 +19,7 @@ type xucred struct {
 const (
 	solLocal      = 0 // SOL_LOCAL
 	localPeerCred = 1 // LOCAL_PEERCRED
+	xucredVersion = 0 // XUCRED_VERSION
 )
 
 // UID returns the effective uid of the process at the other end.
@@ -39,5 +41,11 @@ func UID(conn *net.UnixConn) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	return cred.UID, sysErr
+	if sysErr != nil {
+		return 0, sysErr
+	}
+	if cred.Version != xucredVersion {
+		return 0, fmt.Errorf("peercred: xucred version %d", cred.Version)
+	}
+	return cred.UID, nil
 }

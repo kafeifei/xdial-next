@@ -95,9 +95,9 @@ type Daemon struct {
 	wake chan struct{}
 }
 
-// New prepares a daemon: directories, permissions, stored files. It also
-// removes a resolver key an older build may have left; the key this build
-// sets goes by itself with the session holding it, 6.4.
+// New prepares a daemon: directories, permissions, stored files. It does
+// not touch the resolver key: that goes by itself with the session that
+// held it, 6.4.
 func New(opts Options) (*Daemon, error) {
 	if opts.Authorize == nil {
 		opts.Authorize = consoleOrRoot
@@ -122,9 +122,6 @@ func New(opts Options) (*Daemon, error) {
 	d.events = newEventLog(l.Events())
 	if err := opts.ExcludeFromBackup(l.Private()); err != nil {
 		d.events.add("backup_exclusion_failed", map[string]any{"error": err.Error()})
-	}
-	if err := d.sys.ClearStale(l.DNSKey()); err != nil {
-		d.events.add("dns_clear_failed", map[string]any{"error": err.Error()})
 	}
 	if err := store.ReadJSON(l.State(), &d.state); err != nil {
 		return nil, err
@@ -156,16 +153,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	d.events.add("daemon_started", nil)
-	d.ctl.Lock()
-	d.mu.Lock()
-	resume := d.state.Connected
-	d.mu.Unlock()
-	if resume {
-		if err := d.establishLocked(); err != nil {
-			d.retryLocked(err.Error())
+	// Resume in the control sequence while the API already answers, so
+	// status works during the up to half a minute a connection can take.
+	go func() {
+		d.ctl.Lock()
+		defer d.ctl.Unlock()
+		d.mu.Lock()
+		resume := d.state.Connected && !d.closing
+		d.mu.Unlock()
+		if resume {
+			if err := d.establishLocked(); err != nil {
+				d.retryLocked(err.Error())
+			}
 		}
-	}
-	d.ctl.Unlock()
+	}()
 	monitorDone := make(chan struct{})
 	go func() {
 		d.monitor(ctx)

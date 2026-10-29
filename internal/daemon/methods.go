@@ -71,7 +71,11 @@ func (d *Daemon) statusLocked() Status {
 	if d.state.Connected {
 		s.Intent = "connected"
 	}
-	for _, a := range d.physical {
+	physical := d.physical
+	if d.conn != nil {
+		physical = d.conn.physical
+	}
+	for _, a := range physical {
 		s.PhysicalDNS = append(s.PhysicalDNS, a.String())
 	}
 	if c := d.conn; c != nil {
@@ -406,7 +410,7 @@ func (d *Daemon) connect(params json.RawMessage) reply {
 	if err != nil {
 		return reply{err: err}
 	}
-	if c != nil && c.scenario == next.scenario && c.revision == next.revision && sameServers(c.physical, next.physical) {
+	if c != nil && c.scenario == next.scenario && c.revision == next.revision && c.physical[0] == next.physical[0] {
 		return reply{schema: SchemaStatus, result: d.currentStatus()}
 	}
 	if err := d.switchLocked(next); err != nil {

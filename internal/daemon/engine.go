@@ -40,21 +40,33 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	// Pipes of our own for stdout and stderr: Wait would close pipes it
+	// made as soon as the engine exits and lose the end of its log, the
+	// part a crash writes. These are read to the end on their own.
+	outR, outW, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+	errR, errW, err := os.Pipe()
 	if err != nil {
+		outR.Close()
+		outW.Close()
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
+	cmd.Stdout, cmd.Stderr = outW, errW
+	err = cmd.Start()
+	outW.Close()
+	errW.Close()
+	if err != nil {
+		outR.Close()
+		errR.Close()
 		return nil, fmt.Errorf("引擎起不来：%w", err)
 	}
 	p := &engineProc{cmd: cmd, pid: cmd.Process.Pid, stdin: stdin, done: make(chan struct{})}
 	logPath := d.opts.Layout.EngineLog()
 	go func() {
-		scanner := bufio.NewScanner(stderr)
+		defer errR.Close()
+		scanner := bufio.NewScanner(errR)
 		scanner.Buffer(make([]byte, 64<<10), 1<<20)
 		for scanner.Scan() {
 			appendRotating(logPath, []byte(scrub.scrub(scanner.Text())+"\n"))
@@ -62,11 +74,12 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 	}()
 	ready := make(chan engine.Ready, 1)
 	go func() {
-		line, _ := bufio.NewReader(io.LimitReader(stdout, 64<<10)).ReadBytes('\n')
+		defer outR.Close()
+		line, _ := bufio.NewReader(io.LimitReader(outR, 64<<10)).ReadBytes('\n')
 		var r engine.Ready
 		_ = json.Unmarshal(line, &r)
 		ready <- r
-		_, _ = io.Copy(io.Discard, stdout)
+		_, _ = io.Copy(io.Discard, outR)
 	}()
 	go func() {
 		_ = cmd.Wait()
@@ -74,29 +87,50 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 		close(p.done)
 	}()
 	// The configuration goes in as one JSON value; stdin then stays open
-	// until the engine stops, so the engine notices if the daemon dies.
-	if _, err := stdin.Write(compiled); err != nil {
-		p.stop()
-		return nil, fmt.Errorf("交给引擎配置时出错：%w", err)
-	}
+	// until the engine stops, so the engine notices if the daemon dies. An
+	// engine that does not read it is killed when readyTimeout runs out,
+	// which ends the write too.
+	written := make(chan error, 1)
+	go func() {
+		_, err := stdin.Write(compiled)
+		written <- err
+	}()
 	var reason string
+	timeout := time.After(readyTimeout)
 	select {
-	case r := <-ready:
-		switch {
-		case r.Ready && r.Version == buildinfo.Build():
-			return p, nil
-		case r.Ready:
-			reason = fmt.Sprintf("引擎是 %s，不是 daemon 的 %s；重新 sudo xdial daemon install", r.Version, buildinfo.Build())
-		case r.Error != "":
-			reason = "引擎没能启动：" + scrub.scrub(r.Error)
-		default:
-			reason = "引擎没有报告就绪就退出了，原因在引擎日志里"
+	case err := <-written:
+		if err != nil {
+			reason = fmt.Sprintf("交给引擎配置时出错：%v", err)
+			break
 		}
-	case <-time.After(readyTimeout):
-		reason = fmt.Sprintf("引擎 %s 内没有就绪", readyTimeout)
+		select {
+		case r := <-ready:
+			reason = readyReason(r, scrub)
+			if reason == "" {
+				return p, nil
+			}
+		case <-timeout:
+			reason = fmt.Sprintf("引擎 %s 内没有就绪", readyTimeout)
+		}
+	case <-timeout:
+		reason = fmt.Sprintf("引擎 %s 内没有读完配置", readyTimeout)
 	}
 	p.stop()
 	return nil, errors.New(reason)
+}
+
+// readyReason is why a ready line does not let the engine run, or "".
+func readyReason(r engine.Ready, scrub *scrubber) string {
+	switch {
+	case r.Ready && r.Version == buildinfo.Build():
+		return ""
+	case r.Ready:
+		return fmt.Sprintf("引擎是 %s，不是 daemon 的 %s；重新 sudo xdial daemon install", r.Version, buildinfo.Build())
+	case r.Error != "":
+		return "引擎没能启动：" + scrub.scrub(r.Error)
+	default:
+		return "引擎没有报告就绪就退出了，原因在引擎日志里"
+	}
 }
 
 // stop asks the engine to exit and kills it if it does not, then waits.

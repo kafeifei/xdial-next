@@ -203,8 +203,16 @@ func Physical() ([]netip.Addr, error) {
 			servers = parseServers(blocks[1])
 		}
 		v4, v6 := hasAddresses(blocks[2]), hasAddresses(blocks[3])
+		iface := parseValue(blocks[3], "InterfaceName")
+		if iface == "" {
+			iface = parseValue(blocks[2], "InterfaceName")
+		}
 		var usable []netip.Addr
 		for _, a := range servers {
+			if a.Is6() && a.IsLinkLocalUnicast() && a.Zone() == "" && iface != "" {
+				// A link-local server is only reachable on its interface.
+				a = a.WithZone(iface)
+			}
 			if (a.Is4() && v4) || (a.Is6() && v6) {
 				usable = append(usable, a)
 			}
@@ -324,6 +332,13 @@ func parseFirstResolver(out string) (string, error) {
 		}
 	}
 	return "", errors.New("no resolver #1")
+}
+
+// FlushCache drops the system's DNS cache.
+func FlushCache() error {
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "/usr/bin/dscacheutil", "-flushcache").Run()
 }
 
 // Clear removes key; removing an absent key is not an error. Temporary keys

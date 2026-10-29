@@ -196,6 +196,11 @@ func TestPhysical(t *testing.T) {
 			"State:/Network/Service/B/DNS":  dict(servers("2001:db8::53")),
 			"State:/Network/Service/B/IPv6": dict("  Addresses : <array> {\n    0 : 2001:db8::2\n  }"),
 		}, "[2001:db8::53]"},
+		{"link-local server gets its interface", map[string]string{
+			"State:/Network/Global/IPv6":    dict("  PrimaryService : B"),
+			"State:/Network/Service/B/DNS":  dict(servers("fe80::1")),
+			"State:/Network/Service/B/IPv6": dict("  Addresses : <array> {\n    0 : fe80::2\n  }", "  InterfaceName : en0"),
+		}, "[fe80::1%en0]"},
 		{"manual ipv4 dns on an ipv6-only service", map[string]string{
 			"State:/Network/Global/IPv6":    dict("  PrimaryService : B"),
 			"Setup:/Network/Service/B/DNS":  dict(servers("1.1.1.1", "2606:4700:4700::1111")),

@@ -407,7 +407,7 @@ func TestHiddenCommandsAreDispatched(t *testing.T) {
 	}
 }
 
-func TestInstallBinaryChecksTheSource(t *testing.T) {
+func TestStageBinaryChecksTheSource(t *testing.T) {
 	t.Setenv("SUDO_UID", strconv.Itoa(os.Getuid()))
 	dir := t.TempDir()
 	src := filepath.Join(dir, "xdial")
@@ -418,20 +418,21 @@ func TestInstallBinaryChecksTheSource(t *testing.T) {
 	if err := os.Symlink(src, link); err != nil {
 		t.Fatal(err)
 	}
-	dst := filepath.Join(t.TempDir(), "xdial")
-	if err := installBinary(link, dst); err != nil {
+	bin := t.TempDir()
+	staged, err := stageBinary(link, bin)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(dst); string(b) != "binary" {
-		t.Errorf("copied %q", b)
+	if b, _ := os.ReadFile(staged); string(b) != "binary" || filepath.Dir(staged) != bin {
+		t.Errorf("staged %s: %q", staged, b)
 	}
-	if info, _ := os.Stat(dst); info.Mode().Perm() != 0o755 {
+	if info, _ := os.Stat(staged); info.Mode().Perm() != 0o755 {
 		t.Errorf("mode %v", info.Mode())
 	}
 	if err := os.Chmod(src, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	if err := installBinary(src, dst); !cli.Is(err, cli.CodeInputPermission) {
+	if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {
 		t.Errorf("a file others can write was installed: %v", err)
 	}
 	if err := os.Chmod(src, 0o755); err != nil {
@@ -440,18 +441,18 @@ func TestInstallBinaryChecksTheSource(t *testing.T) {
 	if err := os.Chmod(dir, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	if err := installBinary(src, dst); !cli.Is(err, cli.CodeInputPermission) {
+	if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {
 		t.Errorf("a file in a directory others can change was installed: %v", err)
 	}
 	if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil {
 		t.Fatal(err)
 	}
-	if err := installBinary(src, dst); err != nil {
+	if _, err := stageBinary(src, bin); err != nil {
 		t.Errorf("a sticky directory was refused: %v", err)
 	}
 	t.Setenv("SUDO_UID", strconv.Itoa(os.Getuid()+1))
 	if os.Getuid() != 0 {
-		if err := installBinary(src, dst); !cli.Is(err, cli.CodeInputPermission) {
+		if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {
 			t.Errorf("a file of another user was installed: %v", err)
 		}
 	}
