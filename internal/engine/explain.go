@@ -160,7 +160,7 @@ func Explain(c *config.Config, opts Options, target Target, addresses []netip.Ad
 		}
 		e.Notes = append(e.Notes, fmt.Sprintf("以上按 TCP 判断；UDP（例如 QUIC）%s，走 %s", where, udpLine))
 	}
-	if e.Rule == nil && len(result.Endpoints) > 0 {
+	if (e.Rule == nil || udpRule == nil) && len(result.Endpoints) > 0 {
 		e.Notes = append(e.Notes, "AnyConnect 和 Tailscale 推送的网段和域名只有引擎知道：走 final 的流量可能被它们接管（3.2）")
 	}
 	if metadata.Domain != "" {

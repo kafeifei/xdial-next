@@ -40,9 +40,10 @@ type connection struct {
 	groups    map[string][]string
 	outbounds []string
 	physical  []netip.Addr
-	// up is when the engine came up: remote content that changed later
-	// is not in it, 3.4.
-	up        time.Time
+	// content is when each remote rule set and subscription compiled in
+	// last changed, by "rule_set:<id>" and "subscription:<id>": content
+	// changed since is not in the engine, 3.4.
+	content   map[string]time.Time
 	lock      *connectionLock
 	engine    *engineProc
 	resolver  Resolver
@@ -62,6 +63,7 @@ type plan struct {
 	groups    map[string][]string
 	outbounds []string
 	stale     []string // groups whose member picked by hand is gone
+	content   map[string]time.Time
 	secrets   map[string]Secret
 }
 
@@ -157,7 +159,7 @@ func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[
 	if len(physical) == 0 {
 		return nil, cli.Errorf(cli.CodeEngineFailed, "连上网络后再试；已经连着时，网络就绪后会自动重连", "物理网络还没有 DNS 服务器")
 	}
-	ruleSets, err := d.cachedRuleSets(cfg, scenario, secrets)
+	ruleSets, ruleSetsChanged, err := d.cachedRuleSets(cfg, scenario, secrets)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +221,8 @@ func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[
 		return nil, err
 	}
 	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON),
-		endpoints: result.Endpoints, groups: result.Groups, outbounds: result.Outbounds, stale: result.StaleSelections, secrets: scrubbed}, nil
+		endpoints: result.Endpoints, groups: result.Groups, outbounds: result.Outbounds, stale: result.StaleSelections,
+		content: contentVersions(ruleSetsChanged, source.changed), secrets: scrubbed}, nil
 }
 
 // bringUp replaces the connection with p, 6.3: take the connection lock,
@@ -233,7 +236,7 @@ func (d *Daemon) bringUp(p *plan) error {
 	d.conn = nil
 	d.mu.Unlock()
 	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, endpoints: p.endpoints,
-		groups: p.groups, outbounds: p.outbounds, physical: p.physical}
+		groups: p.groups, outbounds: p.outbounds, content: p.content, physical: p.physical}
 	if old != nil {
 		// A reload keeps the lock it holds rather than letting it go and
 		// taking it again.
@@ -278,7 +281,6 @@ func (d *Daemon) bringUp(p *plan) error {
 	if err := d.sys.FlushCache(); err != nil {
 		d.events.add("dns_flush_failed", map[string]any{"error": err.Error()})
 	}
-	c.up = time.Now()
 	d.mu.Lock()
 	d.conn = c
 	d.mu.Unlock()
@@ -586,4 +588,17 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return strings.ToValidUTF8(s[:n], "") + "…"
+}
+
+// contentVersions keys when rule sets and subscriptions last changed by
+// kind and id.
+func contentVersions(ruleSets, subscriptions map[string]time.Time) map[string]time.Time {
+	versions := map[string]time.Time{}
+	for id, at := range ruleSets {
+		versions["rule_set:"+id] = at
+	}
+	for id, at := range subscriptions {
+		versions["subscription:"+id] = at
+	}
+	return versions
 }

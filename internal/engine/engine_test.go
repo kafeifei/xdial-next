@@ -818,6 +818,17 @@ func TestExplainNotes(t *testing.T) {
 	if e.Line != "hk" || !strings.Contains(notes, "UDP（例如 QUIC）命中场景第 2 条规则，走 block") || !strings.Contains(notes, "corp 推送的域名") {
 		t.Errorf("line %s, notes:\n%s", e.Line, notes)
 	}
+	// TCP goes by a rule, UDP falls to final, which a VPN's routes could
+	// take over.
+	c2 := loadDoc(t, `{"version": 1,
+		"lines": [{"id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://vpn.example", "username": "u", "password": {"secret": "c"}}],
+		"rule_sets": [{"id": "tcp", "type": "inline", "rules": [{"network": ["tcp"]}]},
+		              {"id": "work", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]}],
+		"scenarios": [{"id": "s", "final": "block", "rules": [{"rule_set": "work", "line": "corp"}, {"rule_set": "tcp", "line": "direct"}]}]}`)
+	ip, _ := ParseTarget("10.1.2.3")
+	if e, err := Explain(c2, Options{Scenario: "s", StateDirectory: t.TempDir()}, ip, nil); err != nil || !strings.Contains(strings.Join(e.Notes, "\n"), "可能被它们接管") {
+		t.Errorf("UDP to final: %v %v", e, err)
+	}
 	nx, _ := ParseTarget("USE-APPLICATION-DNS.NET.")
 	if e, err := Explain(c, Options{Scenario: "s", StateDirectory: t.TempDir()}, nx, nil); err != nil || e.DNS.Server != "xdial" {
 		t.Errorf("canary: %+v %v", e.DNS, err)

@@ -23,7 +23,7 @@ const SchemaExplain = "xdial.explain/v1"
 // configuration, with remote content from the cache. Asked about the
 // scenario running, a domain is resolved through the system, which is
 // sing-box's DNS, so rules on addresses answer as they would for the
-// traffic; content that changed since it came up is pointed out.
+// traffic; content other than what the engine runs is pointed out.
 func (d *Daemon) explain(params json.RawMessage) reply {
 	var p struct {
 		Target   string `json:"target"`
@@ -51,7 +51,7 @@ func (d *Daemon) explain(params json.RawMessage) reply {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "用 xdial config export 查看有哪些场景", "场景 %q 不存在", scenario)}
 	}
 	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
-	changed := map[string]time.Time{}
+	ruleSets := map[string]time.Time{}
 	opts := engine.Options{
 		Scenario: scenario, StateDirectory: d.opts.Layout.Tailscale(), Selections: d.selections(),
 		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
@@ -61,7 +61,7 @@ func (d *Daemon) explain(params json.RawMessage) reply {
 			}
 			meta, rules, ok := d.cachedRules(o, url)
 			if ok {
-				changed["规则集 "+o.ID] = meta.ChangedAt
+				ruleSets[o.ID] = meta.ChangedAt
 			}
 			return rules, ok
 		},
@@ -81,18 +81,19 @@ func (d *Daemon) explain(params json.RawMessage) reply {
 		return reply{err: cli.Errorf(cli.CodeInternal, "", "%v", err)}
 	}
 	if running {
-		for id, at := range source.changed {
-			changed["订阅 "+id] = at
-		}
+		// Content other than what the engine was compiled with: an update
+		// since, even one that landed while the connection came up.
+		names := map[string]string{"rule_set": "规则集", "subscription": "订阅"}
 		var newer []string
-		for what, at := range changed {
-			if at.After(c.up) {
-				newer = append(newer, what)
+		for key, at := range contentVersions(ruleSets, source.changed) {
+			if compiled, ok := c.content[key]; !ok || !compiled.Equal(at) {
+				kind, id, _ := strings.Cut(key, ":")
+				newer = append(newer, names[kind]+" "+id)
 			}
 		}
 		if len(newer) > 0 {
 			slices.Sort(newer)
-			e.Notes = append(e.Notes, fmt.Sprintf("%s 在连上之后更新过：以上是按新内容的结果，下一次连接或切场景才生效；运行中的引擎还在用旧内容（3.4）", strings.Join(newer, "、")))
+			e.Notes = append(e.Notes, fmt.Sprintf("%s 和运行中的引擎用的不是同一份：以上是按缓存里的内容的结果，下一次连接或切场景才生效（3.4）", strings.Join(newer, "、")))
 		}
 	}
 	return reply{schema: SchemaExplain, result: e}
