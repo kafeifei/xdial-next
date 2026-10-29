@@ -69,7 +69,9 @@ func (d *Daemon) resumeAfterFetch() {
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
 	d.mu.Lock()
-	waiting := d.state.Connected && !d.closing && d.conn == nil && d.status == "failed"
+	// Only a connection that is down for want of the cache: one that
+	// failed for any other reason keeps its stopped retries.
+	waiting := d.state.Connected && !d.closing && d.conn == nil && d.status == "failed" && d.awaitingCache
 	d.mu.Unlock()
 	if !waiting {
 		return
@@ -231,9 +233,13 @@ func (d *Daemon) establishLocked() error {
 	cfg, scenario := d.cfg, d.state.Scenario
 	d.mu.Unlock()
 	p, err := d.prepare(cfg, scenario)
+	d.mu.Lock()
+	d.awaitingCache = cli.Is(err, cli.CodeResourceMissing)
+	d.mu.Unlock()
 	if err != nil {
 		// Content missing from the cache is downloaded in the background,
-		// outside the control sequence; a later retry picks it up.
+		// outside the control sequence; a download that brings it in
+		// tries again, resumeAfterFetch.
 		d.setStatus("failed", err.Error())
 		return err
 	}

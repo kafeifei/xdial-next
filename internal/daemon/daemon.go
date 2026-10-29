@@ -99,6 +99,9 @@ type Daemon struct {
 	res      sync.Mutex
 	attempts map[string]resourceAttempt
 	resWake  chan struct{}
+	// awaitingCache, under mu: the last attempt to connect failed because
+	// the cache lacked what the scenario needs.
+	awaitingCache bool
 }
 
 // New prepares a daemon: directories, permissions, stored files. It does

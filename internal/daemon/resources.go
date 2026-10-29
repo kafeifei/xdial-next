@@ -325,7 +325,9 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 		return result, e
 	}
 	d.events.add("rule_set_updated", map[string]any{"id": o.ID, "changed": result.Changed, "rules": result.Rules})
-	go d.resumeAfterFetch()
+	if result.Changed {
+		go d.resumeAfterFetch()
+	}
 	return result, nil
 }
 

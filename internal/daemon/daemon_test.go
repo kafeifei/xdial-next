@@ -861,8 +861,16 @@ func TestConnectionResumesWhenTheCacheIsFilled(t *testing.T) {
 	h.d.state = State{Connected: true, Scenario: "s"}
 	h.d.status = "failed"
 	h.d.mu.Unlock()
+	// Retries that stopped for another reason are left alone.
+	h.d.resumeAfterFetch()
+	if s := h.ok("status", nil); s["state"] != "failed" {
+		t.Errorf("a download lifted retries that stopped for another reason: %v", s)
+	}
+	h.d.mu.Lock()
+	h.d.awaitingCache = true
+	h.d.mu.Unlock()
 	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"domain": ["b.example"]}]}`)
-	// A download completing is what calls this.
+	// A download that brings content in is what calls this.
 	h.d.resumeAfterFetch()
 	if s := h.ok("status", nil); s["state"] != "connected" {
 		t.Errorf("a filled cache did not bring the connection back: %v", s)
