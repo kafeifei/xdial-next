@@ -81,10 +81,11 @@ func (d *Daemon) resumeAfterFetch() {
 	d.mu.Lock()
 	cfg, scenario := d.cfg, d.state.Scenario
 	d.mu.Unlock()
-	p, err := d.prepare(cfg, scenario)
-	if cli.Is(err, cli.CodeResourceMissing) {
+	scenario = defaultScenario(cfg, scenario)
+	if !d.cacheComplete(cfg, scenario) {
 		return
 	}
+	p, err := d.prepare(cfg, scenario)
 	// The cache is complete: retries start over, through the usual
 	// backoff should anything else, such as reading the physical DNS,
 	// fail for a moment.

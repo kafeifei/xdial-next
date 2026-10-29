@@ -208,10 +208,42 @@ func (d *Daemon) dropInvalid(path string, valid func() bool) {
 	}
 	defer d.res.Unlock()
 	if _, err := os.Stat(path); err == nil && !valid() {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil {
+			// Still there: the mark stays, and the background loop
+			// downloads it again.
+			d.mu.Lock()
+			if d.invalid == nil {
+				d.invalid = map[string]bool{}
+			}
+			d.invalid[path] = true
+			d.mu.Unlock()
+			return
+		}
 		d.events.add("cache_dropped", map[string]any{"file": filepath.Base(path)})
 	}
 	d.unmark(path)
+}
+
+// cacheComplete reports whether the cache holds, checked, every remote rule
+// set scenario of cfg uses. It looks at the cache only, so whatever else
+// preparing may fail on says nothing about it.
+func (d *Daemon) cacheComplete(cfg *config.Config, scenario string) bool {
+	if cfg == nil {
+		return false
+	}
+	d.mu.Lock()
+	secrets := maps.Clone(d.secrets)
+	d.mu.Unlock()
+	for _, o := range remoteRuleSets(cfg, scenario) {
+		url, err := remoteURL(cfg, o, secrets)
+		if err != nil {
+			return false
+		}
+		if _, _, ok := d.cachedRules(o, url); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // markedInvalid reports whether compiling found path's content refused
