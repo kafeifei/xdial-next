@@ -649,7 +649,7 @@ func endpointLine(id string, e engine.EndpointStatus) string {
 	if len(e.Self) > 0 {
 		line += "，地址 " + strings.Join(e.Self, " ")
 	}
-	if e.FullTunnel {
+	if e.DefaultRoute {
 		line += "；服务器推送了默认路由，原本走 final 的流量都会进这条 VPN"
 	}
 	return line

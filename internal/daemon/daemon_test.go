@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -1015,5 +1016,31 @@ func TestEndpointStatusIsReported(t *testing.T) {
 	events, _ := os.ReadFile(h.layout.Events())
 	if !strings.Contains(string(events), "endpoint_state") {
 		t.Error("no event for the endpoint's state")
+	}
+}
+
+func TestReadLineSkipsOnlyTheOverlongLine(t *testing.T) {
+	input := "short\n" + strings.Repeat("x", 300) + "\nnext\n"
+	r := bufio.NewReaderSize(strings.NewReader(input), 16)
+	var got []string
+	for {
+		line, err := readLine(r, 100)
+		if err != nil {
+			break
+		}
+		got = append(got, fmt.Sprintf("%q", line))
+	}
+	if strings.Join(got, ",") != `"short\n","","next\n"` {
+		t.Errorf("lines: %v", got)
+	}
+}
+
+func TestEndpointTextIsScrubbed(t *testing.T) {
+	endpoints := map[string]engine.EndpointStatus{"corp": {Type: "openconnect", State: "auth_required",
+		Error: "login failed for hunter2-secret", AuthMessage: "retry hunter2-secret", AuthURL: "https://login.example/a/1"}}
+	scrubEndpoints(endpoints, newScrubber(map[string]Secret{"corp": {Value: "hunter2-secret"}}))
+	e := endpoints["corp"]
+	if strings.Contains(e.Error+e.AuthMessage, "hunter2") || e.AuthURL == "" {
+		t.Errorf("scrubbed status: %+v", e)
 	}
 }

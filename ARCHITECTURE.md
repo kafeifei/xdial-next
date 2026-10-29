@@ -468,9 +468,10 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
 
 - **字段**（`endpoints.<线路 id>`）：
   - `type`：`openconnect` 或 `tailscale`；`state`：`connecting`、`connected`、`auth_required`、`failed`。程序判断看这两个，说明文字给人看。
-  - AnyConnect：`error`、`auth_message`（服务器要求再输入什么）、`browser_auth`、`addresses`（分到的地址）、`dns`（下发的 DNS）、`since`、`full_tunnel`。
+  - AnyConnect：`error`、`auth_message`（服务器要求再输入什么）、`browser_auth`、`addresses`（分到的地址）、`dns`（下发的 DNS）、`since`、`default_route`。
   - Tailscale：`auth_url`（要登录时的链接）、`tailnet`、`dns_name`、`self`（本机在 tailnet 里的地址）、`exit_node`、`peers`、`online`。
-  - 登录链接只在 `status` 里，不进事件日志。
+  - 登录链接只在 `status` 里，不进事件日志。服务器给的文字（`error`、`auth_message`）和引擎日志一样先脱敏，最长 512 字节。
+  - 引擎写的状态行超过 1 MiB 的跳过这一行，之后的照常读。
 - **整个连接和 VPN 分开**：VPN 连不上不算连接失败。连接照常建立，场景里走这条线路的流量连不通，其余不受影响；`status` 和事件说明 VPN 的情况。
 - **AnyConnect 的认证**：
   - 用户名、密码（凭据引用），可选 TOTP（`token.mode: totp`，种子是凭据引用）。旧版的公司线路就是用户名加密码。
@@ -479,7 +480,7 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
   - 引擎不自己重试认证；线路断了之后由 sing-box 按 `reconnect_timeout` 重连，超时就是 `failed`。`failed` 之后要切一次场景（重载）才会再试，第一版不自动重载：重载会断掉所有连接。
 - **VPN 推送的网段和域名**（3.2 的信任假设）：
   - sing-box 不把推送的内容交给外面（只有地址、DNS 和 MTU），XDial 读不到，也就无法过滤或限额，除非给 sing-box 打补丁，这和"只用上游"冲突。3.2 的做法不变：推送规则排在用户规则之后，只能接管原本走 `final` 的流量。
-  - 能看到的是结果：daemon 问 endpoint 公网地址（1.1.1.1、2606:4700:4700::1111）是不是由它接管，是的话 `full_tunnel: true`，`xdial status` 提示"原本走 final 的流量都会进这条 VPN"，并记进事件。
+  - 能看到的是结果：引擎问 endpoint 两个文档用的地址（198.51.100.1、2001:db8::1）是不是由它接管。只有默认路由或者差不多一样宽的路由才会盖住它们，所以是的话 `default_route: true`，`xdial status` 提示"原本走 final 的流量都会进这条 VPN"，并记进事件。不用公网地址探测：sing-box 给 VPN 下发的每个 DNS 服务器加一条主机路由，下发 1.1.1.1 就会误判。
   - 用户在公司网络上实测之后，再决定要不要做更多（第 7 节）。
 
 ## 4. 存放与修改
