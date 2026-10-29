@@ -120,7 +120,7 @@ func watchOpenConnect(ctx context.Context, ep adapter.OpenConnectEndpoint, repor
 
 func openConnectStatus(ep adapter.OpenConnectEndpoint) EndpointStatus {
 	st := ep.OpenConnectStatus()
-	s := EndpointStatus{Type: "openconnect", Error: st.Error}
+	s := EndpointStatus{Type: "openconnect", Error: bound(st.Error)}
 	switch st.State {
 	case adapter.OpenConnectStateConnected:
 		s.State = "connected"
@@ -132,7 +132,7 @@ func openConnectStatus(ep adapter.OpenConnectEndpoint) EndpointStatus {
 		s.State = "connecting"
 	}
 	if c := st.AuthChallenge; c != nil {
-		s.AuthMessage = strings.TrimSpace(strings.Join([]string{c.Message, c.Error}, " "))
+		s.AuthMessage = bound(strings.TrimSpace(strings.Join([]string{c.Message, c.Error}, " ")))
 		s.BrowserAuth = c.Browser != nil
 	}
 	if t := st.TunnelInfo; t != nil {
@@ -183,4 +183,17 @@ func tailscaleStatus(st *adapter.TailscaleEndpointStatus) EndpointStatus {
 	}
 	sort.Strings(s.Self)
 	return s
+}
+
+// maxText bounds a VPN server's text in a status line, so one endpoint
+// cannot push every line past the daemon's limit. It is far above what the
+// daemon keeps after scrubbing, 512 bytes, so a secret this cut splits is
+// beyond what is kept, and the daemon still scrubs whole secrets first.
+const maxText = 64 << 10
+
+func bound(s string) string {
+	if len(s) <= maxText {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxText], "")
 }
