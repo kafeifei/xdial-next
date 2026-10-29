@@ -521,9 +521,14 @@ const (
 	maxListItems   = 20000
 )
 
-func headlessRuleSpec(depth int) *Spec {
+func headlessRuleSpec(depth int) *Spec { return headlessRuleSpecWithin(depth, maxListItems) }
+
+// headlessRuleSpecWithin is the headless rule with lists of up to listCap
+// items: downloaded rule sets carry lists far longer than a configuration
+// written by hand, ARCHITECTURE.md 3.4.
+func headlessRuleSpecWithin(depth, listCap int) *Spec {
 	bigList := func(elem *Spec) *Spec {
-		return &Spec{shape: shapeListable, elem: elem, maxItems: maxListItems}
+		return &Spec{shape: shapeListable, elem: elem, maxItems: listCap}
 	}
 	plain := map[string]*Spec{
 		"type":                      enum("default"),
@@ -558,7 +563,7 @@ func headlessRuleSpec(depth int) *Spec {
 		variants["logical"] = map[string]*Spec{
 			"type":   enum("logical"),
 			"mode":   req(enum("and", "or")),
-			"rules":  req(&Spec{shape: shapeArray, elem: headlessRuleSpec(depth + 1), maxItems: 64}),
+			"rules":  req(&Spec{shape: shapeArray, elem: headlessRuleSpecWithin(depth+1, listCap), maxItems: 64}),
 			"invert": boolean(),
 		}
 	}

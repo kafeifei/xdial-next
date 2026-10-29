@@ -93,6 +93,12 @@ type Daemon struct {
 	// wake tells monitor the connection changed, so it watches the new
 	// resolver session.
 	wake chan struct{}
+
+	// res serializes downloads and decoding of remote rule sets, 3.4;
+	// attempts, under mu, is the last download of each.
+	res      sync.Mutex
+	attempts map[string]resourceAttempt
+	resWake  chan struct{}
 }
 
 // New prepares a daemon: directories, permissions, stored files. It does
@@ -118,7 +124,7 @@ func New(opts Options) (*Daemon, error) {
 		}
 	}
 	trimDaemonLog(l.DaemonLog())
-	d := &Daemon{opts: opts, sys: opts.System, status: "disconnected", since: time.Now(), secrets: map[string]Secret{}, wake: make(chan struct{}, 1)}
+	d := &Daemon{opts: opts, sys: opts.System, status: "disconnected", since: time.Now(), secrets: map[string]Secret{}, wake: make(chan struct{}, 1), resWake: make(chan struct{}, 1)}
 	d.events = newEventLog(l.Events())
 	if err := opts.ExcludeFromBackup(l.Private()); err != nil {
 		d.events.add("backup_exclusion_failed", map[string]any{"error": err.Error()})
@@ -176,6 +182,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.monitor(ctx)
 		close(monitorDone)
 	}()
+	go d.resourceLoop(ctx)
 	go func() {
 		<-ctx.Done()
 		listener.Close()

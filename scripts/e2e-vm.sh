@@ -17,6 +17,8 @@ ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
 
 mkdir -p "$out_dir/share"
 GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$out_dir/share/xdial" ./cmd/xdial
+# 只给 e2e 用的 sing-box 服务端，代理线路和订阅连它，不进产品。
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$out_dir/share/testserver" ./e2e/testserver
 # Go 不给 git worktree 里构建的二进制写 VCS 信息，这里自己记下构建时的提交，结果才对得上代码。
 commit="$(git rev-parse HEAD)$(git diff --quiet HEAD -- || echo -dirty)"
 echo "$commit" > "$out_dir/commit"

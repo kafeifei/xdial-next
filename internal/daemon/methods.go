@@ -28,16 +28,18 @@ const (
 
 func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 	return map[string]func(json.RawMessage) reply{
-		"version":       d.version,
-		"status":        d.statusMethod,
-		"config.export": d.export,
-		"config.apply":  d.apply,
-		"secret.set":    d.secretSet,
-		"secret.list":   d.secretList,
-		"secret.rm":     d.secretRemove,
-		"connect":       d.connect,
-		"disconnect":    d.disconnect,
-		"scenario.use":  d.scenarioUse,
+		"version":         d.version,
+		"status":          d.statusMethod,
+		"config.export":   d.export,
+		"config.apply":    d.apply,
+		"secret.set":      d.secretSet,
+		"secret.list":     d.secretList,
+		"secret.rm":       d.secretRemove,
+		"connect":         d.connect,
+		"disconnect":      d.disconnect,
+		"scenario.use":    d.scenarioUse,
+		"rule_set.list":   d.ruleSetList,
+		"rule_set.update": d.ruleSetUpdate,
 	}
 }
 
@@ -225,6 +227,7 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	d.mu.Unlock()
 	result.Applied = true
 	d.events.add("config_applied", map[string]any{"revision": result.Revision, "previous": result.PreviousRevision})
+	d.wakeResources()
 	return reply{schema: SchemaConfigApply, result: result}
 }
 
@@ -347,6 +350,7 @@ func (d *Daemon) secretSet(params json.RawMessage) reply {
 		return reply{err: err}
 	}
 	d.events.add("secret_set", map[string]any{"name": p.Name})
+	d.wakeResources()
 	for _, r := range secretRefs(d.cfg, d.secrets) {
 		if r.Name == p.Name {
 			return reply{schema: SchemaSecret, result: r}

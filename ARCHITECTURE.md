@@ -350,6 +350,51 @@
 - **没缓存又下载失败**：连接失败，不悄悄换成直连。
 - **更新之后怎么生效**：规则集内容变了，在下一次连接或切场景时生效，不为了更新规则集专门重载、打断现有连接。
 
+M3 的实现（#10）：
+
+- **两个子进程**：`xdial __fetch` 下载，`xdial __rule-set-decode` 把 binary 转成 source。
+  - 都由 daemon 用自己的二进制起，以 `nobody` 身份运行，什么都不继承，输入全在 stdin。
+  - 下载子进程：
+    - 经 `direct` 时，用 daemon 交给它的物理网络 DNS 解析，再用标准库拨号；
+    - 经代理线路时，起一个只含 `download_via` 那条线路链的 sing-box（`engine.CompileDownload`），日志关掉。
+  - 两种情况的 socket 都绑在物理接口上（macOS 的 `IP_BOUND_IF`），接口取主网络服务的 `PrimaryInterface`。TUN 不注册网络服务，所以连接期间它仍是物理接口。
+- **拒绝的地址**（经 `direct` 时）：
+  - 回环、链路本地、私有（含 `fc00::/7`）、CGNAT `100.64.0.0/10`、组播、未指定；
+  - `0.0.0.0/8`、`240.0.0.0/4`、广播、`198.18.0.0/15`（常被假 IP 型 DNS 使用）、文档网段、Teredo、`fec0::/10`；
+  - NAT64（`64:ff9b::/96`）和 6to4（`2002::/16`）按内嵌的 IPv4 再查一次。
+  - 检查在拨号时做，每一跳重定向、每个新连接都重新检查；同一主机的连接复用不再检查。
+- **请求**：带 `If-None-Match` / `If-Modified-Since`，`304` 时只更新下载时间；重定向最多 5 次；整次下载 60 秒。
+- **错误**：只回错误码和不含 URL 的说明：订阅地址的路径里常带令牌。服务器返回错误时只报状态码，不回显响应体。子进程给的说明截到 300 字节。
+- **上限**：
+
+  | 内容 | 上限 |
+  |---|---|
+  | source 下载 | 16 MiB；解析时最多 60 万个值 |
+  | 单个列表 | 30 万项（手写配置是 2 万）；geosite-cn 一条规则就有约 11 万个后缀 |
+  | 规则 | 每个规则集 2 万条，逻辑规则 4 层，正则按编译后的大小计 |
+  | binary 下载 | 16 MiB；解压后 32 MiB |
+  | binary 的域名树 | 100 万个域名，展开后 16 MiB，单个域名 512 字节 |
+  | binary 的 IP 段 | 展开后 100 万个前缀 |
+  | 转换 | 30 秒；输出按 source 的上限 |
+
+- **binary 的预检**（`resource.Preflight`）：
+  - 每个声明的长度都先和剩下的字节数比较，再和上限比较，不先分配。
+  - 域名树：按广度优先走一遍位图，核对节点数、边数和标签数一致，叶子位图覆盖所有节点且末尾没有多余的位，不通向任何域名的节点、空域名、不在末尾的后缀标记都拒绝，同时累计域名个数和展开后的长度。
+  - IP 段：首尾地址族一致、首不大于尾，按 CIDR 展开数计数。
+  - 子进程里在解码前再做一次预检，不依赖调用方。
+- **缓存**：
+  - 在 `private/resources/rule-sets/<id>.json`，root 专属。存检查过的 source 内容、指纹（url 和 format 的 SHA-256）、下载时间、内容变化时间、`ETag`、`Last-Modified`。
+  - url 或 format 变了，旧缓存就不算数。每次使用都重新过一遍 source 的检查。
+- **什么时候下载**：
+  - 连接、切场景、连接中 apply 时，场景用到而缓存里没有的，先下载再编译。这一步在控制序列里，失败则这次请求失败，错误码是下载的错误码。
+  - 后台：daemon 启动时、每次 apply 和 `secret set` 之后、以后每 5 分钟检查一次，下载没缓存或已过期的。
+  - 过期按 `update_interval`，默认 24 小时，最短 10 分钟。失败后 10 分钟内后台不再试。
+  - 下载一次只跑一个。
+- **命令**：
+  - `xdial rule-set list`：每个规则集是否已下载、规则条数、下载时间、下次更新时间、上次的错误。
+  - `xdial rule-set update [<id>...]`：现在下载，不写 id 就下载全部远程规则集。有失败时整体报第一个失败的错误码，说明里列出每个失败的规则集和成功的个数。
+- **事件**：`rule_set_updated`（是否变化、条数）、`rule_set_update_failed`（错误码和说明）。
+
 ## 4. 存放与修改
 
 ### 4.1 配置
@@ -638,7 +683,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - 被允许的连接同时最多 32 个，满了之后新连接收到 `daemon.busy`。
   - `logs --follow` 可以一直开着、中间没有输出，客户端对它不设读超时。
 - **凭据只走 API**：`secret.set` 的值在请求里传，不进命令行参数和环境变量（4.3）。
-- **第一批方法**：`version`、`status`、`config.export`、`config.apply`（`dry_run`、`if_match`）、`secret.set`、`secret.list`、`secret.rm`、`connect`、`disconnect`、`scenario.use`、`logs`（`lines`、`follow`）。
+- **第一批方法**：`version`、`status`、`config.export`、`config.apply`（`dry_run`、`if_match`）、`secret.set`、`secret.list`、`secret.rm`、`connect`、`disconnect`、`scenario.use`、`logs`（`lines`、`follow`）。M3 加 `rule_set.list`、`rule_set.update`（`ids`），见 3.4。
   - `connect` 对已经连着的同一场景、同一配置不做任何事。
 - **状态**：`status` 和改变连接的方法返回同一个结构。
   - `state`：`disconnected`、`connecting`（正在连接、重载或等待重连）、`connected`、`failed`。
@@ -663,6 +708,10 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   | `engine.failed` | 1 | 没能连上：引擎没能启动、启动后很快退出、查询进不了 sing-box，或者系统解析器没能设置 |
   | `engine.busy` | 5 | 另一个身份正连着（6.1） |
   | `resource.missing` | 3 | 场景用到的远程规则集或订阅还没下载（3.4） |
+  | `resource.download` | 1 | 下载失败：连不上、超时，或者服务器返回了错误（3.4，M3） |
+  | `resource.blocked` | 1 | 下载地址不被允许：不是 https、重定向到 http，或者解析到本机和内网 |
+  | `resource.too_large` | 1 | 下载的内容超过上限 |
+  | `resource.invalid` | 1 | 下载的内容不是合法的规则集，详情在 `problems`，只给位置和错误码 |
 
   参数不对用 `usage`。
 
@@ -787,6 +836,7 @@ SupplementalMatchDomains : [""]
   - 安装时的版本核对比的是构建标识，不是文件内容。签名构建（M6）后改用签名。
   - 和其他全局 VPN 同时连着、更具体的解析器、指定接口的查询：`xdial doctor`（M4）检测并提示。
 - **M3**：
+  - 远程规则集的下载已实现（3.4）；订阅用同一个下载器，在 #11 实现。
   - 订阅节点怎么被线路组和场景引用；
   - VPN 推送内容的形态，以及要不要由 XDial 过滤、限额后改写成普通规则；
   - AnyConnect 需要浏览器登录时怎么办；

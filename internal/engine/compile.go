@@ -477,3 +477,55 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 	dns := map[string]any{"servers": servers, "final": final, "reverse_mapping": true, "rules": rules}
 	return dns, used
 }
+
+// CompileDownload builds the configuration a download child runs to fetch
+// through line via, ARCHITECTURE.md 3.4: only the chain via reaches, every
+// socket bound to iface so it goes around TUN, and server names resolved
+// with the physical network's DNS. Config checks keep endpoints out of
+// that chain.
+func CompileDownload(c *config.Config, via, iface string, opts Options) ([]byte, error) {
+	if opts.Secret == nil {
+		opts.Secret = Placeholder
+	}
+	k := &compiler{c: c, opts: opts, replace: map[*config.Value]string{}, lines: map[string]bool{}, ruleSets: map[string]bool{}}
+	for _, use := range c.Secrets {
+		k.replace[use.Value] = opts.Secret(use)
+	}
+	if c.Line(via) == nil {
+		return nil, fmt.Errorf("line %q does not exist", via)
+	}
+	k.reach(via)
+	outbounds := []any{map[string]any{"type": "direct", "tag": config.Direct}}
+	for _, list := range [][]*config.Object{c.Lines, c.Groups} {
+		for _, o := range list {
+			if !k.lines[o.ID] {
+				continue
+			}
+			if o.Kind == "line" && isEndpoint(o.Type) {
+				return nil, fmt.Errorf("line %q is an endpoint", o.ID)
+			}
+			v := o.Value.Clone(k.replace).Without("id", "name").With("tag", config.String(o.ID))
+			if o.Kind == "line" {
+				v = v.With("domain_resolver", config.String(tagDNSLocal))
+			}
+			outbounds = append(outbounds, v)
+		}
+	}
+	physical := opts.PhysicalDNS
+	if !physical.IsValid() {
+		physical = checkPhysicalDNS
+	}
+	return json.Marshal(map[string]any{
+		"log":       map[string]any{"disabled": true},
+		"outbounds": outbounds,
+		"dns": map[string]any{
+			"servers": []any{map[string]any{"type": "udp", "tag": tagDNSLocal, "server": physical.String()}},
+			"final":   tagDNSLocal,
+		},
+		"route": map[string]any{
+			"final":                   via,
+			"default_interface":       iface,
+			"default_domain_resolver": tagDNSLocal,
+		},
+	})
+}

@@ -401,3 +401,45 @@ func TestEngineExitsWhenItsDaemonGoes(t *testing.T) {
 		t.Fatal("engine kept running after its stdin closed")
 	}
 }
+
+func TestCompileDownloadHoldsOnlyTheChain(t *testing.T) {
+	c := loadDoc(t, `{"version": 1,
+		"lines": [
+			{"id": "front", "type": "shadowsocks", "server": "front.example", "server_port": 443, "method": "aes-128-gcm", "password": {"secret": "f"}},
+			{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "hk"}, "detour": "front"},
+			{"id": "jp", "type": "trojan", "server": "jp.example", "server_port": 443, "password": {"secret": "jp"}},
+			{"id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://vpn.example", "username": "u", "password": {"secret": "c"}}
+		],
+		"groups": [{"id": "proxy", "type": "urltest", "outbounds": ["hk"]}],
+		"rule_sets": [{"id": "r", "type": "remote", "format": "binary", "url": "https://rules.example/r.srs", "download_via": "proxy"}],
+		"scenarios": [{"id": "s", "rules": [{"rule_set": "r", "line": "corp"}], "final": "jp"}]}`)
+	out, err := CompileDownload(c, "proxy", "en0", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Outbounds []map[string]any `json:"outbounds"`
+		Endpoints []any            `json:"endpoints"`
+		Inbounds  []any            `json:"inbounds"`
+		Route     map[string]any   `json:"route"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	var tags []string
+	for _, o := range doc.Outbounds {
+		tags = append(tags, o["tag"].(string))
+	}
+	if strings.Join(tags, ",") != "direct,front,hk,proxy" || doc.Endpoints != nil || doc.Inbounds != nil {
+		t.Errorf("download configuration holds more than the chain: %s", out)
+	}
+	if doc.Route["final"] != "proxy" || doc.Route["default_interface"] != "en0" {
+		t.Errorf("route: %v", doc.Route)
+	}
+	if err := CheckInProcess(out); err != nil {
+		t.Errorf("sing-box rejects it: %v", err)
+	}
+	if _, err := CompileDownload(c, "corp", "en0", Options{}); err == nil {
+		t.Error("an endpoint was compiled into a download")
+	}
+}

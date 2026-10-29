@@ -237,3 +237,31 @@ func TestDetourDirectIsRejected(t *testing.T) {
 		t.Errorf("detour direct passed: %s", codes(problems))
 	}
 }
+
+func TestCheckRuleSetSource(t *testing.T) {
+	long := `"` + strings.Repeat(`a.example", "`, maxListItems) + `b.example"`
+	rules, problems := CheckRuleSetSource([]byte(`{"version": 2, "rules": [{"domain_suffix": [` + long + `]}, {"ip_cidr": ["10.0.0.0/8"], "invert": true}]}`))
+	if len(problems) > 0 || len(rules) != 2 {
+		t.Fatalf("a long list beyond what a configuration takes: %d rules, %v", len(rules), problems)
+	}
+	for name, doc := range map[string]string{
+		"not an object":  `[]`,
+		"no rules":       `{"version": 1}`,
+		"no version":     `{"rules": []}`,
+		"future version": `{"version": 9, "rules": []}`,
+		"unknown key":    `{"version": 1, "rules": [], "extra": 1}`,
+		"forbidden":      `{"version": 1, "rules": [{"query_type": ["A"]}]}`,
+		"adguard":        `{"version": 1, "rules": [{"adguard_domain": ["||x^"]}]}`,
+		"bad cidr":       `{"version": 1, "rules": [{"ip_cidr": ["10.0.0.0/99"]}]}`,
+		"bad regex":      `{"version": 1, "rules": [{"domain_regex": ["("]}]}`,
+		"syntax":         `{"version": 1, "rules": [}`,
+	} {
+		if _, problems := CheckRuleSetSource([]byte(doc)); len(problems) == 0 {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	tooMany := `"` + strings.Repeat(`a", "`, maxRuleSetList) + `b"`
+	if _, problems := CheckRuleSetSource([]byte(`{"version": 1, "rules": [{"domain": [` + tooMany + `]}]}`)); len(problems) == 0 {
+		t.Error("a list over the cap was accepted")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"github.com/kafeifei/xdial-next/internal/cli"
 	"github.com/kafeifei/xdial-next/internal/config"
 	"github.com/kafeifei/xdial-next/internal/engine"
+	"github.com/kafeifei/xdial-next/internal/resource"
 )
 
 func main() {
@@ -28,9 +30,9 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-// hidden runs the subcommands xdial starts itself: the one-shot check child
-// and the engine child, ARCHITECTURE.md 2.2 and 6.1. They are not part of
-// the CLI contract.
+// hidden runs the subcommands xdial starts itself: the one-shot check child,
+// the engine child and the download and decode children, ARCHITECTURE.md
+// 2.2, 3.4 and 6.1. They are not part of the CLI contract.
 func hidden(args []string) (int, bool) {
 	if len(args) == 0 {
 		return 0, false
@@ -40,6 +42,10 @@ func hidden(args []string) (int, bool) {
 		return engine.RunCheckChild(os.Stdin, os.Stdout), true
 	case engine.EngineCommand:
 		return engine.RunEngineChild(os.Stdin, os.Stdout, os.Stderr, args[1:]), true
+	case resource.FetchCommand:
+		return resource.RunFetchChild(os.Stdin, os.Stdout), true
+	case resource.DecodeCommand:
+		return resource.RunDecodeChild(os.Stdin, os.Stdout, os.Stderr), true
 	}
 	return 0, false
 }
@@ -169,11 +175,31 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 		}
 		ctx.options[name] = value
 	}
-	if len(ctx.args) != len(cmd.Args) {
-		return out.Fail(cli.Errorf(cli.CodeUsage, "用法：xdial "+strings.Join(append(append([]string{}, cmd.Path...), cmd.Args...), " "),
-			"%s 需要 %d 个参数，这里有 %d 个", strings.Join(cmd.Path, " "), len(cmd.Args), len(ctx.args)))
+	if lo, hi := argCount(cmd.Args); len(ctx.args) < lo || len(ctx.args) > hi {
+		usage := "用法：xdial " + strings.Join(append(append([]string{}, cmd.Path...), cmd.Args...), " ")
+		if lo == hi {
+			return out.Fail(cli.Errorf(cli.CodeUsage, usage, "%s 需要 %d 个参数，这里有 %d 个", strings.Join(cmd.Path, " "), lo, len(ctx.args)))
+		}
+		return out.Fail(cli.Errorf(cli.CodeUsage, usage, "%s 的参数个数不对，这里有 %d 个", strings.Join(cmd.Path, " "), len(ctx.args)))
 	}
 	return cmd.run(ctx)
+}
+
+// argCount is how many arguments a command takes: an argument written in
+// brackets is optional, and one ending in "...]" may repeat.
+func argCount(args []string) (lo, hi int) {
+	for _, a := range args {
+		switch {
+		case strings.HasSuffix(a, "...]"):
+			return lo, math.MaxInt
+		case strings.HasPrefix(a, "["):
+			hi++
+		default:
+			lo++
+			hi++
+		}
+	}
+	return lo, hi
 }
 
 func equal(a, b []string) bool {

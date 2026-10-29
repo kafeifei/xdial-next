@@ -13,6 +13,9 @@ import (
 type System interface {
 	// PhysicalDNS returns the DNS servers of the physical network.
 	PhysicalDNS() ([]netip.Addr, error)
+	// PhysicalInterface returns the interface of the physical network,
+	// which downloads bind to, 3.4.
+	PhysicalInterface() (string, error)
 	// Hold publishes the resolver key in a session that inherits lock and
 	// removes the key when it ends.
 	Hold(key string, lock *os.File) (Resolver, error)
@@ -39,6 +42,8 @@ var resolverAddress = netip.MustParseAddr(sysdns.Server)
 type macOS struct{}
 
 func (macOS) PhysicalDNS() ([]netip.Addr, error) { return sysdns.Physical() }
+
+func (macOS) PhysicalInterface() (string, error) { return sysdns.PrimaryInterface() }
 
 func (macOS) Hold(key string, lock *os.File) (Resolver, error) {
 	return sysdns.Hold(key, resolverAddress, lock)

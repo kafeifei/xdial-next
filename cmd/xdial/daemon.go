@@ -66,6 +66,11 @@ func daemonCommands() []*command {
 			Summary: "列出凭据的名字、是否已设置和引用方，不显示值", Options: []option{jsonOption}},
 		{Path: []string{"secret", "rm"}, Args: []string{"<名字>"}, Output: daemon.SchemaSecret, run: runSecretRemove,
 			Summary: "删除凭据；仍被引用时拒绝", Options: []option{jsonOption}},
+		{Path: []string{"rule-set", "list"}, Output: daemon.SchemaRuleSetList, run: runRuleSetList,
+			Summary: "列出规则集：远程规则集有没有下载、下载时间、规则条数和上次的错误", Options: []option{jsonOption}},
+		{Path: []string{"rule-set", "update"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaRuleSetUpdate, run: runRuleSetUpdate,
+			Summary: "现在下载远程规则集，不写 id 就下载全部；新内容在下一次连接或切场景时生效（ARCHITECTURE.md 3.4）",
+			Options: []option{jsonOption}},
 		{Path: []string{"logs"}, Output: "xdial.logs/v1", run: runLogs,
 			Summary: "显示 daemon 的事件日志",
 			Options: []option{jsonOption,
@@ -481,6 +486,53 @@ func runDaemonUninstall(ctx *context_) int {
 		fmt.Fprintf(w, "daemon %s 已卸载\n", l.ID)
 		for _, p := range removed {
 			fmt.Fprintln(w, "  删除了", p)
+		}
+	})
+}
+
+func runRuleSetList(ctx *context_) int {
+	return call(ctx, "rule_set.list", nil, func(w io.Writer, raw json.RawMessage) {
+		var r struct {
+			RuleSets []daemon.RuleSetInfo `json:"rule_sets"`
+		}
+		_ = json.Unmarshal(raw, &r)
+		for _, s := range r.RuleSets {
+			line := fmt.Sprintf("%s  %s", s.ID, s.Type)
+			switch {
+			case s.Type == "inline":
+				line += fmt.Sprintf("，%d 条规则", s.Rules)
+			case s.Cached:
+				line += fmt.Sprintf("，%d 条规则，%s 下载", s.Rules, s.FetchedAt.Local().Format("2006-01-02 15:04"))
+			default:
+				line += "，还没下载"
+			}
+			fmt.Fprintln(w, cli.Escape(line))
+			if s.LastError != nil {
+				fmt.Fprintln(w, "  上次下载失败：", cli.Escape(s.LastError.Message))
+			}
+		}
+	})
+}
+
+func runRuleSetUpdate(ctx *context_) int {
+	return call(ctx, "rule_set.update", map[string]any{"ids": ctx.args}, func(w io.Writer, raw json.RawMessage) {
+		var r struct {
+			Updated []struct {
+				ID      string `json:"id"`
+				Changed bool   `json:"changed"`
+				Rules   int    `json:"rules"`
+			} `json:"updated"`
+		}
+		_ = json.Unmarshal(raw, &r)
+		for _, u := range r.Updated {
+			state := "没有变化"
+			if u.Changed {
+				state = "已更新"
+			}
+			fmt.Fprintf(w, "%s：%s，%d 条规则\n", cli.Escape(u.ID), state, u.Rules)
+		}
+		if len(r.Updated) > 0 {
+			fmt.Fprintln(w, "新内容在下一次连接或切场景时生效")
 		}
 	})
 }

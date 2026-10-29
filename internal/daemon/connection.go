@@ -78,10 +78,18 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if len(physical) == 0 {
 		return nil, cli.Errorf(cli.CodeEngineFailed, "连上网络后再试；已经连着时，网络就绪后会自动重连", "物理网络还没有 DNS 服务器")
 	}
+	ruleSets, err := d.ensureRuleSets(cfg, scenario, secrets)
+	if err != nil {
+		return nil, err
+	}
 	result, err := engine.Compile(cfg, engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
 		PhysicalDNS: physical[0],
 		Secret:      func(u config.SecretUse) string { return secrets[u.Name].Value },
+		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
+			rules, ok := ruleSets[o.ID]
+			return rules, ok
+		},
 	})
 	if err != nil {
 		return nil, cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
@@ -89,7 +97,7 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	// Placeholders are for checks only: a rule set that never matches would
 	// quietly send its traffic elsewhere, 3.4.
 	if len(result.MissingRuleSets) > 0 {
-		return nil, cli.Errorf(cli.CodeResourceMissing, "远程规则集的下载在 M3 实现，现在只能用 inline 规则集", "场景 %s 用到的远程规则集还没下载：%v", scenario, result.MissingRuleSets)
+		return nil, cli.Errorf(cli.CodeResourceMissing, "", "场景 %s 用到的远程规则集还没下载：%v", scenario, result.MissingRuleSets)
 	}
 	if err := checkSecrets(cfg, secrets, result.Secrets); err != nil {
 		return nil, err
