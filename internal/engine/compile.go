@@ -62,6 +62,9 @@ type Options struct {
 	RuleSet func(*config.Object) ([]*config.Value, bool)
 	// StateDirectory holds the tailscale state of each line, by id.
 	StateDirectory string
+	// Selections are the members picked by hand in selector groups, by
+	// group id: compiled as the group's default when still a member, 3.6.
+	Selections map[string]string
 	// TailscaleAuthKeys logs tailscale lines in with an auth key, by line
 	// id: given once by xdial tailscale login, never stored, 4.7.
 	TailscaleAuthKeys map[string]string
@@ -239,7 +242,15 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 				v = v.With("domain_resolver", config.String(tagDNSLocal))
 			}
 			if o.Kind == "group" {
-				v = v.With("outbounds", k.expandMembers(o))
+				members := k.expandMembers(o)
+				v = v.With("outbounds", members)
+				if picked, ok := opts.Selections[o.ID]; ok && o.Type == "selector" {
+					for _, m := range members.Items {
+						if m.String == picked {
+							v = v.With("default", config.String(picked))
+						}
+					}
+				}
 			}
 			if o.Type == "tailscale" {
 				v = v.With("state_directory", config.String(filepath.Join(opts.StateDirectory, o.ID)))

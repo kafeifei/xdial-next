@@ -13,7 +13,9 @@ import (
 	"github.com/kafeifei/xdial-next/internal/buildinfo"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/service"
 )
 
 // MaxConfigSize is the most the engine reads from stdin. The daemon checks
@@ -41,10 +43,46 @@ type Command struct {
 	// TailscaleLogout logs the tailscale line with this id out; it then
 	// waits for a new login, 3.5.
 	TailscaleLogout string `json:"tailscale_logout,omitempty"`
+	// Select switches a selector group to a member, 3.6.
+	Select *SelectCommand `json:"select,omitempty"`
+	// URLTest measures lines and the members of groups; the answer is a
+	// status line carrying a TestResult with the same id, 3.6.
+	URLTest *URLTestCommand `json:"url_test,omitempty"`
 }
 
-func runCommand(ctx context.Context, instance *box.Box, c Command, stderr io.Writer) {
-	if c.TailscaleLogout == "" {
+// SelectCommand switches Group to Member.
+type SelectCommand struct {
+	Group  string `json:"group"`
+	Member string `json:"member"`
+}
+
+// URLTestCommand tests Tags: a line, or every member of a group.
+type URLTestCommand struct {
+	ID   int      `json:"id"`
+	Tags []string `json:"tags"`
+}
+
+// testURL is what a test fetches through a line, sing-box's default.
+const testURL = "https://www.gstatic.com/generate_204"
+
+// testTimeout bounds one line's test.
+const testTimeout = 10 * time.Second
+
+func runCommand(ctx context.Context, instance *box.Box, r *reporter, c Command, stderr io.Writer) {
+	switch {
+	case c.Select != nil:
+		o, ok := instance.Outbound().Outbound(c.Select.Group)
+		selector, isSelector := o.(interface{ SelectOutbound(string) bool })
+		if !ok || !isSelector || !selector.SelectOutbound(c.Select.Member) {
+			fmt.Fprintln(stderr, "engine: select: cannot select", c.Select.Member, "in", c.Select.Group)
+		}
+		r.poke()
+		return
+	case c.URLTest != nil:
+		_ = r.write(StatusLine{Test: &TestResult{ID: c.URLTest.ID, Results: urlTest(ctx, instance, r, c.URLTest.Tags)}})
+		r.poke()
+		return
+	case c.TailscaleLogout == "":
 		return
 	}
 	e, ok := instance.Endpoint().Get(c.TailscaleLogout)
@@ -108,6 +146,10 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	if err := opts.UnmarshalJSONContext(ctx, data); err != nil {
 		return fail("parse", err)
 	}
+	// The engine's own urltest history, so it can report what groups
+	// measured; box.New uses it instead of making one.
+	history := urltest.NewHistoryStorage()
+	ctx = service.ContextWithPtr(ctx, history)
 	instance, err := box.New(box.Options{Context: ctx, Options: opts})
 	if err != nil {
 		return fail("create", err)
@@ -122,8 +164,9 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 		_ = instance.Close()
 		return 1
 	}
-	// After the ready line, stdout carries endpoint status, 6.3.
-	go reportEndpoints(ctx, instance, stdout)
+	// After the ready line, stdout carries status, 6.3.
+	reports := newReporter(instance, history, stdout)
+	go reports.run(ctx)
 	// Commands run one at a time in a worker of their own: a logout can
 	// wait on the control server, and the loop below must stay free for
 	// the signals and the daemon going away. Leaving cancels the command.
@@ -134,7 +177,7 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 			case <-commandCtx.Done():
 				return
 			case c := <-commands:
-				runCommand(commandCtx, instance, c, stderr)
+				runCommand(commandCtx, instance, reports, c, stderr)
 			}
 		}
 	}()
@@ -149,4 +192,41 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 		return 1
 	}
 	return 0
+}
+
+// urlTest measures each tag: a group's members, or the line itself. Every
+// result also goes into the history groups read, 3.6.
+func urlTest(ctx context.Context, instance *box.Box, r *reporter, tags []string) map[string]TestOutcome {
+	results := map[string]TestOutcome{}
+	var test func(tag string, depth int)
+	test = func(tag string, depth int) {
+		if _, done := results[tag]; done {
+			return
+		}
+		o, ok := instance.Outbound().Outbound(tag)
+		if !ok {
+			results[tag] = TestOutcome{Error: "没有这条线路"}
+			return
+		}
+		if g, isGroup := o.(adapter.OutboundGroup); isGroup && depth < 4 {
+			for _, member := range g.All() {
+				test(member, depth+1)
+			}
+			return
+		}
+		testCtx, cancel := context.WithTimeout(ctx, testTimeout)
+		defer cancel()
+		delay, err := urltest.URLTest(testCtx, testURL, o)
+		if err != nil {
+			results[tag] = TestOutcome{Error: "测不通"}
+			r.history.DeleteURLTestHistory(tag)
+			return
+		}
+		results[tag] = TestOutcome{DelayMS: int(delay)}
+		r.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
+	}
+	for _, tag := range tags {
+		test(tag, 0)
+	}
+	return results
 }

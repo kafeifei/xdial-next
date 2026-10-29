@@ -130,6 +130,7 @@ func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[
 	}
 	d.mu.Lock()
 	secrets := maps.Clone(d.secrets)
+	selections := maps.Clone(d.state.Selections)
 	scrubbed := maps.Clone(secrets)
 	for line, key := range authKeys {
 		scrubbed["tailscale-auth-key:"+line] = Secret{Value: key}
@@ -155,9 +156,9 @@ func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[
 	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
 	opts := engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
-		TailscaleAuthKeys: authKeys,
-		PhysicalDNS:       physical[0],
-		Secret:            func(u config.SecretUse) string { return secrets[u.Name].Value },
+		TailscaleAuthKeys: authKeys, Selections: selections,
+		PhysicalDNS: physical[0],
+		Secret:      func(u config.SecretUse) string { return secrets[u.Name].Value },
 		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
 			rules, ok := ruleSets[o.ID]
 			return rules, ok
@@ -304,7 +305,7 @@ func (d *Daemon) switchLocked(p *plan) error {
 		d.resumeIntentLocked(err.Error())
 		return err
 	}
-	if err := d.persist(State{Scenario: p.scenario, Connected: true}); err != nil {
+	if err := d.persist(State{Scenario: p.scenario, Connected: true, Selections: d.selections()}); err != nil {
 		d.disconnectLocked()
 		d.resumeIntentLocked("保存连接状态失败：" + err.Error())
 		return cli.Errorf(cli.CodeInternal, "", "保存连接状态失败，已断开：%v", err)

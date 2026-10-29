@@ -1087,3 +1087,56 @@ func TestLoginLinksGoBeforeScrubbing(t *testing.T) {
 		t.Errorf("log line: %s", got)
 	}
 }
+
+const groupDoc = `{"version": 1,
+	"lines": [{"id": "a", "type": "trojan", "server": "127.0.0.1", "server_port": 9, "password": {"secret": "p"}},
+	          {"id": "b", "type": "trojan", "server": "127.0.0.1", "server_port": 9, "password": {"secret": "p"}}],
+	"groups": [{"id": "pick", "type": "selector", "outbounds": ["a", "b"]},
+	           {"id": "fast", "type": "urltest", "outbounds": ["a", "b"]}],
+	"scenarios": [{"id": "s", "rules": [], "final": "pick"}, {"id": "t", "rules": [], "final": "fast"}]}`
+
+func TestGroupSelectSwitchesAndPersists(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	pid := h.ok("connect", map[string]any{"scenario": "s"})["engine_pid"]
+	h.waitFor("the group's status", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		return g != nil && g["pick"] != nil
+	})
+	r := h.ok("group.select", map[string]any{"group": "pick", "member": "b"})
+	if r["applied"] != true {
+		t.Errorf("select: %v", r)
+	}
+	s := h.ok("status", nil)
+	if s["engine_pid"] != pid || s["groups"].(map[string]any)["pick"].(map[string]any)["now"] != "b" {
+		t.Errorf("after select: pid %v -> %v, groups %v", pid, s["engine_pid"], s["groups"])
+	}
+	// A reload compiles the choice as the default.
+	h.ok("scenario.use", map[string]any{"id": "t"})
+	h.ok("scenario.use", map[string]any{"id": "s"})
+	h.waitFor("the choice after a reload", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		pick, _ := g["pick"].(map[string]any)
+		return pick != nil && pick["now"] == "b"
+	})
+	h.fails("group.select", map[string]any{"group": "fast", "member": "a"}, cli.CodeConfigConflict)
+	h.fails("group.select", map[string]any{"group": "pick", "member": "nope"}, cli.CodeConfigConflict)
+}
+
+func TestLineTestAnswersThroughTheEngine(t *testing.T) {
+	h := start(t, nil)
+	h.fails("line.test", map[string]any{"ids": []string{"a"}}, cli.CodeConfigConflict)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	h.ok("connect", map[string]any{"scenario": "s"})
+	r := h.ok("line.test", map[string]any{"ids": []string{"pick", "nope"}})
+	results := r["results"].(map[string]any)
+	// Nothing listens on port 9: each member answers with an error.
+	for _, tag := range []string{"a", "b", "nope"} {
+		o, _ := results[tag].(map[string]any)
+		if o == nil || o["error"] == nil {
+			t.Errorf("%s: %v", tag, results)
+		}
+	}
+}

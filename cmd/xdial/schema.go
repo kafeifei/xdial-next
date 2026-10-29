@@ -33,6 +33,16 @@ func envelope(name string, result map[string]any) map[string]any {
 	})
 }
 
+// groupSchema is a group of lines as it runs.
+func groupSchema() map[string]any {
+	return object([]string{"type", "now", "members"}, map[string]any{
+		"type": map[string]any{"enum": []string{"selector", "urltest"}}, "now": str(),
+		"members": map[string]any{"type": "array", "items": object([]string{"tag"}, map[string]any{
+			"tag": str(), "delay_ms": map[string]any{"type": "integer"}, "tested_at": str(),
+		})},
+	})
+}
+
 // endpointSchema is the status of one AnyConnect or Tailscale line.
 func endpointSchema() map[string]any {
 	return object([]string{"type", "state"}, map[string]any{
@@ -104,6 +114,7 @@ func outputSchemas() map[string]any {
 				"last_error": str(), "system_dns": map[string]any{"type": "boolean"}, "engine_pid": map[string]any{"type": "integer"},
 				"intent": map[string]any{"enum": []string{"connected", "disconnected"}}, "physical_dns": strList(),
 				"endpoints": map[string]any{"type": "object", "additionalProperties": endpointSchema()},
+				"groups":    map[string]any{"type": "object", "additionalProperties": groupSchema()},
 			},
 		)),
 		"xdial.config.export/v1": envelope("xdial.config.export/v1", object(
@@ -169,6 +180,14 @@ func outputSchemas() map[string]any {
 			e["required"] = []string{"line"}
 			return e
 		}()),
+		"xdial.group.select/v1": envelope("xdial.group.select/v1", object([]string{"group", "member", "applied"}, map[string]any{
+			"group": str(), "member": str(), "applied": map[string]any{"type": "boolean"},
+		})),
+		"xdial.line.test/v1": envelope("xdial.line.test/v1", object([]string{"results"}, map[string]any{
+			"results": map[string]any{"type": "object", "additionalProperties": object(nil, map[string]any{
+				"delay_ms": map[string]any{"type": "integer"}, "error": str(),
+			})},
+		})),
 		"xdial.logs/v1": envelope("xdial.logs/v1", object([]string{"time", "type"}, map[string]any{
 			"time": str(), "type": str(), "fields": map[string]any{"type": "object"},
 		})),

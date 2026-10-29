@@ -493,6 +493,14 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
   - `exit_node` 写在配置里（线路的字段），和旧版一样随场景生效；不另设运行时切换。
   - 构建去掉了 peerapi、C2N、SSH、Taildrop 等能力（2.6）。XDial 不提供设置 serve 的途径，serve 不会开启。
 
+### 3.6 线路组在运行中（M4）
+
+- **当前成员和延迟**：引擎的状态行里带每个组（selector、urltest）的当前成员和各成员最近一次测得的延迟，`status` 的 `groups` 里能看到。urltest 自己定时测，结果也进来；引擎每 15 秒至少报一次，组自己切了成员也看得到。
+- **手选**（`xdial group select <组> <成员>`）：
+  - 只有 selector 组能手选。成员是组里的 id，或者订阅成员展开出的节点（写它的 tag，`status` 里列着）。
+  - 选择由 daemon 记在 `state.json` 的 `selections` 里，不写进配置（1.1）。连接中经引擎的 stdin 切换，现有连接不断；之后每次编译这个组，都把它编成组的 `default`。选的成员不在组里了（例如配置改了、订阅里没了），回到组自己的默认值。
+- **测速**（`xdial line test [<id>...]`）：经运行中的引擎，每条线路取一次 `https://www.gstatic.com/generate_204`，10 秒超时；写组的 id 就测它的每个成员，不写就测所有组。结果也记进组的延迟里。没有连接时不能测：测速要走和实际流量一样的线路。
+
 ## 4. 存放与修改
 
 ### 4.1 配置
@@ -513,7 +521,7 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
 - **连接中 apply**：
   - 当前场景受影响时，先用新配置重载，成功才写入。重载失败就恢复旧配置继续运行，apply 报错，配置不变。
   - 不允许删掉当前场景，要先切到别的场景。
-  - selector 手选的成员被删掉时，回到组的默认值。
+  - selector 手选的成员被删掉时，回到组的默认值（3.6）。
 - **缺凭据或缺资源**：可以 apply，输出里列出缺什么。真正连接、或者切到用到它的场景时，才因为缺凭据或缺资源而拒绝。
 - **版本**：
   - `version` 必填，只增不减。daemon 拒绝读比自己新的版本，旧版本在读入时迁移，每个迁移都有测试。
@@ -791,6 +799,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - 另有 `scenario`、`revision`、`since`、`last_error`、`engine_pid`。
   - `endpoints`：AnyConnect 和 Tailscale 线路各自的状态，见 3.5（M3）。
 - **M3 加的方法**：`tailscale.login`（`line`、`auth_key`）、`tailscale.logout`（`line`），见 3.5。
+- **M4 加的方法**：`group.select`（`group`、`member`）、`line.test`（`ids`），见 3.6；`status` 加 `groups`。
 - **新增的错误码**（退出码按 5.3）：
 
   | 错误码 | 退出码 | 说明 |
@@ -844,7 +853,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
     - `version` 是构建标识（版本加 revision）。和 daemon 不一致就不用这个引擎，例如二进制被换掉了。
     - `error` 经脱敏（4.3）后才写进 `last_error`。
     - 就绪之后，每当 AnyConnect 或 Tailscale 线路的状态变了，再写一行 `{"endpoints": {"<线路 id>": {…}}}`，最多半秒一行，见 3.5。超过 1 MiB 的行丢掉。
-  - stdin 上，配置之后可以再写命令，一行一个 JSON：现在只有 `{"tailscale_logout": "<线路 id>"}`（3.5）。引擎的回应就是之后的状态行。
+  - stdin 上，配置之后可以再写命令，一行一个 JSON：`{"tailscale_logout": "<线路 id>"}`（3.5）、`{"select": {"group", "member"}}`、`{"url_test": {"id", "tags"}}`（3.6）。引擎的回应就是之后的状态行；测速的结果单独一行 `{"test": {"id", "results"}}`。
   - stderr：sing-box 的日志，脱敏后写进引擎日志。
   - 以后要加的运行中交互（selector 手选、urltest 状态），也加在 stdin 和 stdout 上，仍是一行一个 JSON。
 - **TUN**：

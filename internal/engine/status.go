@@ -12,6 +12,8 @@ import (
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing/common/observable"
 )
 
 // EndpointStatus is what the engine reports about one endpoint line after
@@ -40,13 +42,40 @@ type EndpointStatus struct {
 }
 
 // StatusLine is one line the engine writes to stdout after its ready
-// line: the status of every endpoint, by line id.
+// line. A snapshot carries the status of every endpoint and group, by id;
+// a line answering a url_test command carries only Test.
 type StatusLine struct {
-	Endpoints map[string]EndpointStatus `json:"endpoints"`
+	Endpoints map[string]EndpointStatus `json:"endpoints,omitempty"`
+	Groups    map[string]GroupStatus    `json:"groups,omitempty"`
+	Test      *TestResult               `json:"test,omitempty"`
 }
 
-// statusInterval bounds how often the engine writes a status line.
-const statusInterval = 500 * time.Millisecond
+// GroupStatus is a group of lines as it runs: the member in use and what
+// the last tests measured, ARCHITECTURE.md 3.6.
+type GroupStatus struct {
+	Type    string         `json:"type"`
+	Now     string         `json:"now"`
+	Members []MemberStatus `json:"members"`
+}
+
+// MemberStatus is one member of a group and its last test, if any.
+type MemberStatus struct {
+	Tag      string     `json:"tag"`
+	DelayMS  int        `json:"delay_ms,omitempty"`
+	TestedAt *time.Time `json:"tested_at,omitempty"`
+}
+
+// TestResult answers one url_test command.
+type TestResult struct {
+	ID      int                    `json:"id"`
+	Results map[string]TestOutcome `json:"results"`
+}
+
+// TestOutcome is one line's test: a delay, or why there is none.
+type TestOutcome struct {
+	DelayMS int    `json:"delay_ms,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
 
 // probeAddresses ask an AnyConnect endpoint whether its routes take
 // everything, 3.2, per address family: documentation addresses, which only
@@ -55,45 +84,92 @@ const statusInterval = 500 * time.Millisecond
 // 1.1.1.1 included.
 var probeAddresses = map[string]netip.Addr{"ipv4": netip.MustParseAddr("198.51.100.1"), "ipv6": netip.MustParseAddr("2001:db8::1")}
 
-// reportEndpoints writes a StatusLine to w whenever an endpoint's status
-// changes, at most every statusInterval, until ctx ends.
-func reportEndpoints(ctx context.Context, instance *box.Box, w io.Writer) {
-	var mu sync.Mutex
-	statuses := map[string]EndpointStatus{}
-	changed := make(chan struct{}, 1)
-	set := func(tag string, s EndpointStatus) {
-		mu.Lock()
-		statuses[tag] = s
-		mu.Unlock()
-		select {
-		case changed <- struct{}{}:
-		default:
-		}
+// statusInterval bounds how often the engine writes a status line.
+const statusInterval = 500 * time.Millisecond
+
+// reporter writes status lines to the daemon, 6.3.
+type reporter struct {
+	instance *box.Box
+	history  *urltest.HistoryStorage
+	writeMu  sync.Mutex
+	encoder  *json.Encoder
+
+	mu        sync.Mutex
+	endpoints map[string]EndpointStatus
+	changed   chan struct{}
+}
+
+func newReporter(instance *box.Box, history *urltest.HistoryStorage, w io.Writer) *reporter {
+	return &reporter{instance: instance, history: history, encoder: json.NewEncoder(w),
+		endpoints: map[string]EndpointStatus{}, changed: make(chan struct{}, 1)}
+}
+
+// poke asks for a new snapshot.
+func (r *reporter) poke() {
+	select {
+	case r.changed <- struct{}{}:
+	default:
 	}
-	for _, e := range instance.Endpoint().Endpoints() {
+}
+
+func (r *reporter) write(line StatusLine) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	return r.encoder.Encode(line)
+}
+
+// run writes a snapshot whenever an endpoint's or a group's status
+// changes, at most every statusInterval and at least every groupInterval,
+// until ctx ends.
+func (r *reporter) run(ctx context.Context) {
+	for _, e := range r.instance.Endpoint().Endpoints() {
+		tag := e.Tag()
+		set := func(s EndpointStatus) {
+			r.mu.Lock()
+			r.endpoints[tag] = s
+			r.mu.Unlock()
+			r.poke()
+		}
 		switch ep := e.(type) {
 		case adapter.OpenConnectEndpoint:
-			go watchOpenConnect(ctx, ep, func(s EndpointStatus) { set(e.Tag(), s) })
+			go watchOpenConnect(ctx, ep, set)
 		case adapter.TailscaleEndpoint:
 			go func() {
-				_ = ep.SubscribeTailscaleStatus(ctx, func(st *adapter.TailscaleEndpointStatus) { set(e.Tag(), tailscaleStatus(st)) })
+				_ = ep.SubscribeTailscaleStatus(ctx, func(st *adapter.TailscaleEndpointStatus) { set(tailscaleStatus(st)) })
 			}()
 		}
 	}
-	encoder := json.NewEncoder(w)
+	// Tests a group runs by itself land in the history.
+	hook := observable.NewSubscriber[struct{}](8)
+	r.history.AddUpdateHook(hook)
+	go func() {
+		updates, done := hook.Subscription()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-updates:
+				r.poke()
+			}
+		}
+	}()
+	r.poke()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-changed:
+		case <-r.changed:
+		case <-time.After(groupInterval):
 		}
-		mu.Lock()
-		line := StatusLine{Endpoints: make(map[string]EndpointStatus, len(statuses))}
-		for tag, s := range statuses {
+		r.mu.Lock()
+		line := StatusLine{Endpoints: make(map[string]EndpointStatus, len(r.endpoints)), Groups: r.groups()}
+		for tag, s := range r.endpoints {
 			line.Endpoints[tag] = s
 		}
-		mu.Unlock()
-		if encoder.Encode(line) != nil {
+		r.mu.Unlock()
+		if r.write(line) != nil {
 			return
 		}
 		select {
@@ -102,6 +178,31 @@ func reportEndpoints(ctx context.Context, instance *box.Box, w io.Writer) {
 		case <-time.After(statusInterval):
 		}
 	}
+}
+
+// groupInterval is how often a snapshot goes out regardless, so a group
+// that switched by itself is seen.
+const groupInterval = 15 * time.Second
+
+func (r *reporter) groups() map[string]GroupStatus {
+	out := map[string]GroupStatus{}
+	for _, o := range r.instance.Outbound().Outbounds() {
+		g, ok := o.(adapter.OutboundGroup)
+		if !ok {
+			continue
+		}
+		status := GroupStatus{Type: o.Type(), Now: g.Now(), Members: []MemberStatus{}}
+		for _, tag := range g.All() {
+			m := MemberStatus{Tag: tag}
+			if h := r.history.LoadURLTestHistory(tag); h != nil {
+				t := h.Time
+				m.DelayMS, m.TestedAt = int(h.Delay), &t
+			}
+			status.Members = append(status.Members, m)
+		}
+		out[o.Tag()] = status
+	}
+	return out
 }
 
 func watchOpenConnect(ctx context.Context, ep adapter.OpenConnectEndpoint, report func(EndpointStatus)) {

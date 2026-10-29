@@ -38,6 +38,8 @@ func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 		"connect":             d.connect,
 		"disconnect":          d.disconnect,
 		"scenario.use":        d.scenarioUse,
+		"group.select":        d.groupSelect,
+		"line.test":           d.lineTest,
 		"tailscale.login":     d.tailscaleLogin,
 		"tailscale.logout":    d.tailscaleLogout,
 		"rule_set.list":       d.ruleSetList,
@@ -71,6 +73,9 @@ type Status struct {
 	// Endpoints is what the engine last reported about the AnyConnect and
 	// Tailscale lines of the connection, by line id, 6.3.
 	Endpoints map[string]engine.EndpointStatus `json:"endpoints,omitempty"`
+	// Groups is each group as it runs: the member in use and the last
+	// tests, 3.6.
+	Groups map[string]engine.GroupStatus `json:"groups,omitempty"`
 }
 
 func (d *Daemon) statusLocked() Status {
@@ -93,6 +98,9 @@ func (d *Daemon) statusLocked() Status {
 		s.SystemDNS = c.first == resolverAddress.String()
 		if endpoints := c.engine.endpointStatus(); len(endpoints) > 0 {
 			s.Endpoints = endpoints
+		}
+		if groups := c.engine.groupStatus(); len(groups) > 0 {
+			s.Groups = groups
 		}
 	}
 	return s
@@ -518,7 +526,7 @@ func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 		if err := d.switchLocked(next); err != nil {
 			return reply{err: err}
 		}
-	} else if err := d.persist(State{Scenario: p.ID}); err != nil {
+	} else if err := d.persist(State{Scenario: p.ID, Selections: d.selections()}); err != nil {
 		return reply{err: cli.Errorf(cli.CodeInternal, "", "保存场景失败：%v", err)}
 	}
 	d.events.add("scenario_used", map[string]any{"scenario": p.ID})

@@ -79,6 +79,10 @@ func daemonCommands() []*command {
 			Summary: "列出订阅的节点（名字、类型、服务器，不含凭据）和策略名，用来写组的 filter 和场景的 policies", Options: []option{jsonOption}},
 		{Path: []string{"subscription", "update"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaSubscriptionUpdate, run: runSubscriptionUpdate,
 			Summary: "现在下载订阅，不写 id 就下载全部；新内容在下一次连接或切场景时生效（ARCHITECTURE.md 1.5）", Options: []option{jsonOption}},
+		{Path: []string{"group", "select"}, Args: []string{"<组>", "<成员>"}, Output: daemon.SchemaGroupSelect, run: runGroupSelect,
+			Summary: "手选 selector 组的成员：连接中不重载就切换，重载和重启后保持（ARCHITECTURE.md 3.6）", Options: []option{jsonOption}},
+		{Path: []string{"line", "test"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaLineTest, run: runLineTest,
+			Summary: "经运行中的引擎测线路的延迟；写组的 id 就测它的每个成员，不写就测所有组", Options: []option{jsonOption}},
 		{Path: []string{"tailscale", "login"}, Args: []string{"<线路>"}, Output: daemon.SchemaTailscale, run: runTailscaleLogin,
 			Summary: "登录当前连接里的一条 tailscale 线路：不带选项时给出登录链接；--auth-key 从 stdin 读 auth key，重载一次，不保存（ARCHITECTURE.md 3.5、4.7）",
 			Options: []option{jsonOption, {Name: "--auth-key", Summary: "从 stdin 读 auth key 登录"}}},
@@ -141,6 +145,14 @@ func printStatusOrRaw(w io.Writer, raw json.RawMessage) {
 		sort.Strings(ids)
 		for _, id := range ids {
 			fmt.Fprintln(w, cli.Escape(endpointLine(id, s.Endpoints[id])))
+		}
+		groups := make([]string, 0, len(s.Groups))
+		for id := range s.Groups {
+			groups = append(groups, id)
+		}
+		sort.Strings(groups)
+		for _, id := range groups {
+			fmt.Fprintln(w, cli.Escape(groupLine(id, s.Groups[id])))
 		}
 		return
 	}
@@ -694,4 +706,55 @@ func runTailscaleLogin(ctx *context_) int {
 
 func runTailscaleLogout(ctx *context_) int {
 	return call(ctx, "tailscale.logout", map[string]string{"line": ctx.args[0]}, printTailscale)
+}
+
+func runGroupSelect(ctx *context_) int {
+	return call(ctx, "group.select", map[string]string{"group": ctx.args[0], "member": ctx.args[1]}, func(w io.Writer, raw json.RawMessage) {
+		var r daemon.GroupSelection
+		if json.Unmarshal(raw, &r) == nil {
+			state := "已切换"
+			if !r.Applied {
+				state = "已记下，下次编译这个组时生效"
+			}
+			fmt.Fprintf(w, "组 %s 选 %s：%s\n", cli.Escape(r.Group), cli.Escape(r.Member), state)
+		}
+	})
+}
+
+func runLineTest(ctx *context_) int {
+	return call(ctx, "line.test", map[string]any{"ids": ctx.args}, func(w io.Writer, raw json.RawMessage) {
+		var r struct {
+			Results map[string]engine.TestOutcome `json:"results"`
+		}
+		_ = json.Unmarshal(raw, &r)
+		tags := make([]string, 0, len(r.Results))
+		for tag := range r.Results {
+			tags = append(tags, tag)
+		}
+		sort.Strings(tags)
+		for _, tag := range tags {
+			o := r.Results[tag]
+			if o.Error != "" {
+				fmt.Fprintln(w, cli.Escape(fmt.Sprintf("%s：%s", tag, o.Error)))
+			} else {
+				fmt.Fprintln(w, cli.Escape(fmt.Sprintf("%s：%d ms", tag, o.DelayMS)))
+			}
+		}
+	})
+}
+
+// groupLine is one group in the status text: the member in use, and the
+// last delay of each member that has one.
+func groupLine(id string, g engine.GroupStatus) string {
+	line := fmt.Sprintf("组 %s（%s）：用 %s", id, g.Type, g.Now)
+	var delays []string
+	for _, m := range g.Members {
+		if m.DelayMS > 0 {
+			delays = append(delays, fmt.Sprintf("%s %d ms", m.Tag, m.DelayMS))
+		}
+	}
+	if len(delays) > 0 {
+		line += "；" + strings.Join(delays, "，")
+	}
+	return line
 }
