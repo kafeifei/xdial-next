@@ -82,15 +82,23 @@ func (d *Daemon) resumeAfterFetch() {
 	cfg, scenario := d.cfg, d.state.Scenario
 	d.mu.Unlock()
 	p, err := d.prepare(cfg, scenario)
-	if err != nil {
+	if cli.Is(err, cli.CodeResourceMissing) {
 		return
 	}
+	// The cache is complete: retries start over, through the usual
+	// backoff should anything else, such as reading the physical DNS,
+	// fail for a moment.
 	d.failures = nil
 	d.gen++
 	d.mu.Lock()
 	d.awaitingCache = false
 	d.mu.Unlock()
-	if err := d.bringUp(p); err != nil {
+	if err == nil {
+		err = d.bringUp(p)
+	} else {
+		d.setStatus("failed", err.Error())
+	}
+	if err != nil {
 		d.retryLocked(err.Error())
 	}
 }

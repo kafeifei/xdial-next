@@ -882,3 +882,22 @@ func TestConnectionResumesWhenTheCacheIsFilled(t *testing.T) {
 		t.Errorf("a filled cache did not bring the connection back: %v", s)
 	}
 }
+
+func TestRedownloadMarkSurvivesAFailedDownload(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://rules.example.com/r.json"
+	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
+	path := filepath.Join(h.layout.Resources(), "rule-sets", "r."+fingerprint(url, "source")[:16]+".json")
+	h.d.mu.Lock()
+	h.d.invalid = map[string]bool{path: true}
+	h.d.mu.Unlock()
+	h.d.refreshResources() // the download fails on the test network
+	if !h.d.markedInvalid(path) {
+		t.Error("a failed download dropped the mark")
+	}
+	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"domain": ["a.example"]}]}`)
+	h.d.dropInvalid(path, func() bool { return true })
+	if h.d.markedInvalid(path) {
+		t.Error("a valid cache kept the mark")
+	}
+}

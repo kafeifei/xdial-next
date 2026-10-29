@@ -211,16 +211,22 @@ func (d *Daemon) dropInvalid(path string, valid func() bool) {
 		_ = os.Remove(path)
 		d.events.add("cache_dropped", map[string]any{"file": filepath.Base(path)})
 	}
+	d.unmark(path)
 }
 
-// markedInvalid reports and clears whether compiling found path's content
-// refused while a download held d.res.
+// markedInvalid reports whether compiling found path's content refused
+// while a download held d.res. The mark stays until the file is replaced
+// by a download or removed, so a failed download does not forget it.
 func (d *Daemon) markedInvalid(path string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	marked := d.invalid[path]
+	return d.invalid[path]
+}
+
+func (d *Daemon) unmark(path string) {
+	d.mu.Lock()
 	delete(d.invalid, path)
-	return marked
+	d.mu.Unlock()
 }
 
 // ruleSetMeta reads what the cache says about a rule set without checking
@@ -373,7 +379,14 @@ func (d *Daemon) writeRuleSet(id string, c *cachedRuleSet) error {
 	if err := enc.Encode(c); err != nil {
 		return err
 	}
-	return store.WriteFile(d.ruleSetPath(id, c.Fingerprint), data.Bytes(), 0o600)
+	path := d.ruleSetPath(id, c.Fingerprint)
+	if err := store.WriteFile(path, data.Bytes(), 0o600); err != nil {
+		return err
+	}
+	// Only checked content is written: a mark for downloading it again
+	// is done with.
+	d.unmark(path)
+	return nil
 }
 
 // checkUsable has sing-box construct a configuration routing by the rules
@@ -629,7 +642,7 @@ func (d *Daemon) resourceLoop(ctx context.Context) {
 	ticker := time.NewTicker(resourceCheckInterval)
 	defer ticker.Stop()
 	for {
-		d.refreshRuleSets()
+		d.refreshResources()
 		select {
 		case <-ctx.Done():
 			return
@@ -646,7 +659,9 @@ func (d *Daemon) wakeResources() {
 	}
 }
 
-func (d *Daemon) refreshRuleSets() {
+// refreshResources downloads remote content missing from the cache or past
+// its interval.
+func (d *Daemon) refreshResources() {
 	d.mu.Lock()
 	cfg := d.cfg
 	secrets := maps.Clone(d.secrets)
