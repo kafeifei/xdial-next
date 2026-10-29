@@ -1025,6 +1025,7 @@ func TestTailscaleLoginNeedsALineOfTheConnection(t *testing.T) {
 	h.connected()
 	h.fails("tailscale.login", map[string]any{"line": "hk"}, cli.CodeConfigConflict)
 	h.fails("tailscale.login", map[string]any{"line": "nope", "auth_key": "k"}, cli.CodeConfigConflict)
+	h.fails("tailscale.login", map[string]any{"line": "nope", "auth_key": strings.Repeat("k", MaxSecretLength+1)}, cli.CodeSecretFormat)
 	h.fails("tailscale.logout", map[string]any{"line": "hk"}, cli.CodeConfigConflict)
 }
 
