@@ -1484,3 +1484,15 @@ func TestApplyIfAbsentTakesOnlyTheFirst(t *testing.T) {
 	h.fails("config.apply", map[string]any{"content": doc, "if_absent": true}, cli.CodeConfigConflict)
 	h.ok("config.apply", map[string]any{"content": doc})
 }
+
+func TestApplyIfAbsentKeepsAFileThatDidNotLoad(t *testing.T) {
+	h := start(t, nil)
+	// A configuration on disk the daemon could not read is still there.
+	if err := os.WriteFile(h.layout.Config(), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.fails("config.apply", map[string]any{"content": doc, "if_absent": true}, cli.CodeConfigConflict)
+	if data, _ := os.ReadFile(h.layout.Config()); string(data) != "{not json" {
+		t.Errorf("the file was written over: %s", data)
+	}
+}

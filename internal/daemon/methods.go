@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"sort"
 	"time"
 
@@ -210,7 +211,8 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	if p.IfMatch != "" && p.IfMatch != revision {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "重新 xdial config export 后再改", "配置已经被改过：现在是 %s", revision)}
 	}
-	if p.IfAbsent && current != nil {
+	// A file the daemon could not load counts: it is the user's all the same.
+	if _, err := os.Lstat(d.opts.Layout.Config()); p.IfAbsent && (current != nil || !errors.Is(err, os.ErrNotExist)) {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "要整份替换就去掉这个条件", "daemon 里已经有配置（%s）", revision)}
 	}
 	scenarioGone := true

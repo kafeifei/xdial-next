@@ -26,7 +26,7 @@ const library = `{
          "anytls_sni": "", "anytls_client_fingerprint": "chrome", "anytls_alpn": ["h2"], "anytls_idle_session_check_interval": 30,
          "anytls_idle_session_timeout": 30, "anytls_min_idle_session": 0},
         {"id": "n2", "name": "Japan 02", "type": "anytls", "anytls_server": "jp.example", "anytls_port": 8443, "anytls_password": "pw-2",
-         "anytls_sni": "sni.example", "anytls_client_fingerprint": "", "anytls_alpn": []},
+         "anytls_sni": "sni.example", "anytls_client_fingerprint": "", "anytls_alpn": [], "native_options": {"tls": {}}},
         {"id": "n3", "name": "坏的", "type": "anytls", "anytls_server": "x.example", "anytls_port": 443, "anytls_password": "pw-3", "tfo": true},
         {"id": "off", "name": "关着的", "type": "anytls", "enabled": false, "anytls_server": "y.example", "anytls_port": 443, "anytls_password": "pw-4"},
         {"id": "d1", "name": "直连", "type": "direct"},
@@ -49,7 +49,7 @@ const library = `{
     }},
     {"id": "p2", "name": "公司", "profile": {
       "lines": [
-        {"id": "vpn1", "name": "Corp VPN", "type": "vpn", "vpn_server": "vpn.corp.example", "vpn_username": "me", "vpn_password": "vpn-pw"},
+        {"id": "vpn1", "name": "Corp VPN", "type": "vpn", "vpn_server": "vpn.corp.example", "vpn_username": "me", "vpn_password": "vpn-pw", "allow_insecure": true},
         {"id": "ss1", "name": "ss", "type": "shadowsocks", "ss_server": "ss.example", "ss_port": 8388, "ss_method": "aes-256-gcm", "ss_password": "ss-pw", "udp": true, "tfo": true},
         {"id": "ts1", "name": "tailnet", "type": "tailscale", "tailscale_exit_node": "exit"},
         {"id": "direct", "name": "直连", "type": "direct"}
@@ -62,7 +62,7 @@ const library = `{
     }}
   ],
   "groups": [
-    {"id": "grp-a", "name": "自动", "type": "urltest", "group_members": ["n1", "n2", "n3", "off"], "group_url": "https://cp.example/generate_204", "group_interval": "3m"},
+    {"id": "grp-a", "name": "自动", "type": "urltest", "group_members": ["n1", "n2", "off"], "group_url": "https://cp.example/generate_204", "group_interval": "3m"},
     {"id": "grp-s", "name": "Proxy", "type": "selector", "group_members": ["grp-a", "n1", "direct"], "group_default": "n1"}
   ],
   "scenarios": [
@@ -119,6 +119,9 @@ func TestConvert(t *testing.T) {
 	if hk["password"].(map[string]any)["secret"] != "line-01-password" || tls["server_name"] != "hk.example" ||
 		tls["utls"] == nil || hk["idle_session_check_interval"] != "30s" {
 		t.Errorf("anytls: %v", hk)
+	}
+	if vpn := lines["corp-vpn"]; fmt.Sprint(vpn["tls"]) != "map[insecure:true]" {
+		t.Errorf("vpn: %v", vpn)
 	}
 	groups := byID(doc["groups"])
 	auto, proxy := groups["group-1"], groups["proxy"]
@@ -179,12 +182,15 @@ func TestConvert(t *testing.T) {
 
 func TestConvertRefusesWhatItCannotCarry(t *testing.T) {
 	for name, edit := range map[string][2]string{
-		"bundle id only":  {`"path": "/Applications/WeChat.app"`, `"path": ""`},
-		"subscription":    {`"line_id": "vpn1", "subscription_id": ""`, `"line_id": "", "subscription_id": "sub"`},
-		"native options":  {`"name": "Corp VPN", "type": "vpn"`, `"name": "Corp VPN", "type": "vpn", "native_options": {"x": 1}`},
-		"unknown member":  {`"group_members": ["n1", "n2", "n3", "off"]`, `"group_members": ["nope"]`},
-		"bad match order": {`"match_order": ["c2", "c3", "c1"]`, `"match_order": ["c2", "c2"]`},
-		"bad rule":        {`"native_rule": {"ip_cidr": ["10.0.0.0/8"]}`, `"native_rule": {"ip_cidr": ["not a prefix"]}`},
+		"bundle id only":   {`"path": "/Applications/WeChat.app"`, `"path": ""`},
+		"subscription":     {`"line_id": "vpn1", "subscription_id": ""`, `"line_id": "", "subscription_id": "sub"`},
+		"native options":   {`"name": "Corp VPN", "type": "vpn"`, `"name": "Corp VPN", "type": "vpn", "native_options": {"x": 1}`},
+		"unknown member":   {`"group_members": ["n1", "n2", "off"]`, `"group_members": ["nope"]`},
+		"bad match order":  {`"match_order": ["c2", "c3", "c1"]`, `"match_order": ["c2", "c2"]`},
+		"bad rule":         {`"native_rule": {"ip_cidr": ["10.0.0.0/8"]}`, `"native_rule": {"ip_cidr": ["not a prefix"]}`},
+		"unusable member":  {`"group_members": ["n1", "n2", "off"]`, `"group_members": ["n1", "n3"]`},
+		"unusable default": {`"default_line_id": "grp-a"`, `"default_line_id": "n3"`},
+		"unusable binding": {`"rule_set_id": "corp", "line_id": "vpn1"`, `"rule_set_id": "corp", "line_id": "n3"`},
 	} {
 		changed := strings.Replace(library, edit[0], edit[1], 1)
 		if changed == library {

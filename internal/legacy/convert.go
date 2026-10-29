@@ -137,6 +137,10 @@ func (c *converter) leftOut(what, why string) {
 	c.report.LeftOut = append(c.report.LeftOut, Item{what, why})
 }
 
+// unusable marks an old line that is on but that the old App could not
+// use either: what refers to it did not connect there, so it cannot here.
+const unusable = "\x00unusable"
+
 var notID = regexp.MustCompile(`[^a-z0-9]+`)
 
 // newID makes an id the configuration allows from name, else from kind,
@@ -192,13 +196,14 @@ func (c *converter) convertLines() {
 				c.lineIDs[l.ID] = config.Direct
 				continue
 			}
-			if len(l.NativeOptions) > 0 && string(l.NativeOptions) != "null" && string(l.NativeOptions) != "{}" {
+			if !emptyJSON(l.NativeOptions) {
 				c.problem(label, "带额外的 sing-box 选项（native_options），还转不了")
 				continue
 			}
 			out, why := c.line(l, record)
 			if why != "" {
-				c.leftOut(label, why)
+				c.lineIDs[l.ID] = unusable
+				c.leftOut(label, why+"；用到它的场景和组导入不了")
 				continue
 			}
 			c.lineIDs[l.ID] = out["id"].(string)
@@ -294,6 +299,9 @@ func (c *converter) line(l Line, record Record) (out map[string]any, why string)
 		if l.VPNPassword != "" {
 			out["password"] = c.secret(id, "password", l.VPNPassword)
 		}
+		if l.Insecure {
+			out["tls"] = map[string]any{"insecure": true}
+		}
 	case "tailscale":
 		out["type"] = "tailscale"
 		if h := record.Profile.Tailscale.Hostname; h != "" && len(h) <= 63 {
@@ -345,6 +353,8 @@ func (c *converter) convertGroups() {
 				members = append(members, config.Direct)
 			case !known:
 				c.problem(label, "成员 "+m+" 不在旧库里")
+			case to == unusable:
+				c.problem(label, "有成员旧版也用不了")
 			case to != "":
 				members = append(members, to)
 			}
@@ -461,8 +471,8 @@ func (c *converter) addCondition(r RuleSet, enabled bool, profile string) {
 			case !known:
 				c.problem(label, "下载经过的线路不在旧库里")
 				return
-			case to == "":
-				c.problem(label, "下载经过的线路关着或没导入")
+			case to == "" || to == unusable:
+				c.problem(label, "下载经过的线路关着或旧版也用不了")
 				return
 			case c.lineTypes[to] == "openconnect" || c.lineTypes[to] == "tailscale":
 				// A VPN line is not up while rule sets download, 3.4.
@@ -641,6 +651,11 @@ func (c *converter) convertScenarios() {
 				bad = true
 				break
 			}
+			if line == unusable {
+				c.problem(label, "绑定的线路旧版也用不了，这个场景旧版也连不上")
+				bad = true
+				break
+			}
 			// Off rule sets and lines skip the binding, as in the old App.
 			if cond.id == "" || line == "" {
 				continue
@@ -660,6 +675,9 @@ func (c *converter) convertScenarios() {
 			final = config.Direct
 		case !ok:
 			c.problem(label, "默认线路不在旧库里")
+			continue
+		case final == unusable:
+			c.problem(label, "默认线路开着但旧版也用不了，这个场景旧版也连不上")
 			continue
 		case final == "":
 			// The old App went direct when the default line was off.
@@ -685,4 +703,35 @@ func (c *converter) target(old string) (string, bool) {
 		return config.Direct, true
 	}
 	return "", false
+}
+
+// emptyJSON reports whether raw holds nothing: null, or objects and arrays
+// with nothing in them. The old App kept an empty {"tls": {}} on lines it
+// imported with only the usual TLS fields.
+func emptyJSON(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return false
+	}
+	var empty func(any) bool
+	empty = func(v any) bool {
+		switch x := v.(type) {
+		case nil:
+			return true
+		case map[string]any:
+			for _, child := range x {
+				if !empty(child) {
+					return false
+				}
+			}
+			return true
+		case []any:
+			return len(x) == 0
+		}
+		return false
+	}
+	return empty(v)
 }

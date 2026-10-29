@@ -645,8 +645,8 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
 
     | 旧 | 新 |
     |---|---|
-    | AnyTLS、Trojan、Shadowsocks、VMess 线路 | 同类型的线路，密码或 UUID 存成凭据 `<线路 id>-password`（`-uuid`）；Trojan、Shadowsocks、VMess 的 TFO 和 UDP 开关照旧版转成 `tcp_fast_open`、`udp_over_tcp`；开了 TFO 的 AnyTLS 和缺字段的线路旧版也用不了，不导入并列出 |
-    | AnyConnect（`vpn`）线路 | `openconnect` 线路（`flavor: anyconnect`），密码存成凭据 |
+    | AnyTLS、Trojan、Shadowsocks、VMess 线路 | 同类型的线路，密码或 UUID 存成凭据 `<线路 id>-password`（`-uuid`）；Trojan、Shadowsocks、VMess 的 TFO 和 UDP 开关照旧版转成 `tcp_fast_open`、`udp_over_tcp`；开了 TFO 的 AnyTLS 和缺字段的线路旧版也用不了，不导入并列出；用到它们的场景和组旧版也连不上，算转不了 |
+    | AnyConnect（`vpn`）线路 | `openconnect` 线路（`flavor: anyconnect`），密码存成凭据，跳过证书校验照搬到 `tls.insecure` |
     | Tailscale 线路 | `tailscale` 线路，主机名取所在 Profile 的；登录状态不迁移，导入后重新登录 |
     | 直连线路 | 内置的 `direct` |
     | 关着的线路、组、规则 | 不导入；场景里用到它们的绑定跳过，和旧版一样 |
@@ -656,7 +656,7 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
     | 默认线路 | `final`；关着的和旧版一样走直连，并列出 |
 
   - **不迁移**（列在报告里，不挡导入）：按 SSID 自动切换场景（方案 3.3 不做）；`no_resolve`（新版先解析再分流，3.3）；场景图标；Tailscale 的登录状态；经 VPN 线路下载的远程规则集改成直连下载（VPN 线路下载时还没上线，3.4），直连下不了要自己把 `download_via` 改成代理线路。
-  - **转不了**（挡导入）：带额外 sing-box 选项（`native_options`）的线路、绑到订阅上的场景规则、只有 bundle id 的应用、引用不存在的东西、转出来过不了检查的。
+  - **转不了**（挡导入）：带额外 sing-box 选项（`native_options`，旧版留下的空对象不算）的线路、绑到订阅上的场景规则、只有 bundle id 的应用、引用不存在的东西、转出来过不了检查的。
 - **种子配置**：只含配置，不含凭据。
 
 ## 5. CLI 约定
