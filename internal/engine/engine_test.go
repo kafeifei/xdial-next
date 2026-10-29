@@ -666,3 +666,52 @@ func TestPlainMembersDoNotCountAgainstTheBudget(t *testing.T) {
 		t.Errorf("20,200 members written by hand hit the subscription budget: %v", err)
 	}
 }
+
+func TestAuthKeyIsCompiledOnlyWhenGiven(t *testing.T) {
+	c := loadDoc(t, `{"version": 1, "lines": [{"id": "tailnet", "type": "tailscale"}],
+		"scenarios": [{"id": "s", "final": "tailnet"}]}`)
+	plain, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.JSON), "auth_key") {
+		t.Error("an auth key appeared without a login")
+	}
+	login, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir(), TailscaleAuthKeys: map[string]string{"tailnet": "tskey-auth-xyz"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(login.JSON), `"auth_key":"tskey-auth-xyz"`) {
+		t.Errorf("the auth key is missing: %s", login.JSON)
+	}
+}
+
+func TestEngineIgnoresACommandForNoSuchLine(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, EngineCommand)
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = stdin.Write([]byte(`{"log": {"level": "error"}, "outbounds": [{"type": "direct", "tag": "direct"}],
+		"dns": {"servers": [{"type": "udp", "tag": "d", "server": "192.0.2.53"}], "final": "d"}}` + "\n"))
+	line, _ := bufio.NewReader(stdout).ReadBytes('\n')
+	if !strings.Contains(string(line), `"ready":true`) {
+		t.Fatalf("engine did not start: %q", line)
+	}
+	_, _ = stdin.Write([]byte(`{"tailscale_logout": "nope"}` + "\n"))
+	time.Sleep(200 * time.Millisecond)
+	_ = stdin.Close() // the daemon going away ends the engine
+	if err := cmd.Wait(); err != nil {
+		t.Errorf("engine exit: %v, stderr %s", err, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no tailscale line nope") {
+		t.Errorf("stderr: %s", stderr.String())
+	}
+}

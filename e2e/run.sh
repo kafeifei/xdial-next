@@ -323,6 +323,42 @@ http="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://www.apple.com 2>&1
 events="$("$xdial" logs --lines 100 --json 2>&1 | grep -c '"endpoint_state"')"
 text="$("$xdial" status 2>&1 | grep 'corp' | head -1)"
 check m3-anyconnect-status "jq -e '.ok and .result.state == \"connected\"' <<< '$out' > /dev/null && jq -e '.result.state == \"connected\" and .result.endpoints.corp.type == \"openconnect\" and .result.endpoints.corp.state != \"connected\"' <<< '$st' > /dev/null && [[ '$http' == 200 && '$events' -ge 1 ]]" "$(jq -c '.result.endpoints' <<< "$st") http=$http events=$events text=[$text]"
+
+# --- M3：Tailscale（#13）-----------------------------------------------------
+# 用用户给的临时 auth key（可复用、ephemeral、tag:xdial-e2e）让虚拟机入网：登录后到 connected，
+# 自己的 Tailnet 名字经系统 DNS 解析到自己的地址，日志里没有 key，登出后等新的登录。
+if [[ -s "$dir/ts-authkey" ]]; then
+  ts_host="xdial-e2e-$(date +%s)"
+  cat > "$work/m3ts.jsonc" << EOF
+{
+  "version": 1,
+  "lines": [{ "id": "tailnet", "type": "tailscale", "hostname": "$ts_host", "ephemeral": true }],
+  "rule_sets": [{ "id": "tailnet-names", "type": "inline", "rules": [{ "domain_suffix": ["ts.net"] }, { "ip_cidr": ["100.64.0.0/10"] }] }],
+  "scenarios": [{ "id": "ts", "rules": [{ "rule_set": "tailnet-names", "line": "tailnet" }], "final": "direct" }]
+}
+EOF
+  "$xdial" disconnect --json > /dev/null 2>&1
+  "$xdial" config apply "$work/m3ts.jsonc" --json > /dev/null 2>&1
+  "$xdial" connect --scenario ts --json > /dev/null 2>&1
+  out="$("$xdial" tailscale login tailnet --auth-key --json < "$dir/ts-authkey" 2>&1)"
+  for _ in $(seq 1 60); do
+    st="$("$xdial" status --json 2> /dev/null)"
+    jq -e '.result.endpoints.tailnet.state == "connected" and (.result.endpoints.tailnet.self | length) > 0' <<< "$st" > /dev/null 2>&1 && break
+    sleep 1
+  done
+  ts_name="$(jq -r '.result.endpoints.tailnet.dns_name // ""' <<< "$st")"
+  ts_ip="$(jq -r '[.result.endpoints.tailnet.self[] | select(startswith("100."))][0] // ""' <<< "$st")"
+  check m3-tailscale-login "jq -e '.result.endpoints.tailnet.state == \"connected\" and .result.endpoints.tailnet.tailnet != \"\"' <<< '$st' > /dev/null && [[ -n '$ts_ip' ]]" "login=$(jq -c '.ok' <<< "$out") $(jq -c '.result.endpoints.tailnet | {state, tailnet, dns_name, self, peers}' <<< "$st")"
+  dscacheutil -flushcache
+  resolved="$(dscacheutil -q host -a name "${ts_name%.}" 2> /dev/null | awk '/ip_address/{print $2; exit}')"
+  check m3-tailscale-dns '[[ -n "$ts_ip" && "$resolved" == "$ts_ip" ]]' "${ts_name%.} -> $resolved (self $ts_ip)"
+  key_leak="$(sudo grep -c -F -f "$dir/ts-authkey" "$data/private/engine.log" "$data/private/events.jsonl" 2> /dev/null | awk -F: '{s+=$2} END{print s+0}')"
+  check m3-tailscale-key-not-logged '[[ "$key_leak" == 0 ]]' "lines with the auth key: $key_leak"
+  out="$("$xdial" tailscale logout tailnet --json 2>&1)"
+  check m3-tailscale-logout "jq -e '.ok and .result.state == \"auth_required\"' <<< '$out' > /dev/null" "$(jq -c '.result | {state, auth_url: (.auth_url != null)}' <<< "$out" 2> /dev/null || echo "$out")"
+else
+  report m3-tailscale true "跳过：本机钥匙串里没有 xdial-e2e-tailscale-authkey"
+fi
 "$xdial" disconnect --json > /dev/null 2>&1
 "$xdial" config apply "$work/m3.jsonc" --json > /dev/null 2>&1
 "$xdial" connect --scenario s --json > /dev/null 2>&1

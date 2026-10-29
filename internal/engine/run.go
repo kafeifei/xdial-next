@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/kafeifei/xdial-next/internal/buildinfo"
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -30,6 +32,32 @@ type Ready struct {
 	PID     int    `json:"pid,omitempty"`
 	Version string `json:"version"`
 	Error   string `json:"error,omitempty"`
+}
+
+// Command is a line the daemon writes to the engine's stdin after the
+// configuration, ARCHITECTURE.md 6.3. The engine answers through the
+// status lines it writes anyway.
+type Command struct {
+	// TailscaleLogout logs the tailscale line with this id out; it then
+	// waits for a new login, 3.5.
+	TailscaleLogout string `json:"tailscale_logout,omitempty"`
+}
+
+func runCommand(ctx context.Context, instance *box.Box, c Command, stderr io.Writer) {
+	if c.TailscaleLogout == "" {
+		return
+	}
+	e, ok := instance.Endpoint().Get(c.TailscaleLogout)
+	ts, isTailscale := e.(adapter.TailscaleEndpoint)
+	if !ok || !isTailscale {
+		fmt.Fprintln(stderr, "engine: logout: no tailscale line", c.TailscaleLogout)
+		return
+	}
+	logoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := ts.Logout(logoutCtx); err != nil {
+		fmt.Fprintln(stderr, "engine: logout:", err)
+	}
 }
 
 // RunEngineChild reads one compiled configuration from stdin, starts it
@@ -54,10 +82,25 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	if err := decoder.Decode(&data); err != nil {
 		return fail("read", err)
 	}
+	// After the configuration, stdin carries commands, one JSON value
+	// each, until the daemon goes away, 6.3.
 	orphaned := make(chan struct{})
+	commands := make(chan Command, 8)
 	go func() {
-		_, _ = io.Copy(io.Discard, io.MultiReader(decoder.Buffered(), stdin))
-		close(orphaned)
+		defer close(orphaned)
+		in := json.NewDecoder(io.MultiReader(decoder.Buffered(), stdin))
+		for {
+			var c Command
+			if err := in.Decode(&c); err != nil {
+				_, _ = io.Copy(io.Discard, stdin)
+				return
+			}
+			select {
+			case commands <- c:
+			default:
+				fmt.Fprintln(stderr, "engine: command dropped, too many pending")
+			}
+		}
 	}()
 	ctx, cancel := context.WithCancel(Context(context.Background(), allowed...))
 	defer cancel()
@@ -81,10 +124,16 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	}
 	// After the ready line, stdout carries endpoint status, 6.3.
 	go reportEndpoints(ctx, instance, stdout)
-	select {
-	case <-signals:
-	case <-orphaned:
-		fmt.Fprintln(stderr, "engine: daemon went away, shutting down")
+	for running := true; running; {
+		select {
+		case <-signals:
+			running = false
+		case <-orphaned:
+			fmt.Fprintln(stderr, "engine: daemon went away, shutting down")
+			running = false
+		case c := <-commands:
+			runCommand(ctx, instance, c, stderr)
+		}
 	}
 	if err := instance.Close(); err != nil {
 		fmt.Fprintln(stderr, "engine: close:", err)

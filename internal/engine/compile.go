@@ -62,6 +62,9 @@ type Options struct {
 	RuleSet func(*config.Object) ([]*config.Value, bool)
 	// StateDirectory holds the tailscale state of each line, by id.
 	StateDirectory string
+	// TailscaleAuthKeys logs tailscale lines in with an auth key, by line
+	// id: given once by xdial tailscale login, never stored, 4.7.
+	TailscaleAuthKeys map[string]string
 	// TUN adds the TUN inbound, with Stack as its implementation.
 	TUN   bool
 	Stack string
@@ -238,6 +241,9 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 			}
 			if o.Type == "tailscale" {
 				v = v.With("state_directory", config.String(filepath.Join(opts.StateDirectory, o.ID)))
+				if key, ok := opts.TailscaleAuthKeys[o.ID]; ok {
+					v = v.With("auth_key", config.String(key))
+				}
 			}
 			if o.Kind == "line" && isEndpoint(o.Type) {
 				endpoints = append(endpoints, v)

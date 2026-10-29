@@ -32,6 +32,19 @@ type engineProc struct {
 
 	mu        sync.Mutex
 	endpoints map[string]engine.EndpointStatus // the last status line
+	stdinMu   sync.Mutex                       // commands, one at a time
+}
+
+// send writes one command to the engine's stdin, 6.3.
+func (p *engineProc) send(c engine.Command) error {
+	line, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	p.stdinMu.Lock()
+	defer p.stdinMu.Unlock()
+	_, err = p.stdin.Write(append(line, '\n'))
+	return err
 }
 
 // endpointStatus returns the last status the engine reported for its

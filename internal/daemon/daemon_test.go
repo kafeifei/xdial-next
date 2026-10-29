@@ -1017,3 +1017,11 @@ func TestEndpointStatusIsReported(t *testing.T) {
 		t.Error("no event for the endpoint's state")
 	}
 }
+
+func TestTailscaleLoginNeedsALineOfTheConnection(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
+	h.fails("tailscale.login", map[string]any{"line": "hk"}, cli.CodeConfigConflict)
+	h.fails("tailscale.login", map[string]any{"line": "nope", "auth_key": "k"}, cli.CodeConfigConflict)
+	h.fails("tailscale.logout", map[string]any{"line": "hk"}, cli.CodeConfigConflict)
+}

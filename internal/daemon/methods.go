@@ -38,6 +38,8 @@ func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 		"connect":             d.connect,
 		"disconnect":          d.disconnect,
 		"scenario.use":        d.scenarioUse,
+		"tailscale.login":     d.tailscaleLogin,
+		"tailscale.logout":    d.tailscaleLogout,
 		"rule_set.list":       d.ruleSetList,
 		"rule_set.update":     d.ruleSetUpdate,
 		"subscription.list":   d.subscriptionList,

@@ -163,6 +163,12 @@ func outputSchemas() map[string]any {
 				"unsupported": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "integer"}},
 			})},
 		})),
+		"xdial.tailscale/v1": envelope("xdial.tailscale/v1", func() map[string]any {
+			e := endpointSchema()
+			e["properties"].(map[string]any)["line"] = str()
+			e["required"] = []string{"line"}
+			return e
+		}()),
 		"xdial.logs/v1": envelope("xdial.logs/v1", object([]string{"time", "type"}, map[string]any{
 			"time": str(), "type": str(), "fields": map[string]any{"type": "object"},
 		})),

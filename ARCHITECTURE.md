@@ -481,6 +481,14 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
   - sing-box 不把推送的内容交给外面（只有地址、DNS 和 MTU），XDial 读不到，也就无法过滤或限额，除非给 sing-box 打补丁，这和"只用上游"冲突。3.2 的做法不变：推送规则排在用户规则之后，只能接管原本走 `final` 的流量。
   - 能看到的是结果：daemon 问 endpoint 公网地址（1.1.1.1、2606:4700:4700::1111）是不是由它接管，是的话 `full_tunnel: true`，`xdial status` 提示"原本走 final 的流量都会进这条 VPN"，并记进事件。
   - 用户在公司网络上实测之后，再决定要不要做更多（第 7 节）。
+- **Tailscale 的登录**（#13）：
+  - 每条 tailscale 线路是 tailnet 里的一台设备，登录状态在 `private/tailscale/<线路 id>/`，由 sing-box 写，不复制、不导出。
+  - 只能登录当前连接里用到的线路：登录和登出都作用在运行中的引擎上，当前场景用不到的线路没有上线，也就没有可登录的。要先切到用到它的场景。
+  - `xdial tailscale login <线路>`：线路在等登录时，返回登录链接（`auth_url`），在浏览器里打开即可；`status` 里也有。
+  - `xdial tailscale login <线路> --auth-key`：从 stdin 读 auth key，只编进这一次重载的配置（现有连接断一次），之后不保存；脱敏时和凭据同样对待。登录成功后，状态留在上面的目录里，以后的重载不再需要它。
+  - `xdial tailscale logout <线路>`：经引擎的 stdin 发登出命令（6.3），线路随后等新的登录。
+  - `exit_node` 写在配置里（线路的字段），和旧版一样随场景生效；不另设运行时切换。
+  - 构建去掉了 peerapi、C2N、SSH、Taildrop 等能力（2.6）。XDial 不提供设置 serve 的途径，serve 不会开启。
 
 ## 4. 存放与修改
 
@@ -590,7 +598,7 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
 | 代理线路的密码、uuid 等 | 凭据引用 |
 | AnyConnect 的密码、cookie、TOTP 种子 | 凭据引用。浏览器登录第一版不支持（3.5） |
 | 订阅 URL | 凭据引用。拉下来的节点进订阅缓存，不进配置 |
-| Tailscale auth key | 只在 `xdial tailscale login` 时从 stdin 读一次，用完不保存。登录要重载一次 sing-box，现有连接会断一次 |
+| Tailscale auth key | 只在 `xdial tailscale login --auth-key` 时从 stdin 读一次，编进那一次重载的配置，用完不保存（3.5）。现有连接会断一次 |
 | Tailscale 登录状态（节点密钥） | sing-box 写在 root 专属子目录里，不复制，也不导出 |
 
 ### 4.8 导入和种子配置
@@ -779,6 +787,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - `physical_dns`：物理网络的 DNS（3.3）。
   - 另有 `scenario`、`revision`、`since`、`last_error`、`engine_pid`。
   - `endpoints`：AnyConnect 和 Tailscale 线路各自的状态，见 3.5（M3）。
+- **M3 加的方法**：`tailscale.login`（`line`、`auth_key`）、`tailscale.logout`（`line`），见 3.5。
 - **新增的错误码**（退出码按 5.3）：
 
   | 错误码 | 退出码 | 说明 |
@@ -832,6 +841,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
     - `version` 是构建标识（版本加 revision）。和 daemon 不一致就不用这个引擎，例如二进制被换掉了。
     - `error` 经脱敏（4.3）后才写进 `last_error`。
     - 就绪之后，每当 AnyConnect 或 Tailscale 线路的状态变了，再写一行 `{"endpoints": {"<线路 id>": {…}}}`，最多半秒一行，见 3.5。超过 1 MiB 的行丢掉。
+  - stdin 上，配置之后可以再写命令，一行一个 JSON：现在只有 `{"tailscale_logout": "<线路 id>"}`（3.5）。引擎的回应就是之后的状态行。
   - stderr：sing-box 的日志，脱敏后写进引擎日志。
   - 以后要加的运行中交互（selector 手选、urltest 状态），也加在 stdin 和 stdout 上，仍是一行一个 JSON。
 - **TUN**：
@@ -932,8 +942,7 @@ SupplementalMatchDomains : [""]
   - VPN 推送的内容 XDial 读不到（3.5），只能看到是不是全隧道；用户在公司网络实测后再定要不要做更多；
   - AnyConnect 的浏览器登录（SAML 等），和 App 一起在 M5 做；
   - AnyConnect 线路 `failed` 之后不自动重载；
-  - `ts_omit_*` tag 加上之后运行是否正常；
-  - `exit_node` 算配置还是运行状态；
-  - 当前场景用不到的 tailscale 线路怎么登录；
+  - `ts_omit_*` tag 加上之后运行是否正常：e2e 用临时 auth key 登录后到 `connected`（3.5）；
+  - `exit_node` 算配置，当前场景用不到的 tailscale 线路不能登录（3.5）；
   - 允许清单要不要加 hysteria2 等类型。
 - **M5**：App 怎么安装和升级 daemon（6.1）；凭据发往新地方时的本机确认（4.3、6.2）。

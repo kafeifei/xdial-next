@@ -79,6 +79,11 @@ func daemonCommands() []*command {
 			Summary: "列出订阅的节点（名字、类型、服务器，不含凭据）和策略名，用来写组的 filter 和场景的 policies", Options: []option{jsonOption}},
 		{Path: []string{"subscription", "update"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaSubscriptionUpdate, run: runSubscriptionUpdate,
 			Summary: "现在下载订阅，不写 id 就下载全部；新内容在下一次连接或切场景时生效（ARCHITECTURE.md 1.5）", Options: []option{jsonOption}},
+		{Path: []string{"tailscale", "login"}, Args: []string{"<线路>"}, Output: daemon.SchemaTailscale, run: runTailscaleLogin,
+			Summary: "登录当前连接里的一条 tailscale 线路：不带选项时给出登录链接；--auth-key 从 stdin 读 auth key，重载一次，不保存（ARCHITECTURE.md 3.5、4.7）",
+			Options: []option{jsonOption, {Name: "--auth-key", Summary: "从 stdin 读 auth key 登录"}}},
+		{Path: []string{"tailscale", "logout"}, Args: []string{"<线路>"}, Output: daemon.SchemaTailscale, run: runTailscaleLogout,
+			Summary: "登出当前连接里的一条 tailscale 线路，之后它等新的登录", Options: []option{jsonOption}},
 		{Path: []string{"logs"}, Output: "xdial.logs/v1", run: runLogs,
 			Summary: "显示 daemon 的事件日志",
 			Options: []option{jsonOption,
@@ -193,20 +198,29 @@ func short(revision string) string {
 // runSecretSet reads the value from stdin, never from arguments or the
 // environment, with echo off on a terminal, and strips one trailing line
 // ending, ARCHITECTURE.md 4.6.
-func runSecretSet(ctx *context_) int {
+// readStdinValue reads a credential from stdin, without echo when stdin
+// is a terminal, and drops one trailing newline, 4.6.
+func readStdinValue(ctx *context_, prompt string) (string, error) {
 	var value []byte
 	var err error
 	if f, ok := ctx.stdin.(*os.File); ok && isTerminal(f) {
-		fmt.Fprint(ctx.out.Stderr, "输入凭据的值（不回显）：")
+		fmt.Fprint(ctx.out.Stderr, prompt)
 		value, err = readHidden(f)
 		fmt.Fprintln(ctx.out.Stderr)
 	} else {
 		value, err = io.ReadAll(io.LimitReader(ctx.stdin, 1<<20))
 	}
 	if err != nil {
-		return ctx.out.Fail(cli.Errorf(cli.CodeInputRead, "", "读 stdin 出错：%v", err))
+		return "", cli.Errorf(cli.CodeInputRead, "", "读 stdin 出错：%v", err)
 	}
-	s := strings.TrimSuffix(strings.TrimSuffix(string(value), "\n"), "\r")
+	return strings.TrimSuffix(strings.TrimSuffix(string(value), "\n"), "\r"), nil
+}
+
+func runSecretSet(ctx *context_) int {
+	s, err := readStdinValue(ctx, "输入凭据的值（不回显）：")
+	if err != nil {
+		return ctx.out.Fail(err)
+	}
 	return call(ctx, "secret.set", map[string]string{"name": ctx.args[0], "value": s}, func(w io.Writer, raw json.RawMessage) {
 		var r daemon.SecretRef
 		if json.Unmarshal(raw, &r) == nil {
@@ -653,4 +667,30 @@ func endpointLine(id string, e engine.EndpointStatus) string {
 		line += "；服务器推送了默认路由，原本走 final 的流量都会进这条 VPN"
 	}
 	return line
+}
+
+func printTailscale(w io.Writer, raw json.RawMessage) {
+	var r daemon.TailscaleResult
+	if json.Unmarshal(raw, &r) == nil {
+		fmt.Fprintln(w, cli.Escape(endpointLine(r.Line, r.EndpointStatus)))
+	}
+}
+
+func runTailscaleLogin(ctx *context_) int {
+	params := map[string]string{"line": ctx.args[0]}
+	if _, ok := ctx.options["--auth-key"]; ok {
+		key, err := readStdinValue(ctx, "输入 auth key（不回显）：")
+		if err != nil {
+			return ctx.out.Fail(err)
+		}
+		if key == "" {
+			return ctx.out.Fail(cli.Errorf(cli.CodeUsage, "从 stdin 给出 auth key", "auth key 是空的"))
+		}
+		params["auth_key"] = key
+	}
+	return call(ctx, "tailscale.login", params, printTailscale)
+}
+
+func runTailscaleLogout(ctx *context_) int {
+	return call(ctx, "tailscale.logout", map[string]string{"line": ctx.args[0]}, printTailscale)
 }
