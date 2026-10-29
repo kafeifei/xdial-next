@@ -27,6 +27,14 @@ type System interface {
 	// FlushCache drops the system's DNS cache, so answers cached before the
 	// resolver pointed into TUN do not outlive it, 3.3.
 	FlushCache() error
+	// Upstream asks a physical network DNS server for a name from the
+	// physical interface, outside TUN, 7.
+	Upstream(server netip.Addr) error
+	// Supplementals returns the resolvers the system asks for names in
+	// their domains instead of the first resolver, 6.4.
+	Supplementals() ([]sysdns.Supplemental, error)
+	// VPNs returns the names of the connected VPN services.
+	VPNs() ([]string, error)
 }
 
 // Resolver is a published resolver key.
@@ -64,6 +72,18 @@ func (macOS) Resolver(key string) (bool, string, error) {
 func (macOS) Probe() error { return sysdns.Probe(resolverAddress, time.Second) }
 
 func (macOS) FlushCache() error { return sysdns.FlushCache() }
+
+func (macOS) Upstream(server netip.Addr) error {
+	iface, err := sysdns.PrimaryInterface()
+	if err != nil {
+		return err
+	}
+	return sysdns.Upstream(server, iface, 3*time.Second)
+}
+
+func (macOS) Supplementals() ([]sysdns.Supplemental, error) { return sysdns.Supplementals() }
+
+func (macOS) VPNs() ([]string, error) { return sysdns.ConnectedVPNs() }
 
 // usablePhysical picks the servers the engine can dial directly: global
 // addresses first, link-local ones only when there is nothing else.

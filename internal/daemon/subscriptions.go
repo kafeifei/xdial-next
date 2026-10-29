@@ -428,6 +428,10 @@ func policies(c *subscription.Content) []PolicyInfo {
 }
 
 func (d *Daemon) subscriptionList(json.RawMessage) reply {
+	return reply{schema: SchemaSubscriptionList, result: map[string]any{"subscriptions": d.subscriptionInfos()}}
+}
+
+func (d *Daemon) subscriptionInfos() []SubscriptionInfo {
 	d.mu.Lock()
 	cfg := d.cfg
 	secrets := maps.Clone(d.secrets)
@@ -458,7 +462,7 @@ func (d *Daemon) subscriptionList(json.RawMessage) reply {
 			list = append(list, info)
 		}
 	}
-	return reply{schema: SchemaSubscriptionList, result: map[string]any{"subscriptions": list}}
+	return list
 }
 
 // NodeInfo is one node in subscription show: never its credentials.

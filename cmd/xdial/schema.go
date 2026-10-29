@@ -189,6 +189,12 @@ func outputSchemas() map[string]any {
 			"dns":   object([]string{"server", "reason"}, map[string]any{"server": str(), "reason": str()}),
 			"notes": strList(),
 		})),
+		"xdial.doctor/v1": envelope("xdial.doctor/v1", object([]string{"checks"}, map[string]any{
+			"checks": map[string]any{"type": "array", "items": object([]string{"name", "status", "summary"}, map[string]any{
+				"name":   map[string]any{"enum": []string{"connection", "system_dns", "split_dns", "other_vpn", "physical_dns", "endpoints", "groups", "resources", "engine"}},
+				"status": map[string]any{"enum": []string{"ok", "warn", "fail", "skip"}}, "summary": str(), "detail": strList(), "hint": str(),
+			})},
+		})),
 		"xdial.group.select/v1": envelope("xdial.group.select/v1", object([]string{"group", "member", "applied"}, map[string]any{
 			"group": str(), "member": str(), "applied": map[string]any{"type": "boolean"},
 		})),

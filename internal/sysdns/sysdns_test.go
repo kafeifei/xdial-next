@@ -69,12 +69,28 @@ func TestKeyIsChecked(t *testing.T) {
 // serveDNS answers every query with rcode over UDP and TCP on one port.
 func serveDNS(t *testing.T, rcode byte) netip.AddrPort {
 	t.Helper()
-	answer := func(q []byte) []byte {
-		r := append([]byte(nil), q...)
-		r[2] |= 0x80
-		r[3] = r[3]&0xf0 | rcode
-		return r
+	return serveDNSWith(t, func(q []byte, _ bool) []byte { return reply(q, rcode, 0, false) })
+}
+
+// reply answers q with rcode and as many A records for its name.
+func reply(q []byte, rcode byte, records int, truncated bool) []byte {
+	r := append([]byte(nil), q...)
+	r[2] |= 0x80
+	if truncated {
+		r[2] |= 0x02
 	}
+	r[3] = r[3]&0xf0 | rcode
+	binary.BigEndian.PutUint16(r[6:], uint16(records))
+	for range records {
+		// The question's name by pointer, A, IN, a TTL, 192.0.2.1.
+		r = append(r, 0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1)
+	}
+	return r
+}
+
+// serveDNSWith answers queries over UDP and TCP on loopback with answer.
+func serveDNSWith(t *testing.T, answer func(q []byte, tcp bool) []byte) netip.AddrPort {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +108,7 @@ func serveDNS(t *testing.T, rcode byte) netip.AddrPort {
 			if err != nil {
 				return
 			}
-			_, _ = pc.WriteTo(answer(buf[:n]), from)
+			_, _ = pc.WriteTo(answer(buf[:n], false), from)
 		}
 	}()
 	go func() {
@@ -105,7 +121,7 @@ func serveDNS(t *testing.T, rcode byte) netip.AddrPort {
 			if _, err := io.ReadFull(c, size[:]); err == nil {
 				q := make([]byte, binary.BigEndian.Uint16(size[:]))
 				if _, err := io.ReadFull(c, q); err == nil {
-					r := answer(q)
+					r := answer(q, true)
 					_, _ = c.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(r))), r...))
 				}
 			}
@@ -132,9 +148,38 @@ func TestProbe(t *testing.T) {
 }
 
 func TestBuildQuery(t *testing.T) {
-	q := buildQuery(0x1234, ProbeName)
-	if binary.BigEndian.Uint16(q) != 0x1234 || !strings.Contains(string(q), "\x04_dns\x08resolver\x04arpa\x00") {
+	q := buildQuery(0x1234, ProbeName, typeSVCB)
+	if binary.BigEndian.Uint16(q) != 0x1234 || !strings.HasSuffix(string(q), "\x04_dns\x08resolver\x04arpa\x00\x00\x40\x00\x01") {
 		t.Errorf("query % x", q)
+	}
+}
+
+func TestUpstream(t *testing.T) {
+	lo := ""
+	interfaces, _ := net.Interfaces()
+	for _, i := range interfaces {
+		if i.Flags&net.FlagLoopback != 0 {
+			lo = i.Name
+		}
+	}
+	for name, tc := range map[string]struct {
+		answer func(q []byte, tcp bool) []byte
+		ok     bool
+	}{
+		"an address":   {func(q []byte, _ bool) []byte { return reply(q, 0, 1, false) }, true},
+		"no address":   {func(q []byte, _ bool) []byte { return reply(q, 0, 0, false) }, false},
+		"SERVFAIL":     {func(q []byte, _ bool) []byte { return reply(q, 2, 0, false) }, false},
+		"NXDOMAIN":     {func(q []byte, _ bool) []byte { return reply(q, 3, 0, false) }, false},
+		"over TCP":     {func(q []byte, tcp bool) []byte { return reply(q, 0, map[bool]int{true: 1}[tcp], !tcp) }, true},
+		"cut, no more": {func(q []byte, tcp bool) []byte { return reply(q, 0, 0, !tcp) }, false},
+	} {
+		err := upstreamAt(serveDNSWith(t, tc.answer), lo, time.Second)
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if err := upstreamAt(netip.MustParseAddrPort("127.0.0.1:1"), "", time.Second); err == nil {
+		t.Error("no interface passed")
 	}
 }
 
@@ -225,5 +270,62 @@ func TestSplitBlocks(t *testing.T) {
 	out := dict("  A : <dictionary> {", "    B : 1", "  }") + "  No such key\n" + dict("  C : 2")
 	if blocks := splitBlocks(out); len(blocks) != 3 || blocks[1] != "" || !strings.Contains(blocks[0], "B : 1") {
 		t.Errorf("blocks %q", blocks)
+	}
+}
+
+func TestSupplementals(t *testing.T) {
+	out := `DNS configuration
+
+resolver #1
+  search domain[0] : attlocal.net
+  nameserver[0] : 192.168.1.254
+  if_index : 17 (en0)
+  flags    : Request A records
+
+resolver #2
+  domain   : corp.example
+  nameserver[0] : 10.0.0.53
+  nameserver[1] : fe80::1%utun4
+  if_index : 23 (utun4)
+  flags    : Supplemental, Request A records
+
+resolver #3
+  domain   : local
+  options  : mdns
+  timeout  : 5
+
+resolver #4
+  domain   : test
+  nameserver[0] : 127.0.0.1
+  port     : 5353
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  domain   : scoped.example
+  nameserver[0] : 192.168.1.254
+  if_index : 17 (en0)
+`
+	got := parseSupplementals(out)
+	want := []Supplemental{
+		{Domain: "corp.example", Servers: []string{"10.0.0.53", "fe80::1%utun4"}, Interface: "utun4"},
+		{Domain: "test", Servers: []string{"127.0.0.1"}, Port: 5353},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestConnectedVPNs(t *testing.T) {
+	out := `Available network connection services in the current set (*=enabled):
+* (Disconnected)   1236708A-F972-49BE-B675-F9B3FE374FB2 VPN (io.tailscale.ipn.macsys) "Tailscale"                      [VPN:io.tailscale.ipn.macsys]
+* (Connected)      2236708A-F972-49BE-B675-F9B3FE374FB2 VPN (com.cisco.anyconnect) "Corp VPN"   [VPN:com.cisco.anyconnect]
+  (Connected)      3236708A-F972-49BE-B675-F9B3FE374FB2 PPP --> L2TP "Old"   [PPP:L2TP]
+`
+	if got := parseConnectedVPNs(out); fmt.Sprint(got) != "[Corp VPN Old]" {
+		t.Errorf("got %v", got)
+	}
+	if !IsTunnel("utun4") || IsTunnel("en0") {
+		t.Error("IsTunnel")
 	}
 }

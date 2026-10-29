@@ -86,6 +86,9 @@ func daemonCommands() []*command {
 			Options: []option{jsonOption,
 				{Name: "--scenario", Value: "<id>", Summary: "按这个场景判断，不写就用当前场景"},
 				{Name: "--config", Value: "<文件>", Summary: "不经 daemon，对这份配置判断；远程规则集和订阅按不匹配算"}}},
+		{Path: []string{"doctor"}, Output: daemon.SchemaDoctor, run: runDoctor,
+			Summary: "诊断：连接、系统 DNS、按域名指定的解析器、别的 VPN、物理网络 DNS 的上游、线路、组、远程资源和引擎最近的问题（ARCHITECTURE.md 6.6）",
+			Options: []option{jsonOption}},
 		{Path: []string{"group", "select"}, Args: []string{"<组>", "<成员>"}, Output: daemon.SchemaGroupSelect, run: runGroupSelect,
 			Summary: "手选 selector 组的成员：连接中不重载就切换，重载和重启后保持（ARCHITECTURE.md 3.6）", Options: []option{jsonOption}},
 		{Path: []string{"line", "test"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaLineTest, run: runLineTest,
@@ -843,6 +846,28 @@ func printExplanation(w io.Writer, raw json.RawMessage) {
 	}
 	for _, n := range e.Notes {
 		fmt.Fprintln(w, cli.Escape("  注："+n))
+	}
+}
+
+func runDoctor(ctx *context_) int { return call(ctx, "doctor", nil, printDoctor) }
+
+var checkMarks = map[string]string{"ok": "正常", "warn": "注意", "fail": "有问题", "skip": "跳过"}
+
+func printDoctor(w io.Writer, raw json.RawMessage) {
+	var r struct {
+		Checks []daemon.Check `json:"checks"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return
+	}
+	for _, c := range r.Checks {
+		fmt.Fprintln(w, cli.Escape(fmt.Sprintf("[%s] %s：%s", checkMarks[c.Status], c.Name, c.Summary)))
+		for _, d := range c.Detail {
+			fmt.Fprintln(w, cli.Escape("    "+d))
+		}
+		if c.Hint != "" {
+			fmt.Fprintln(w, cli.Escape("    → "+c.Hint))
+		}
 	}
 }
 

@@ -940,7 +940,7 @@ SupplementalMatchDomains : [""]
   - 匹配域更具体的解析器（`/etc/resolver/<域名>`、其他 VPN 的分割 DNS），在它们的域名上优先，这些查询按它们的设置走；
   - 指定了接口的查询（scoped query），发给那个接口自己的 DNS；
   - 描述文件配置的加密 DNS、iCloud 私有中继和 XDial 谁优先，没有核实。
-  - 这些在 `xdial doctor`（M4）里检测并列出。
+  - 更具体的解析器由 `xdial doctor` 列出（6.6）；其余几类检测不到。
 - **挡住加密 DNS 的自动升级**：
   - 实测系统会查询 `_dns.resolver.arpa`，发现上游的加密 DNS（DDR）。一旦升级成 DoT 或 DoH，查询就会绕开 sing-box。所以这个名字由 sing-box 自己回 NXDOMAIN（3.3），UDP 和 TCP 都实测过。
   - Firefox 自带的 DoH 不走系统解析器。按 Mozilla 的约定，对 canary 域名 `use-application-dns.net` 回 NXDOMAIN，它就不默认开启 DoH；用户在 Firefox 里手动打开的不受影响，不在保证范围内。
@@ -954,8 +954,29 @@ SupplementalMatchDomains : [""]
   - 系统解析器的设置、撤销、补写，会话重建，第一解析器的变化；物理网络 DNS 的变化；
   - 配置 apply 与 revision；凭据的设置与删除，只记名字。
   - VPN 推送内容的变化在 M3 加（3.2）。
-- **怎么读**：`xdial logs [--follow]`（M2）经本地 API 读；`xdial doctor`（M4）汇总诊断。返回前一样要脱敏（4.3）。
+- **怎么读**：`xdial logs [--follow]`（M2）经本地 API 读；`xdial doctor` 汇总诊断（6.6）。返回前一样要脱敏（4.3）。
 - **其他日志**：引擎日志同样 10 MB 轮转，再留 3 份；引擎退出时，管道里剩下的日志也读到最后一行。launchd 接的 stdout 和 stderr 只有 panic 会写，daemon 每次启动时发现超过 1 MiB，就挪到 `.1` 重新开始。
+
+### 6.6 诊断（M4）
+
+`xdial doctor [--json]` 读运行状态、事件日志和系统，说哪里有问题。它只读，不改任何状态，也不在控制序列里，连接进行中也能答。daemon 连不上时 CLI 报 `daemon.unreachable`，不输出检查。
+
+- **每项检查**：名字、结论（`ok`、`warn`、`fail`，不适用时 `skip`）、一句话、依据（`detail`）和下一步（`hint`）。退出码是 0：有问题不算命令失败。
+- **检查项**（名字是契约的一部分）：
+
+  | 名字 | 看什么 |
+  |---|---|
+  | `connection` | 有没有配置、连接状态和失败原因；按实际状态判断，第一次连接还在试或失败了也照实报 |
+  | `system_dns` | 已连接时，系统的第一解析器是不是 XDial 的（6.4） |
+  | `split_dns` | `scutil --dns` 里按域名指定的解析器（别的 VPN 的分割 DNS、`/etc/resolver` 下的文件），mDNS 的除外；这些域名的查询不经过 XDial |
+  | `other_vpn` | `scutil --nc list` 里连着的 VPN 服务，主网络服务是不是在隧道接口上；只报系统给的名字，不识别产品 |
+  | `physical_dns` | 从物理接口直接问物理网络的第一个 DNS 服务器 `apple.com` 的 A 记录，不经过 TUN，要回 NOERROR 并且至少有一条 A 记录；UDP 的回复被截断时改用 TCP 再问。连接时的探测只证明查询进了 sing-box（第 7 节），这一项补上游 |
+  | `endpoints` | AnyConnect、Tailscale 线路的状态，以及登录或排错该做什么 |
+  | `groups` | 每个组在用的成员和测通的成员数；urltest 组一个都没测通时提示 |
+  | `resources` | 远程规则集和订阅：上次下载的错误，还没下载的 |
+  | `engine` | 最近 24 小时引擎退出、起不来、不回答、停止重连、系统解析器丢失的次数；只看内存里最近 200 条事件 |
+
+- **检测不到的**：指定接口的查询，描述文件配置的加密 DNS、iCloud 私有中继（6.4）。
 
 ## 7. 留给后面的
 
@@ -965,10 +986,10 @@ SupplementalMatchDomains : [""]
 - **已知限制**：
   - sing-box 在上游出错时不回应 DNS 查询，系统要等约 60 秒才失败（6.4 实测）。线路断了时，应用会卡在解析上。M3 再看能不能让上游回 SERVFAIL，或者用 urltest 之类的方式缓解。
   - 物理网络的 DNS 只用第一个地址（3.3）。
-  - 连接时和定期检查的探测只证明查询进了 sing-box，不检查上游：物理网络的 DNS 选错时，经它的解析会失败，`status` 仍是 `connected`。`xdial doctor`（M4）补上游检查。
+  - 连接时和定期检查的探测只证明查询进了 sing-box，不检查上游：物理网络的 DNS 选错时，经它的解析会失败，`status` 仍是 `connected`。`xdial doctor` 的 `physical_dns` 补上游检查（6.6）。
   - "上游失败时不回落到路由器"只测了上游不回应的情况；如果以后让 sing-box 回 SERVFAIL，要重测。
   - 安装时的版本核对比的是构建标识，不是文件内容。签名构建（M6）后改用签名。
-  - 和其他全局 VPN 同时连着、更具体的解析器、指定接口的查询：`xdial doctor`（M4）检测并提示。
+  - 和其他全局 VPN 同时连着、更具体的解析器：`xdial doctor` 检测并提示（6.6）；指定接口的查询检测不到。
 - **M3**：
   - 远程规则集的下载（3.4）和订阅（1.5）已实现。
   - Surge 格式的订阅；Clash 的 `GEOIP`、`RULE-SET` 等规则类型。

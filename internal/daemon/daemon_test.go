@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -25,6 +26,7 @@ import (
 	"github.com/kafeifei/xdial-next/internal/resource"
 	"github.com/kafeifei/xdial-next/internal/store"
 	"github.com/kafeifei/xdial-next/internal/subscription"
+	"github.com/kafeifei/xdial-next/internal/sysdns"
 )
 
 // The test binary doubles as the check child and the engine child.
@@ -81,6 +83,10 @@ type fakeSystem struct {
 	emptyFrom int // from this read on the physical DNS is gone; 0 never
 	resolver  *fakeResolver
 	onClose   func()
+	// What doctor reads.
+	upstream      error
+	supplementals []sysdns.Supplemental
+	vpns          []string
 }
 
 func (f *fakeSystem) PhysicalDNS() ([]netip.Addr, error) {
@@ -124,6 +130,24 @@ func (f *fakeSystem) Resolver(string) (bool, string, error) {
 		return false, "192.0.2.1", nil
 	}
 	return true, "172.19.0.2", nil
+}
+
+func (f *fakeSystem) Upstream(netip.Addr) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.upstream
+}
+
+func (f *fakeSystem) Supplementals() ([]sysdns.Supplemental, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.supplementals, nil
+}
+
+func (f *fakeSystem) VPNs() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.vpns, nil
 }
 
 func (f *fakeSystem) Probe() error      { return nil }
@@ -451,6 +475,10 @@ func TestOneIdentityConnectedAtATime(t *testing.T) {
 	b.ok("config.apply", map[string]any{"content": doc})
 	b.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
 	b.fails("connect", map[string]any{"scenario": "s"}, cli.CodeEngineBusy)
+	// A first connect that failed is reported as failed, not as never made.
+	if c := b.doctorChecks()["connection"]; c["status"] != "fail" || c["detail"] == nil {
+		t.Errorf("doctor after a failed first connect: %v", c)
+	}
 	a.ok("disconnect", nil)
 	b.ok("connect", map[string]any{"scenario": "s"})
 }
@@ -1371,6 +1399,61 @@ func TestSafeCutNeverSplitsASecret(t *testing.T) {
 	}
 	if cut := s.safeCut("short", 512); cut != 5 {
 		t.Errorf("short text cut at %d", cut)
+	}
+}
+
+// doctorChecks runs doctor and returns its checks by name.
+func (h *harness) doctorChecks() map[string]map[string]any {
+	checks := map[string]map[string]any{}
+	for _, c := range h.ok("doctor", nil)["checks"].([]any) {
+		m := c.(map[string]any)
+		checks[m["name"].(string)] = m
+	}
+	return checks
+}
+
+func TestDoctor(t *testing.T) {
+	h := start(t, nil)
+	if c := h.doctorChecks()["connection"]; c["status"] != "fail" || c["hint"] == nil {
+		t.Errorf("without a configuration: %v", c)
+	}
+	h.connected()
+	checks := h.doctorChecks()
+	for name, want := range map[string]string{"connection": "ok", "system_dns": "ok", "split_dns": "ok", "other_vpn": "ok",
+		"physical_dns": "ok", "endpoints": "skip", "groups": "skip", "resources": "skip", "engine": "ok"} {
+		if checks[name]["status"] != want {
+			t.Errorf("connected, %s: %v, want %s", name, checks[name], want)
+		}
+	}
+	if len(checks) != 9 {
+		t.Errorf("%d checks", len(checks))
+	}
+
+	h.sys.mu.Lock()
+	h.sys.supplementals = []sysdns.Supplemental{{Domain: "corp.example", Servers: []string{"10.0.0.53"}, Interface: "utun4"}}
+	h.sys.vpns = []string{"Corp VPN"}
+	h.sys.upstream = errors.New("i/o timeout")
+	h.sys.mu.Unlock()
+	h.d.events.add("engine_exited", map[string]any{"pid": 1})
+	checks = h.doctorChecks()
+	for name, want := range map[string]string{"split_dns": "warn", "other_vpn": "warn", "physical_dns": "fail", "engine": "warn"} {
+		if checks[name]["status"] != want || checks[name]["detail"] == nil {
+			t.Errorf("%s: %v, want %s", name, checks[name], want)
+		}
+	}
+	h.d.events.add("retry_stopped", map[string]any{"failures": 5})
+	if c := h.doctorChecks()["engine"]; c["status"] != "fail" {
+		t.Errorf("reconnecting stopped: %v", c)
+	}
+}
+
+func TestDoctorReportsDownloadFailures(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": remoteDoc("https://rules.example.com/r.json")})
+	h.fails("rule_set.update", nil, cli.CodeResourceDownload)
+	c := h.doctorChecks()["resources"]
+	if c["status"] != "fail" || !strings.Contains(fmt.Sprint(c["detail"]), "规则集 r 下载失败，还没有缓存") {
+		t.Errorf("resources: %v", c)
 	}
 }
 

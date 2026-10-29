@@ -1,10 +1,9 @@
-package resource
+package netbind
 
 import "syscall"
 
-// bindControl binds a socket to one interface, as sing-box does on macOS:
-// it then leaves through that interface whatever routes TUN has added.
-func bindControl(index int) func(network, address string, c syscall.RawConn) error {
+// control binds a socket to one interface.
+func control(index int) func(network, address string, c syscall.RawConn) error {
 	return func(network, _ string, c syscall.RawConn) error {
 		var err error
 		ctlErr := c.Control(func(fd uintptr) {

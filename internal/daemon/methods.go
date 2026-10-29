@@ -39,6 +39,7 @@ func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 		"disconnect":          d.disconnect,
 		"scenario.use":        d.scenarioUse,
 		"explain":             d.explain,
+		"doctor":              d.doctor,
 		"group.select":        d.groupSelect,
 		"line.test":           d.lineTest,
 		"tailscale.login":     d.tailscaleLogin,
