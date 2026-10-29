@@ -649,7 +649,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
      - 先解析出真实路径；源文件所在目录的属主是 root 或运行 sudo 的用户，别人不能写（带粘滞位的目录除外，那里别人换不掉不属于自己的文件），也没有 ACL；
      - 按 `O_NOFOLLOW` 打开源文件，对打开的这个文件核对：普通文件，属主是 root 或运行 sudo 的用户，别人不能写，没有 ACL；
      - 内容写进 `bin/` 下新建的临时文件；签名的构建在这里核对临时副本的签名（M6）。
-  3. `launchctl bootout` 已装的 daemon。它照常断开（6.3），但不改用户要的连接状态。再把临时文件 rename 成 `bin/xdial`：launchd 不会读到写了一半的文件，正在运行的二进制也不会被就地覆盖。
+  3. `launchctl bootout` 已装的 daemon。它照常断开（6.3），但不改用户要的连接状态。等到 launchd 里没有这个任务了（最多 60 秒）才往下走：任务还在时再 `bootstrap` 会报 I/O 错误。再把临时文件 rename 成 `bin/xdial`：launchd 不会读到写了一半的文件，正在运行的二进制也不会被就地覆盖。
   4. 写 plist（同样是临时文件加 rename），`launchctl bootstrap`。
   5. 等 socket 出现，核对监听者是 root（6.2），并且 `version` 报告的构建和刚装的一致。
   - 重复执行就是升级。新 daemon 起来后按 `state.json` 恢复连接（实测）。
@@ -659,7 +659,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - `RunAtLoad`、`KeepAlive`，`ProcessType` 为 `Interactive`；
   - `AbandonProcessGroup` 为 false：daemon 退出时，launchd 杀掉它进程组里剩下的进程，引擎和 scutil 会话不会留下；
   - `ThrottleInterval` 5 秒；`ExitTimeOut` 20 秒，留够断开的时间。
-- **卸载**：`sudo xdial daemon uninstall [--purge]` 先 `launchctl bootout`（daemon 断开），再删 plist、二进制和 socket 目录；另一个身份没装时，连共享目录一起删；`--purge` 连数据目录一起删。
+- **卸载**：`sudo xdial daemon uninstall [--purge]` 先 `launchctl bootout`（daemon 断开），同样等任务没了，再删 plist、二进制和 socket 目录；另一个身份没装时，连共享目录一起删；`--purge` 连数据目录一起删。
 - **和 App 的衔接**：
   - `SMAppService.daemon` 运行的是 App 包里的二进制。App 装在 `/Applications` 时 admin 用户就能改它，不满足上面"只有 root 能改"。两种注册方式也不能共用同一个 launchd label。
   - M2 只交付 CLI 安装。App 怎么安装和升级 daemon（例如调用同一个 install 流程），在 M5 定。
