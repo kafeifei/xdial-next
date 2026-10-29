@@ -199,8 +199,11 @@ cat > "$work/ts.json" << EOF
   "route": { "default_interface": "$iface", "default_domain_resolver": "d" }
 }
 EOF
-"$dir/testserver" "$work/ts.json" > "$work/ts.out" 2>&1 &
+# 共享目录不能直接执行，和 xdial 一样先拷到工作目录。
+cp "$dir/testserver" "$work/testserver"
+"$work/testserver" "$work/ts.json" > "$work/ts.out" 2>&1 &
 tspid=$!
+sleep 1
 cat > "$work/m3.jsonc" << EOF
 {
   "version": 1,
@@ -227,7 +230,7 @@ printf 'e2e-ss-pass\n' | "$xdial" secret set ss --json > /dev/null 2>&1
 before_gh="$(sudo grep -c raw.githubusercontent.com "$data/private/engine.log" 2> /dev/null)"
 # 连着场景 s 时 apply：两个规则集都没缓存，重载前先下载，一个经 direct、一个经代理线路。
 out="$("$xdial" config apply "$work/m3.jsonc" --json 2>&1)"
-check m3-apply-downloads "jq -e '.ok and .result.applied and .result.reloaded' <<< '$out' > /dev/null" "iface=$iface lan=$lan $out"
+check m3-apply-downloads "jq -e '.ok and .result.applied and .result.reloaded' <<< '$out' > /dev/null" "iface=$iface lan=$lan testserver=[$(head -c 300 "$work/ts.out" | tr '\n' ';')] $out"
 list="$("$xdial" rule-set list --json 2>&1)"
 check m3-rule-set-list "jq -e '[.result.rule_sets[] | select(.id == \"apple\" or .id == \"cn-ip\") | select(.cached and .rules > 0)] | length == 2' <<< '$list' > /dev/null" "$(jq -c '[.result.rule_sets[] | {id, cached, rules, last_error: .last_error.code}]' <<< "$list")"
 via="$(grep -c raw.githubusercontent.com "$work/ts.log" 2> /dev/null)"

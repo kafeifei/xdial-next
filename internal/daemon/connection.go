@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/kafeifei/xdial-next/internal/cli"
@@ -98,6 +101,29 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	// quietly send its traffic elsewhere, 3.4.
 	if len(result.MissingRuleSets) > 0 {
 		return nil, cli.Errorf(cli.CodeResourceMissing, "", "场景 %s 用到的远程规则集还没下载：%v", scenario, result.MissingRuleSets)
+	}
+	// Downloaded content joined the configuration only now: check the
+	// whole of it before anything running is replaced. The check sees
+	// placeholders for secrets, as every check does, 4.5.
+	if len(result.JSON) > engine.MaxConfigSize {
+		return nil, cli.Errorf(cli.CodeResourceTooLarge, "少用几个大的远程规则集", "场景 %s 编译出的配置超过 %d 字节", scenario, engine.MaxConfigSize)
+	}
+	checked, err := engine.Compile(cfg, engine.Options{
+		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
+		PhysicalDNS: physical[0],
+		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
+			rules, ok := ruleSets[o.ID]
+			return rules, ok
+		},
+	})
+	if err != nil {
+		return nil, cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
+	}
+	if err := engine.Check(context.Background(), d.opts.Executable, checked.JSON); err != nil {
+		if errors.Is(err, engine.ErrCheckUnavailable) {
+			return nil, cli.Errorf(cli.CodeInternal, "", "%v", err)
+		}
+		return nil, cli.Errorf(cli.CodeEngineFailed, "", "场景 %s 的配置 sing-box 不接受：%s", scenario, truncate(err.Error(), 300))
 	}
 	if err := checkSecrets(cfg, secrets, result.Secrets); err != nil {
 		return nil, err
@@ -453,4 +479,11 @@ func (d *Daemon) reconcile() {
 		return
 	}
 	c.probeMiss = 0
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n], "") + "…"
 }

@@ -51,7 +51,7 @@ func CheckInProcess(compiled []byte) error {
 // RunCheckChild is the body of the hidden subcommand: it reads a compiled
 // configuration from stdin and prints one JSON report.
 func RunCheckChild(stdin io.Reader, stdout io.Writer) int {
-	data, err := io.ReadAll(io.LimitReader(stdin, 64<<20))
+	data, err := io.ReadAll(io.LimitReader(stdin, MaxConfigSize))
 	r := report{OK: true}
 	if err == nil {
 		err = CheckInProcess(data)
@@ -78,11 +78,19 @@ func Check(ctx context.Context, executable string, compiled []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, executable, CheckCommand)
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	return CheckWith(ctx, cmd, compiled)
+}
+
+// CheckWith is Check with a command the caller prepared, for example to run
+// the child as another user. cmd must run CheckCommand and be bound to ctx.
+func CheckWith(ctx context.Context, cmd *exec.Cmd, compiled []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
 	cmd.Stdin = bytes.NewReader(compiled)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &limitedWriter{w: &stdout, n: maxReport}
 	cmd.Stderr = &limitedWriter{w: &stderr, n: 4096}
-	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("%w：%v", ErrCheckUnavailable, err)

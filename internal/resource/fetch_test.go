@@ -110,6 +110,9 @@ func TestFetch(t *testing.T) {
 			http.Redirect(w, r, "/ok", http.StatusFound)
 		case "/loop":
 			http.Redirect(w, r, "/loop", http.StatusFound)
+		case "/bad-location":
+			w.Header().Set("Location", "https://example.com/token-in-location/%zz")
+			w.WriteHeader(http.StatusFound)
 		default:
 			http.Error(w, "remote error page with secrets", http.StatusNotFound)
 		}
@@ -126,14 +129,15 @@ func TestFetch(t *testing.T) {
 		t.Errorf("https redirect: %q %+v", body, res)
 	}
 	for path, code := range map[string]string{
-		"/big":     cli.CodeResourceTooLarge,
-		"/to-http": cli.CodeResourceBlocked,
-		"/loop":    cli.CodeResourceDownload,
-		"/missing": cli.CodeResourceDownload,
+		"/big":          cli.CodeResourceTooLarge,
+		"/to-http":      cli.CodeResourceBlocked,
+		"/loop":         cli.CodeResourceDownload,
+		"/missing":      cli.CodeResourceDownload,
+		"/bad-location": cli.CodeResourceDownload,
 	} {
 		if _, res := get(t, FetchRequest{URL: srv.URL + path}); res.Code != code {
 			t.Errorf("%s: want %s, got %+v", path, code, res)
-		} else if strings.Contains(res.Message, "secrets") || strings.Contains(res.Message, path) {
+		} else if strings.Contains(res.Message, "secrets") || strings.Contains(res.Message, path) || strings.Contains(res.Message, "token") || strings.Contains(res.Message, "127.0.0.1") {
 			t.Errorf("%s: the message echoes remote content or the url: %s", path, res.Message)
 		}
 	}

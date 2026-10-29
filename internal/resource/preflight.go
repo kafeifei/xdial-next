@@ -20,9 +20,19 @@ const (
 	maxDomainLength  = 512      // the longest key of a trie, also its depth
 	maxPrefixes      = 1 << 20  // CIDR prefixes the IP sets expand to
 	maxLogicalDepth  = 4        // as headless rules, internal/config
-	maxBinaryRules   = 20000    // as rules of a rule set, internal/config
+	maxBinaryRules   = 20000    // top-level rules, as a rule set, internal/config
+	maxLogicalRules  = 64       // rules inside one logical rule, as internal/config
+	maxRuleNodes     = 50000    // rules at every level together
+	maxListItems     = 300_000  // one list, as a downloaded source rule set
+	maxTotalItems    = 2 << 20  // every list together
 	maxBinaryVersion = 5        // sing-box's RuleSetVersionCurrent
 )
+
+// sing-box allocates a slice of every declared length before reading its
+// elements: a logical rule's rules, a list's strings, an IP set's ranges.
+// Fitting in what is left of the file is not enough, because an element
+// can take a few bytes in the file and a kilobyte in memory; every count is
+// also held to the caps above, which keep decoding within some hundred MiB.
 
 var srsMagic = []byte("SRS")
 
@@ -109,9 +119,25 @@ func Preflight(data []byte) error {
 type preflight struct {
 	b        []byte
 	err      error
+	rules    int
+	items    int
 	domains  int
 	expanded int
 	prefixes int
+}
+
+// list reads the count of a list and holds it to the caps.
+func (p *preflight) list(size int) uint64 {
+	n := p.count(size)
+	if p.err == nil && n > maxListItems {
+		p.limit("一个列表超过 %d 项", maxListItems)
+		return 0
+	}
+	if p.items += int(n); p.err == nil && p.items > maxTotalItems {
+		p.limit("列表合计超过 %d 项", maxTotalItems)
+		return 0
+	}
+	return n
 }
 
 func (p *preflight) fail(format string, args ...any) {
@@ -177,6 +203,10 @@ func (p *preflight) skip(n uint64) []byte {
 }
 
 func (p *preflight) rule(depth int) {
+	if p.rules++; p.rules > maxRuleNodes {
+		p.limit("各层规则合计超过 %d 条", maxRuleNodes)
+		return
+	}
 	switch p.byte() {
 	case 0:
 		p.defaultRule()
@@ -189,6 +219,10 @@ func (p *preflight) rule(depth int) {
 			p.fail("逻辑规则的模式 %d 不认识", mode)
 		}
 		n := p.count(3)
+		if p.err == nil && n > maxLogicalRules {
+			p.limit("一条逻辑规则里超过 %d 条规则", maxLogicalRules)
+			return
+		}
 		for i := uint64(0); i < n && p.err == nil; i++ {
 			p.rule(depth + 1)
 		}
@@ -202,12 +236,12 @@ func (p *preflight) defaultRule() {
 	for p.err == nil {
 		switch item := p.byte(); item {
 		case itemQueryType, itemPort, itemSourcePort:
-			n := p.count(2)
+			n := p.list(2)
 			p.skip(2 * n)
 		case itemNetwork, itemDomainKeyword, itemDomainRegex, itemSourcePortRange, itemPortRange,
 			itemProcessName, itemProcessPath, itemProcessPathRegex, itemPackageName, itemPackageNameRegex,
 			itemWIFISSID, itemWIFIBSSID:
-			n := p.count(1)
+			n := p.list(1)
 			for i := uint64(0); i < n && p.err == nil; i++ {
 				p.skip(p.uvarint())
 			}
@@ -220,10 +254,10 @@ func (p *preflight) defaultRule() {
 				p.err = ErrAdGuard
 			}
 		case itemNetworkType:
-			p.skip(p.count(1))
+			p.skip(p.list(1))
 		case itemNetworkIsExpensive, itemNetworkIsConstrained:
 		case itemNetworkInterfaceAddress:
-			n := p.count(2)
+			n := p.list(2)
 			for i := uint64(0); i < n && p.err == nil; i++ {
 				p.byte()
 				p.prefixList()
@@ -242,7 +276,7 @@ func (p *preflight) defaultRule() {
 }
 
 func (p *preflight) prefixList() {
-	n := p.count(2)
+	n := p.list(2)
 	for i := uint64(0); i < n && p.err == nil; i++ {
 		size := p.uvarint()
 		if p.err == nil && size != 4 && size != 16 {

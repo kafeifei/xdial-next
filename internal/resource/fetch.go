@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 
@@ -63,6 +64,10 @@ type FetchResult struct {
 	Size         int64  `json:"size"`
 }
 
+// privileged reports whether this process runs as root, which the daemon
+// never starts a download or decode child as.
+func privileged() bool { return os.Geteuid() == 0 || os.Getuid() == 0 }
+
 // blocked is a download the rules of 3.4 refuse, as opposed to one that
 // failed.
 type blocked struct{ reason string }
@@ -72,6 +77,9 @@ func (b *blocked) Error() string { return b.reason }
 // RunFetchChild reads one FetchRequest from stdin, downloads it and writes
 // a FetchResult line and the body to stdout.
 func RunFetchChild(stdin io.Reader, stdout io.Writer) int {
+	if privileged() {
+		return writeResult(stdout, FetchResult{Code: cli.CodeInternal, Message: "下载子进程不能以 root 运行"}, nil)
+	}
 	var req FetchRequest
 	if err := json.NewDecoder(io.LimitReader(stdin, 16<<20)).Decode(&req); err != nil {
 		return writeResult(stdout, FetchResult{Code: cli.CodeInternal, Message: "读不到下载请求"}, nil)
@@ -126,7 +134,7 @@ func fetch(ctx context.Context, req FetchRequest) ([]byte, FetchResult) {
 				return &blocked{"重定向到了不是 https 的地址"}
 			}
 			if len(via) >= maxRedirects {
-				return fmt.Errorf("重定向超过 %d 次", maxRedirects)
+				return &tooManyRedirects{}
 			}
 			return nil
 		},
@@ -168,25 +176,46 @@ func fetch(ctx context.Context, req FetchRequest) ([]byte, FetchResult) {
 	return body, result
 }
 
-// failure describes a failed request without its URL, which may be a
-// secret such as a subscription address.
+// failure describes a failed request in words of XDial's own: the
+// underlying error text can carry the URL, a redirect's Location or a
+// server's name, any of which may hold a subscription token.
 func failure(err error) FetchResult {
 	var b *blocked
 	if errors.As(err, &b) {
 		return FetchResult{Code: cli.CodeResourceBlocked, Message: b.reason}
 	}
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		err = ue.Err
-		if errors.As(err, &b) {
-			return FetchResult{Code: cli.CodeResourceBlocked, Message: b.reason}
-		}
+	var (
+		netErr     net.Error
+		dnsErr     *net.DNSError
+		opErr      *net.OpError
+		certErr    *tls.CertificateVerificationError
+		hostErr    x509.HostnameError
+		authErr    x509.UnknownAuthorityError
+		invalidErr x509.CertificateInvalidError
+		recordErr  tls.RecordHeaderError
+		redirects  *tooManyRedirects
+	)
+	message := "下载失败"
+	switch {
+	case errors.As(err, &redirects):
+		message = fmt.Sprintf("重定向超过 %d 次", maxRedirects)
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		message = "下载超时"
+	case errors.As(err, &dnsErr):
+		message = "解析服务器的域名失败"
+	case errors.As(err, &certErr), errors.As(err, &hostErr), errors.As(err, &authErr), errors.As(err, &invalidErr):
+		message = "服务器的证书不受信任"
+	case errors.As(err, &recordErr):
+		message = "TLS 握手失败"
+	case errors.As(err, &opErr) && opErr.Op == "dial":
+		message = "连不上服务器"
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return FetchResult{Code: cli.CodeResourceDownload, Message: "下载超时"}
-	}
-	return FetchResult{Code: cli.CodeResourceDownload, Message: err.Error()}
+	return FetchResult{Code: cli.CodeResourceDownload, Message: message}
 }
+
+type tooManyRedirects struct{}
+
+func (*tooManyRedirects) Error() string { return "too many redirects" }
 
 type dialFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
@@ -201,16 +230,16 @@ func dialerFor(ctx context.Context, req FetchRequest) (dialFunc, func(), error) 
 	boxCtx := engine.Context(ctx)
 	var opts option.Options
 	if err := opts.UnmarshalJSONContext(boxCtx, req.Options); err != nil {
-		return nil, nil, fmt.Errorf("下载线路的配置不对：%w", err)
+		return nil, nil, errors.New("下载线路的配置不对")
 	}
 	opts.Log = &option.LogOptions{Disabled: true}
 	instance, err := box.New(box.Options{Context: boxCtx, Options: opts})
 	if err != nil {
-		return nil, nil, fmt.Errorf("下载线路起不来：%w", err)
+		return nil, nil, errors.New("下载线路起不来")
 	}
 	if err := instance.Start(); err != nil {
 		_ = instance.Close()
-		return nil, nil, fmt.Errorf("下载线路起不来：%w", err)
+		return nil, nil, errors.New("下载线路起不来")
 	}
 	out, ok := instance.Outbound().Outbound(req.Via)
 	if !ok {
@@ -253,9 +282,9 @@ func directDialer(iface, dns string) (dialFunc, error) {
 		if ip, err := netip.ParseAddr(host); err == nil {
 			candidates = []netip.Addr{ip}
 		} else if candidates, err = resolver.LookupNetIP(ctx, "ip", host); err != nil {
-			return nil, fmt.Errorf("解析 %s 失败", host)
+			return nil, err
 		}
-		var lastErr error = &blocked{fmt.Sprintf("%s 解析到的地址都在本机或内网，不允许下载", host)}
+		var lastErr error = &blocked{"服务器的地址都在本机或内网，不允许下载"}
 		for _, ip := range candidates {
 			if !allowed(ip) {
 				continue

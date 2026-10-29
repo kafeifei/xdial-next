@@ -265,3 +265,33 @@ func TestCheckRuleSetSource(t *testing.T) {
 		t.Error("a list over the cap was accepted")
 	}
 }
+
+func TestDownloadViaMustNotReachDirectThroughAGroup(t *testing.T) {
+	doc := `{"version": 1,
+		"lines": [{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "hk"}}],
+		"groups": [{"id": "g", "type": "selector", "outbounds": ["hk", "direct"]}],
+		"rule_sets": [{"id": "r", "type": "remote", "format": "source", "url": "https://rules.example/r.json", "download_via": "g"}],
+		"scenarios": [{"id": "s", "final": "direct"}]}`
+	_, problems, _ := Load([]byte(doc))
+	if len(problems) != 1 || problems[0].Path != "rule_sets[0].download_via" || problems[0].Code != cli.CodeConfigReference {
+		t.Errorf("want one problem on download_via, got %+v", problems)
+	}
+	if _, problems, _ := Load([]byte(strings.Replace(doc, `["hk", "direct"]`, `["hk"]`, 1))); len(problems) != 0 {
+		t.Errorf("a group of proxies only: %+v", problems)
+	}
+}
+
+func TestRuleSetProblemsDoNotEchoRemoteKeys(t *testing.T) {
+	_, problems := CheckRuleSetSource([]byte(`{"version": 1, "rules": [{"domain": ["a"], "token_s3cret": 1, "domain[0]x": 2}]}`))
+	if len(problems) == 0 {
+		t.Fatal("unknown keys were accepted")
+	}
+	for _, p := range problems {
+		if strings.Contains(p.Path, "s3cret") || strings.Contains(p.Path, "]x") {
+			t.Errorf("path echoes a remote key: %q", p.Path)
+		}
+	}
+	if _, problems := CheckRuleSetSource([]byte(`{"version": 1, "rules": []}`)); len(problems) == 0 {
+		t.Error("an empty rule set was accepted")
+	}
+}

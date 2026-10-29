@@ -62,9 +62,15 @@ type resourceAttempt struct {
 	err *cli.Error
 }
 
-func (d *Daemon) ruleSetPath(id string) string {
-	return filepath.Join(d.opts.Layout.Resources(), "rule-sets", id+".json")
+// ruleSetPath is where the content of rule set id downloaded from the url
+// and format of fp is kept. One file per fingerprint: a download for a
+// configuration that has since changed the url cannot overwrite the cache
+// of the new one.
+func (d *Daemon) ruleSetPath(id, fp string) string {
+	return filepath.Join(d.ruleSetDir(), id+"."+fp[:16]+".json")
 }
+
+func (d *Daemon) ruleSetDir() string { return filepath.Join(d.opts.Layout.Resources(), "rule-sets") }
 
 func fingerprint(url, format string) string {
 	sum := sha256.Sum256([]byte(format + "\n" + url))
@@ -89,8 +95,9 @@ func remoteURL(cfg *config.Config, o *config.Object, secrets map[string]Secret) 
 // cachedRules reads the cache of a remote rule set and returns its rules,
 // or false when there is none for this url and format.
 func (d *Daemon) cachedRules(o *config.Object, url string) (*cachedRuleSet, []*config.Value, bool) {
+	fp := fingerprint(url, o.Value.Get("format").String)
 	var c cachedRuleSet
-	if err := store.ReadJSON(d.ruleSetPath(o.ID), &c); err != nil || c.Fingerprint != fingerprint(url, o.Value.Get("format").String) {
+	if err := store.ReadJSON(d.ruleSetPath(o.ID, fp), &c); err != nil || c.Fingerprint != fp {
 		return nil, nil, false
 	}
 	rules, problems := config.CheckRuleSetSource(c.Source)
@@ -203,9 +210,22 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 				return err
 			}
 		}
+		// Compact, so the size checked is the size kept and an unchanged
+		// download compares equal to what is cached.
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, source); err != nil {
+			return invalidContent(o, []cli.Problem{{Code: cli.CodeConfigSyntax}})
+		}
+		source = compact.Bytes()
 		rules, problems := config.CheckRuleSetSource(source)
 		if len(problems) > 0 {
 			return invalidContent(o, problems)
+		}
+		// What passes XDial's checks must also be what sing-box accepts, or
+		// a download could replace a good cache with one no connection
+		// can start from.
+		if err := d.checkUsable(source); err != nil {
+			return err
 		}
 		entry := &cachedRuleSet{
 			Fingerprint: fingerprint(url, format), FetchedAt: now, ChangedAt: now,
@@ -247,11 +267,75 @@ func invalidContent(o *config.Object, problems []cli.Problem) error {
 }
 
 func (d *Daemon) writeRuleSet(id string, c *cachedRuleSet) error {
-	dir := filepath.Dir(d.ruleSetPath(id))
-	if err := store.EnsureDir(dir, 0o700); err != nil {
+	if err := store.EnsureDir(d.ruleSetDir(), 0o700); err != nil {
 		return err
 	}
-	return store.WriteJSON(d.ruleSetPath(id), c, 0o600)
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return store.WriteFile(d.ruleSetPath(id, c.Fingerprint), data, 0o600)
+}
+
+// checkUsable has sing-box construct a configuration routing by the rules
+// of source, in a check child running as nobody.
+func (d *Daemon) checkUsable(source []byte) error {
+	var doc struct {
+		Rules json.RawMessage `json:"rules"`
+	}
+	if err := json.Unmarshal(source, &doc); err != nil {
+		return cli.Errorf(cli.CodeResourceInvalid, "", "规则集读不出来")
+	}
+	compiled, err := json.Marshal(map[string]any{
+		"log":       map[string]any{"disabled": true},
+		"outbounds": []any{map[string]any{"type": "direct", "tag": config.Direct}},
+		"route": map[string]any{
+			"rule_set": []any{map[string]any{"type": "inline", "tag": "r", "rules": doc.Rules}},
+			"rules":    []any{map[string]any{"rule_set": []string{"r"}, "action": "route", "outbound": config.Direct}},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), decodeTimeout)
+	defer cancel()
+	cmd, err := d.child(ctx, engine.CheckCommand)
+	if err != nil {
+		return err
+	}
+	if err := engine.CheckWith(ctx, cmd, compiled); err != nil {
+		if errors.Is(err, engine.ErrCheckUnavailable) {
+			return cli.Errorf(cli.CodeInternal, "", "%v", err)
+		}
+		return cli.Errorf(cli.CodeResourceInvalid, "", "sing-box 不接受下载的规则集")
+	}
+	return nil
+}
+
+// collectRuleSets removes cached files no rule set of cfg uses any more,
+// once they are an hour old: a download for a configuration being applied
+// may not be in cfg yet. Callers hold d.res.
+func (d *Daemon) collectRuleSets(cfg *config.Config, secrets map[string]Secret) {
+	keep := map[string]bool{}
+	for _, o := range cfg.RuleSets {
+		if o.Type != "remote" {
+			continue
+		}
+		if url, err := remoteURL(cfg, o, secrets); err == nil {
+			keep[filepath.Base(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)))] = true
+		}
+	}
+	entries, err := os.ReadDir(d.ruleSetDir())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || keep[e.Name()] || time.Since(info.ModTime()) < time.Hour {
+			continue
+		}
+		_ = os.Remove(filepath.Join(d.ruleSetDir(), e.Name()))
+	}
 }
 
 // fetchRequest is the request for one download: the physical interface
@@ -286,18 +370,24 @@ func (d *Daemon) fetchRequest(cfg *config.Config, o *config.Object, url string, 
 	return req, nil
 }
 
-// child starts a hidden subcommand of the daemon's own binary as nobody,
-// with nothing inherited but its pipes.
-func (d *Daemon) child(ctx context.Context, sub string) *exec.Cmd {
+// child prepares a hidden subcommand of the daemon's own binary, run as
+// nobody with no supplementary groups and nothing inherited but its pipes.
+// A root daemon that cannot find nobody runs no child at all; the child
+// checks again that it is not root.
+func (d *Daemon) child(ctx context.Context, sub string) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, d.opts.Executable, sub)
 	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
 	cmd.Dir = "/"
 	if os.Geteuid() == 0 {
-		if uid, gid, ok := nobody(); ok {
-			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid, NoSetGroups: true}}
+		uid, gid, ok := nobody()
+		if !ok {
+			return nil, cli.Errorf(cli.CodeInternal, "", "找不到 nobody 账户，下载和转换不能降权运行")
 		}
+		// An empty group list with NoSetGroups unset clears the
+		// supplementary groups.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{}}}
 	}
-	return cmd
+	return cmd, nil
 }
 
 // nobody is the unprivileged account downloads and decoding run as. macOS
@@ -323,7 +413,10 @@ func (d *Daemon) fetch(req resource.FetchRequest) (resource.FetchResult, []byte,
 	if err != nil {
 		return resource.FetchResult{}, nil, err
 	}
-	cmd := d.child(ctx, resource.FetchCommand)
+	cmd, err := d.child(ctx, resource.FetchCommand)
+	if err != nil {
+		return resource.FetchResult{}, nil, err
+	}
 	cmd.Stdin = bytes.NewReader(in)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -371,7 +464,10 @@ func (d *Daemon) fetch(req resource.FetchRequest) (resource.FetchResult, []byte,
 func (d *Daemon) decode(binary []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), decodeTimeout)
 	defer cancel()
-	cmd := d.child(ctx, resource.DecodeCommand)
+	cmd, err := d.child(ctx, resource.DecodeCommand)
+	if err != nil {
+		return nil, err
+	}
 	cmd.Stdin = bytes.NewReader(binary)
 	var stdout bytes.Buffer
 	cmd.Stdout = &limitedWriter{w: &stdout, n: config.RuleSetMaxSize}
@@ -460,6 +556,9 @@ func (d *Daemon) refreshRuleSets() {
 		}
 		_, _ = d.downloadRuleSet(cfg, o, secrets)
 	}
+	d.res.Lock()
+	d.collectRuleSets(cfg, secrets)
+	d.res.Unlock()
 }
 
 // RuleSetInfo is one rule set in rule-set list.

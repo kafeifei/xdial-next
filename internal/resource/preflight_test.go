@@ -251,3 +251,33 @@ func TestPreflightBoundsExpansion(t *testing.T) {
 		t.Errorf("want a limit error, got %v", err)
 	}
 }
+
+func TestPreflightBoundsDeclaredCounts(t *testing.T) {
+	// A logical rule declaring millions of minimal rules fits the bytes but
+	// would make sing-box allocate gigabytes before reading them.
+	many := uint64(10_000_000)
+	logical := append(append(uv(1), 1, 0), uv(many)...)
+	for range many / 1000 {
+		logical = append(logical, bytes.Repeat([]byte{0, itemFinal, 0}, 1000)...)
+	}
+	if err := Preflight(raw(logical)); !IsLimit(err) {
+		t.Errorf("logical rule with %d rules: want a limit error, got %v", many, err)
+	}
+	// Rules at every level together.
+	inner := append(append([]byte{1, 1}, uv(maxLogicalRules)...), bytes.Repeat([]byte{0, itemFinal, 0}, maxLogicalRules)...)
+	inner = append(inner, 0)
+	n := maxRuleNodes/(maxLogicalRules+1) + 1
+	b := uv(uint64(n))
+	for range n {
+		b = append(b, inner...)
+	}
+	if err := Preflight(raw(b)); !IsLimit(err) {
+		t.Errorf("%d rules in all: want a limit error, got %v", n*(maxLogicalRules+1), err)
+	}
+	// A list of minimal strings.
+	list := append(append(uv(1), 0, itemDomainKeyword), uv(maxListItems+1)...)
+	list = append(list, make([]byte, maxListItems+1)...)
+	if err := Preflight(raw(append(list, itemFinal, 0))); !IsLimit(err) {
+		t.Errorf("long list: want a limit error, got %v", err)
+	}
+}

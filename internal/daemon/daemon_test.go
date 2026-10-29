@@ -750,11 +750,12 @@ func loopback() string {
 // url would have.
 func (h *harness) seedRuleSet(id, url, source string) {
 	h.t.Helper()
-	path := filepath.Join(h.layout.Resources(), "rule-sets", id+".json")
+	fp := fingerprint(url, "source")
+	path := filepath.Join(h.layout.Resources(), "rule-sets", id+"."+fp[:16]+".json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		h.t.Fatal(err)
 	}
-	entry := cachedRuleSet{Fingerprint: fingerprint(url, "source"), FetchedAt: time.Now(), ChangedAt: time.Now(), Source: json.RawMessage(source)}
+	entry := cachedRuleSet{Fingerprint: fp, FetchedAt: time.Now(), ChangedAt: time.Now(), Source: json.RawMessage(source)}
 	if err := store.WriteJSON(path, entry, 0o600); err != nil {
 		h.t.Fatal(err)
 	}

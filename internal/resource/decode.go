@@ -22,6 +22,10 @@ const MaxBinarySize = 16 << 20
 // already passed through Preflight, and writes it in source format to
 // stdout. It exits non-zero, with the reason on stderr, if it cannot.
 func RunDecodeChild(stdin io.Reader, stdout, stderr io.Writer) int {
+	if privileged() {
+		fmt.Fprintln(stderr, "decode: refusing to run as root")
+		return 1
+	}
 	data, err := io.ReadAll(io.LimitReader(stdin, MaxBinarySize+1))
 	if err != nil || len(data) > MaxBinarySize {
 		fmt.Fprintln(stderr, "decode: input too large or unreadable")
