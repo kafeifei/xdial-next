@@ -1320,3 +1320,24 @@ func TestSafeCutNeverSplitsASecret(t *testing.T) {
 		t.Errorf("short text cut at %d", cut)
 	}
 }
+
+func TestExplainPointsOutContentNewerThanTheEngine(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://rules.example.com/r.json"
+	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
+	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	h.seedRuleSet("r", url, `{"version": 3, "rules": [{"domain_suffix": ["example.com"]}]}`)
+	h.ok("connect", map[string]any{"scenario": "s"})
+	e := h.ok("explain", map[string]any{"target": "www.example.com"})
+	if e["rule"] == nil || strings.Contains(fmt.Sprint(e["notes"]), "更新过") {
+		t.Errorf("before an update: %v", e)
+	}
+	// An update after the engine came up takes effect at the next connect:
+	// explain answers by it, and says so.
+	time.Sleep(10 * time.Millisecond)
+	h.seedRuleSet("r", url, `{"version": 3, "rules": [{"domain_suffix": ["other.example"]}]}`)
+	e = h.ok("explain", map[string]any{"target": "www.example.com"})
+	if e["rule"] != nil || !strings.Contains(fmt.Sprint(e["notes"]), "规则集 r 在连上之后更新过") {
+		t.Errorf("after an update: %v", e)
+	}
+}

@@ -738,14 +738,16 @@ func TestExplain(t *testing.T) {
 			{"id": "work", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]},
 			{"id": "lan", "type": "inline", "rules": [{"ip_cidr": ["10.0.0.0/8"]}]},
 			{"id": "ads", "type": "inline", "rules": [{"domain_keyword": ["ads"]}]},
-			{"id": "cn", "type": "inline", "rules": [{"domain_suffix": [".cn"]}]}],
+			{"id": "cn", "type": "inline", "rules": [{"domain_suffix": [".cn"]}]},
+			{"id": "udp", "type": "inline", "rules": [{"network": ["udp"]}]}],
 		"subscriptions": [{"id": "air", "url": {"secret": "u"}}],
 		"scenarios": [{"id": "s", "final": "hk", "rules": [
 			{"rule_set": "work", "line": "corp"},
 			{"rule_set": "lan", "line": "direct"},
 			{"rule_set": "ads", "line": "block"},
 			{"subscription": "air", "policies": {"Proxy": "hk", "DIRECT": "direct"}},
-			{"rule_set": "cn", "line": "hk", "invert": true}]}]}`)
+			{"rule_set": "cn", "line": "hk", "invert": true}]},
+			{"id": "udp", "final": "hk", "rules": [{"rule_set": "udp", "line": "block"}]}]}`)
 	sub := &Subscription{Rules: []SubscriptionRule{
 		{Policy: "DIRECT", Rule: mustParse(t, `{"domain_suffix": ["direct.example"]}`)},
 		{Policy: "Proxy", Rule: mustParse(t, `{"domain": ["proxy.example.cn"]}`)},
@@ -765,6 +767,7 @@ func TestExplain(t *testing.T) {
 		{"ads.example.com:443", nil, "block", 2, "", "via:hk"},
 		{"www.direct.example", nil, "direct", 3, "DIRECT", "physical"},
 		{"proxy.example.cn", nil, "hk", 3, "Proxy", "via:hk"},
+		{"PROXY.Example.CN.", nil, "hk", 3, "Proxy", "via:hk"},
 		{"example.com", nil, "hk", 4, "", "via:hk"},
 		{"www.example.cn", nil, "hk", -1, "", "via:hk"},
 	} {
@@ -788,9 +791,36 @@ func TestExplain(t *testing.T) {
 		if e.DNS != nil {
 			dns = e.DNS.Server
 		}
+		if policy == "Proxy" && e.Rule.Within != 1 {
+			t.Errorf("%s: subscription rule %d, want 1", tc.target, e.Rule.Within)
+		}
 		if e.Line != tc.line || index != tc.index || policy != tc.policy || dns != tc.dns {
 			t.Errorf("%s: line %s, rule %d, policy %q, dns %q; want %s, %d, %q, %q (notes %v)", tc.target, e.Line, index, policy, dns, tc.line, tc.index, tc.policy, tc.dns, e.Notes)
 		}
+	}
+}
+
+func TestExplainNotes(t *testing.T) {
+	c := loadDoc(t, `{"version": 1,
+		"lines": [{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "p"}},
+		          {"id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://vpn.example", "username": "u", "password": {"secret": "c"}}],
+		"rule_sets": [{"id": "udp", "type": "inline", "rules": [{"network": ["udp"]}]},
+		              {"id": "work", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]}],
+		"scenarios": [{"id": "s", "final": "hk", "rules": [{"rule_set": "work", "line": "corp"}, {"rule_set": "udp", "line": "block"}]}]}`)
+	target, _ := ParseTarget("https://www.example.com")
+	e, err := Explain(c, Options{Scenario: "s", StateDirectory: t.TempDir()}, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := strings.Join(e.Notes, "\n")
+	// TCP goes to final; UDP is blocked, and a name corp pushes would
+	// resolve through corp.
+	if e.Line != "hk" || !strings.Contains(notes, "UDP（例如 QUIC）命中场景第 2 条规则，走 block") || !strings.Contains(notes, "corp 推送的域名") {
+		t.Errorf("line %s, notes:\n%s", e.Line, notes)
+	}
+	nx, _ := ParseTarget("USE-APPLICATION-DNS.NET.")
+	if e, err := Explain(c, Options{Scenario: "s", StateDirectory: t.TempDir()}, nx, nil); err != nil || e.DNS.Server != "xdial" {
+		t.Errorf("canary: %+v %v", e.DNS, err)
 	}
 }
 
