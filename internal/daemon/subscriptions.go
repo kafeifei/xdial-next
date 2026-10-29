@@ -159,8 +159,12 @@ func (d *Daemon) downloadSubscription(cfg *config.Config, o *config.Object, secr
 			return err
 		}
 		fp := subscriptionFingerprint(o, url)
+		// Only content that still passes the checks may answer a 304.
 		var old cachedSubscription
-		hasOld := store.ReadJSON(d.subscriptionPath(o.ID, fp), &old) == nil && old.Fingerprint == fp
+		if c, _, ok := d.cachedSubscription(o, url); ok {
+			old = *c
+		}
+		hasOld := old.Fingerprint == fp
 		req, err := d.fetchRequest(cfg, o, url, secrets)
 		if err != nil {
 			return err
@@ -218,6 +222,7 @@ func (d *Daemon) downloadSubscription(cfg *config.Config, o *config.Object, secr
 		return result, e
 	}
 	d.events.add("subscription_updated", map[string]any{"id": o.ID, "changed": result.Changed, "nodes": result.Nodes, "rules": result.Rules, "unsupported": result.Unsupported})
+	go d.resumeAfterFetch()
 	return result, nil
 }
 
