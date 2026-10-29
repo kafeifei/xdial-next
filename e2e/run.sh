@@ -286,8 +286,9 @@ check m3-subscription-list "jq -e '.result.subscriptions[0] | .cached and .forma
 show="$("$xdial" subscription show air --json 2>&1)"
 check m3-subscription-show-no-secrets "jq -e '.ok and (.result.nodes | length) == 2' <<< '$show' > /dev/null && ! grep -q e2e-ss-pass <<< '$show'" "$(jq -c '.result.nodes' <<< "$show")"
 # 经 TUN 进来的连接交给节点时带的是 IP，测试服务端日志里看不到域名：比较 vless 入站的连接数。
-# example.org 按订阅规则走 proxy 组（vless 节点），它的 DNS 也经这个组；apple.com 走 direct，不该增加。
-vless_count() { grep -c 'vless-in' "$work/ts.log" 2> /dev/null; }
+# example.org 按订阅规则走 proxy 组（vless 节点）；它的 DNS 也经这个组，是发往 1.1.1.1 的 DoH，
+# 不算在内，只数发往其他地址的连接。apple.com 走 direct，不该增加。
+vless_count() { grep 'vless-in' "$work/ts.log" 2> /dev/null | grep 'inbound connection to' | grep -vc 'to 1\.1\.1\.1:'; }
 c0="$(vless_count)"
 code_org="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://example.org 2>&1)"
 sleep 1

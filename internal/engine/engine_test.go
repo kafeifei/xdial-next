@@ -649,3 +649,20 @@ func TestCompileSubscriptionBounds(t *testing.T) {
 		t.Error("20 groups of 2000 nodes did not hit the member budget")
 	}
 }
+
+func TestPlainMembersDoNotCountAgainstTheBudget(t *testing.T) {
+	var lines, members, groups []string
+	for i := range 200 {
+		lines = append(lines, fmt.Sprintf(`{"id": "l%d", "type": "trojan", "server": "a.example", "server_port": 443, "password": {"secret": "p"}}`, i))
+		members = append(members, fmt.Sprintf(`"l%d"`, i))
+	}
+	for i := range 101 {
+		groups = append(groups, fmt.Sprintf(`{"id": "g%d", "type": "selector", "outbounds": [%s]}`, i, strings.Join(members, ",")))
+	}
+	c := loadDoc(t, `{"version": 1, "lines": [`+strings.Join(lines, ",")+`], "groups": [`+strings.Join(groups, ",")+`],
+		"scenarios": [{"id": "s", "final": "g0"}]}`)
+	r, err := Compile(c, Options{StateDirectory: t.TempDir()})
+	if err != nil || r.TooManyMembers {
+		t.Errorf("20,200 members written by hand hit the subscription budget: %v", err)
+	}
+}

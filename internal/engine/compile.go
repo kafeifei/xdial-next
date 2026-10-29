@@ -162,9 +162,10 @@ type SubscriptionRule struct {
 	Rule   *config.Value
 }
 
-// MaxExpandedMembers bounds the members all groups expand to together:
-// subscription members multiply, a group may name a subscription many
-// times and many groups may name it, 1.5.
+// MaxExpandedMembers bounds the members subscription members expand to,
+// over all groups together: they multiply, a group may name a subscription
+// many times and many groups may name it, 1.5. Members written as ids are
+// bounded by the size of the document already.
 const MaxExpandedMembers = 20000
 
 // NodeTag is the tag a subscription node compiles to.
@@ -313,27 +314,29 @@ func (k *compiler) subscription(id string) *Subscription {
 func (k *compiler) expandMembers(o *config.Object) *config.Value {
 	list := &config.Value{Kind: config.KindArray}
 	seen := map[string]bool{}
-	add := func(tag string) {
+	add := func(tag string, fromSubscription bool) {
 		if seen[tag] || k.tooMany {
 			return
 		}
-		if k.members++; k.members > MaxExpandedMembers {
-			k.tooMany = true
-			return
+		if fromSubscription {
+			if k.members++; k.members > MaxExpandedMembers {
+				k.tooMany = true
+				return
+			}
 		}
 		seen[tag] = true
 		list.Items = append(list.Items, config.String(tag))
 	}
 	for _, m := range config.Members(o) {
 		if m.Subscription == "" {
-			add(m.ID)
+			add(m.ID, false)
 			continue
 		}
 		content := k.subscription(m.Subscription)
 		if content == nil {
 			tag := NodeTag(m.Subscription, "placeholder")
 			k.addNode(tag, placeholderNode())
-			add(tag)
+			add(tag, true)
 			continue
 		}
 		filter, _ := regexp.Compile(m.Filter)
@@ -346,7 +349,7 @@ func (k *compiler) expandMembers(o *config.Object) *config.Value {
 			if !seen[tag] && !k.tooMany {
 				k.addNode(tag, n.Outbound)
 			}
-			add(tag)
+			add(tag, true)
 		}
 	}
 	if len(list.Items) == 0 {
