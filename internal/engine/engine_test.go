@@ -775,7 +775,7 @@ func TestGroupsReportAndTestThroughNesting(t *testing.T) {
 			t.Errorf("inner in outer: %+v", m)
 		}
 	}
-	results := urlTest(ctx, instance, rep, []string{"g0"})
+	results := urlTest(ctx, time.Now().Add(TestDeadline), instance, rep, []string{"g0"})
 	if len(results) != 2 || results["a"].Error == "" || results["b"].Error == "" {
 		t.Errorf("test of g0: %v", results)
 	}

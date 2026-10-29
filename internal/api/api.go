@@ -22,8 +22,13 @@ import (
 // Version is the protocol's major version.
 const Version = 1
 
-// MaxMessage bounds one request or response line, 6.2.
+// MaxMessage bounds one request line, 6.2.
 const MaxMessage = 8 << 20
+
+// MaxResponse bounds one response line. The largest the configuration's
+// bounds allow is a status with 256 groups of 1024 members, the 20 000
+// nodes subscriptions expand to and 1024 VPN lines, about 52 MB.
+const MaxResponse = 64 << 20
 
 // Request is one call.
 type Request struct {
@@ -143,7 +148,7 @@ func (c *Client) Call(method string, params any, each func(Response) bool) error
 
 // ReadResponse reads one bounded line.
 func ReadResponse(r *bufio.Reader) (Response, error) {
-	line, err := readLine(r)
+	line, err := readLine(r, MaxResponse)
 	if err != nil {
 		return Response{}, err
 	}
@@ -156,7 +161,7 @@ func ReadResponse(r *bufio.Reader) (Response, error) {
 
 // ReadRequest reads one bounded request line.
 func ReadRequest(r *bufio.Reader) (Request, error) {
-	line, err := readLine(r)
+	line, err := readLine(r, MaxMessage)
 	if err != nil {
 		return Request{}, err
 	}
@@ -167,10 +172,10 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 	return req, nil
 }
 
-// ErrTooLong is a line over MaxMessage.
+// ErrTooLong is a line over its bound.
 var ErrTooLong = errors.New("一行超过上限")
 
-func readLine(r *bufio.Reader) ([]byte, error) {
+func readLine(r *bufio.Reader, limit int) ([]byte, error) {
 	var line []byte
 	for {
 		chunk, isPrefix, err := r.ReadLine()
@@ -178,7 +183,7 @@ func readLine(r *bufio.Reader) ([]byte, error) {
 			return nil, err
 		}
 		line = append(line, chunk...)
-		if len(line) > MaxMessage {
+		if len(line) > limit {
 			return nil, ErrTooLong
 		}
 		if !isPrefix {

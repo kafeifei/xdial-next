@@ -233,11 +233,15 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	// and stored before it is current; if either fails, the old one comes
 	// back and nothing changes, 4.1.
 	canonical := c.Root.Canonical()
+	var stale []string
 	if live {
 		reload, err := d.prepare(c, scenario)
 		if err != nil {
 			return reply{err: err}
 		}
+		// Choices are dropped once the configuration is stored, so a
+		// failed apply leaves them as they were.
+		stale, reload.stale = reload.stale, nil
 		d.gen++
 		if err := d.bringUp(reload); err != nil {
 			d.restoreLocked()
@@ -255,7 +259,7 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	d.mu.Lock()
 	d.cfg, d.raw = c, canonical
 	d.mu.Unlock()
-	d.dropSelections(staleSelections(c, d.selections()))
+	d.dropSelections(append(stale, d.staleSelections(c, d.selections())...))
 	result.Applied = true
 	d.events.add("config_applied", map[string]any{"revision": result.Revision, "previous": result.PreviousRevision})
 	d.wakeResources()

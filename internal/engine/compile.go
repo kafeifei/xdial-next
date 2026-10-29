@@ -314,7 +314,7 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 	sort.Strings(k.missing)
 	sort.Strings(k.missingSubs)
 	sort.Strings(stale)
-	var tags []string
+	tags := []string{config.Direct}
 	for id := range k.lines {
 		tags = append(tags, id)
 	}
@@ -354,6 +354,17 @@ func (k *compiler) subscription(id string) *Subscription {
 	}
 	k.subs[id] = content
 	return content
+}
+
+// GroupMembers are the members group compiles to with the subscription
+// content subscription gives, and the subscriptions it has none for, whose
+// nodes cannot be known, 3.6.
+func GroupMembers(c *config.Config, group *config.Object, subscription func(*config.Object) (*Subscription, bool)) (members, unknown []string) {
+	k := newCompiler(c, Options{Secret: Placeholder, Subscription: subscription})
+	for _, m := range k.expandMembers(group).Items {
+		members = append(members, m.String)
+	}
+	return members, k.missingSubs
 }
 
 // expandMembers turns the members of group o into outbound tags: ids as
