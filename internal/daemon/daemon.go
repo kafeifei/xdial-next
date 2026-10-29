@@ -58,6 +58,9 @@ func excludeFromBackup(dir string) error {
 type State struct {
 	Scenario  string `json:"scenario,omitempty"`
 	Connected bool   `json:"connected"`
+	// Selections are the members picked by hand in selector groups, by
+	// group id: runtime state, not configuration, 1.1 and 3.6.
+	Selections map[string]string `json:"selections,omitempty"`
 }
 
 // Secret is one stored credential, 4.4.

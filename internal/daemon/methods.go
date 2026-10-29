@@ -38,6 +38,8 @@ func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 		"connect":             d.connect,
 		"disconnect":          d.disconnect,
 		"scenario.use":        d.scenarioUse,
+		"group.select":        d.groupSelect,
+		"line.test":           d.lineTest,
 		"tailscale.login":     d.tailscaleLogin,
 		"tailscale.logout":    d.tailscaleLogout,
 		"rule_set.list":       d.ruleSetList,
@@ -71,6 +73,9 @@ type Status struct {
 	// Endpoints is what the engine last reported about the AnyConnect and
 	// Tailscale lines of the connection, by line id, 6.3.
 	Endpoints map[string]engine.EndpointStatus `json:"endpoints,omitempty"`
+	// Groups is each group as it runs: the member in use and the last
+	// tests, 3.6.
+	Groups map[string]engine.GroupStatus `json:"groups,omitempty"`
 }
 
 func (d *Daemon) statusLocked() Status {
@@ -93,6 +98,9 @@ func (d *Daemon) statusLocked() Status {
 		s.SystemDNS = c.first == resolverAddress.String()
 		if endpoints := c.engine.endpointStatus(); len(endpoints) > 0 {
 			s.Endpoints = endpoints
+		}
+		if groups := c.engine.groupStatus(); len(groups) > 0 {
+			s.Groups = groups
 		}
 	}
 	return s
@@ -225,11 +233,15 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	// and stored before it is current; if either fails, the old one comes
 	// back and nothing changes, 4.1.
 	canonical := c.Root.Canonical()
+	var stale []string
 	if live {
 		reload, err := d.prepare(c, scenario)
 		if err != nil {
 			return reply{err: err}
 		}
+		// Choices are dropped once the configuration is stored, so a
+		// failed apply leaves them as they were.
+		stale, reload.stale = reload.stale, nil
 		d.gen++
 		if err := d.bringUp(reload); err != nil {
 			d.restoreLocked()
@@ -247,6 +259,7 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	d.mu.Lock()
 	d.cfg, d.raw = c, canonical
 	d.mu.Unlock()
+	d.dropSelections(append(stale, d.staleSelections(c, d.selections())...))
 	result.Applied = true
 	d.events.add("config_applied", map[string]any{"revision": result.Revision, "previous": result.PreviousRevision})
 	d.wakeResources()
@@ -521,7 +534,7 @@ func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 		if err := d.switchLocked(next); err != nil {
 			return reply{err: err}
 		}
-	} else if err := d.persist(State{Scenario: p.ID}); err != nil {
+	} else if err := d.persist(State{Scenario: p.ID, Selections: d.selections()}); err != nil {
 		return reply{err: cli.Errorf(cli.CodeInternal, "", "保存场景失败：%v", err)}
 	}
 	d.events.add("scenario_used", map[string]any{"scenario": p.ID})

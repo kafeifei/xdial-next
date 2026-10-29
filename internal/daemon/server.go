@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net"
@@ -159,7 +160,7 @@ func (d *Daemon) dispatch(conn *net.UnixConn, req api.Request, uid uint32) bool 
 	if r.err != nil {
 		return writeResponse(conn, failure(req.ID, r.err))
 	}
-	result, err := json.Marshal(r.result)
+	result, err := marshal(r.result)
 	if err != nil {
 		return writeResponse(conn, failure(req.ID, err))
 	}
@@ -174,8 +175,20 @@ func failure(id int, err error) api.Response {
 	return api.Response{ID: id, Schema: cli.ErrorSchema, Error: e}
 }
 
+// marshal encodes v without escaping HTML, which would make names with
+// < > & up to six times longer.
+func marshal(v any) ([]byte, error) {
+	var b bytes.Buffer
+	encoder := json.NewEncoder(&b)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
+}
+
 func writeResponse(conn net.Conn, resp api.Response) bool {
-	line, err := json.Marshal(resp)
+	line, err := marshal(resp)
 	if err != nil {
 		return false
 	}

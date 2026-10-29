@@ -1112,6 +1112,180 @@ func TestLoginLinksGoBeforeScrubbing(t *testing.T) {
 	}
 }
 
+const groupDoc = `{"version": 1,
+	"lines": [{"id": "a", "type": "trojan", "server": "127.0.0.1", "server_port": 9, "password": {"secret": "p"}},
+	          {"id": "b", "type": "trojan", "server": "127.0.0.1", "server_port": 9, "password": {"secret": "p"}}],
+	"groups": [{"id": "pick", "type": "selector", "outbounds": ["a", "b"]},
+	           {"id": "fast", "type": "urltest", "outbounds": ["a", "b"]}],
+	"scenarios": [{"id": "s", "rules": [], "final": "pick"}, {"id": "t", "rules": [], "final": "fast"}]}`
+
+func TestGroupSelectSwitchesAndPersists(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	pid := h.ok("connect", map[string]any{"scenario": "s"})["engine_pid"]
+	h.waitFor("the group's status", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		return g != nil && g["pick"] != nil
+	})
+	r := h.ok("group.select", map[string]any{"group": "pick", "member": "b"})
+	if r["applied"] != true {
+		t.Errorf("select: %v", r)
+	}
+	s := h.ok("status", nil)
+	if s["engine_pid"] != pid || s["groups"].(map[string]any)["pick"].(map[string]any)["now"] != "b" {
+		t.Errorf("after select: pid %v -> %v, groups %v", pid, s["engine_pid"], s["groups"])
+	}
+	// A reload compiles the choice as the default.
+	h.ok("scenario.use", map[string]any{"id": "t"})
+	h.ok("scenario.use", map[string]any{"id": "s"})
+	h.waitFor("the choice after a reload", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		pick, _ := g["pick"].(map[string]any)
+		return pick != nil && pick["now"] == "b"
+	})
+	h.fails("group.select", map[string]any{"group": "fast", "member": "a"}, cli.CodeConfigConflict)
+	h.fails("group.select", map[string]any{"group": "pick", "member": "nope"}, cli.CodeConfigConflict)
+}
+
+func TestSubscriptionMembersCanBeSelectedAndTested(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://sub.example/token"
+	h.ok("config.apply", map[string]any{"content": subDoc})
+	h.ok("secret.set", map[string]any{"name": "jp", "value": "a-password"})
+	h.ok("secret.set", map[string]any{"name": "air-url", "value": url})
+	h.seedSubscription("air", url, airCache)
+	h.ok("connect", map[string]any{"scenario": "s"})
+	h.waitFor("the group's status", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		return g != nil && g["proxy"] != nil
+	})
+	const member = "xdial:sub:air:香港 01"
+	h.ok("group.select", map[string]any{"group": "proxy", "member": "jp"})
+	if r := h.ok("group.select", map[string]any{"group": "proxy", "member": member}); r["applied"] != true {
+		t.Errorf("select a subscription member: %v", r)
+	}
+	if now := h.ok("status", nil)["groups"].(map[string]any)["proxy"].(map[string]any)["now"]; now != member {
+		t.Errorf("now: %v", now)
+	}
+	results := h.ok("line.test", map[string]any{"ids": []string{"proxy"}})["results"].(map[string]any)
+	if results[member] == nil || results["jp"] == nil {
+		t.Errorf("test a subscription member: %v", results)
+	}
+}
+
+func TestSelectionOfARemovedMemberIsDropped(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("group.select", map[string]any{"group": "pick", "member": "b"})
+	// b leaves the group and comes back: the group's default is in use
+	// again, not the old choice.
+	without := strings.Replace(groupDoc, `"outbounds": ["a", "b"]},
+	           {"id": "fast"`, `"outbounds": ["a"]},
+	           {"id": "fast"`, 1)
+	if without == groupDoc {
+		t.Fatal("the test document changed")
+	}
+	h.ok("config.apply", map[string]any{"content": without})
+	if picked := h.d.selections(); len(picked) != 0 {
+		t.Errorf("after b left: %v", picked)
+	}
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	h.ok("connect", map[string]any{"scenario": "s"})
+	h.waitFor("the group's default", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		pick, _ := g["pick"].(map[string]any)
+		return pick != nil && pick["now"] == "a"
+	})
+}
+
+func TestSelectionsSurviveAnApplyThatFails(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	h.ok("connect", map[string]any{"scenario": "s"})
+	h.ok("group.select", map[string]any{"group": "pick", "member": "b"})
+	// The new configuration comes up but cannot be stored: the old one
+	// comes back, and with it the choice its group had.
+	if err := os.Remove(h.layout.Config()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(h.layout.Config(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	without := strings.Replace(groupDoc, `"outbounds": ["a", "b"]},
+	           {"id": "fast"`, `"outbounds": ["a"]},
+	           {"id": "fast"`, 1)
+	if r := h.call("config.apply", map[string]any{"content": without}); r.OK {
+		t.Fatal("apply succeeded without storing")
+	}
+	if picked := h.d.selections(); picked["pick"] != "b" {
+		t.Errorf("after the failed apply: %v", picked)
+	}
+}
+
+func TestSelectionOutsideAFilterIsDropped(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://sub.example/token"
+	h.ok("config.apply", map[string]any{"content": subDoc})
+	h.ok("secret.set", map[string]any{"name": "air-url", "value": url})
+	h.seedSubscription("air", url, airCache)
+	h.ok("group.select", map[string]any{"group": "proxy", "member": "xdial:sub:air:香港 01"})
+	excluded := strings.Replace(subDoc, `"filter": "香港"}`, `"filter": "香港", "exclude": "01"}`, 1)
+	if excluded == subDoc {
+		t.Fatal("the test document changed")
+	}
+	h.ok("config.apply", map[string]any{"content": excluded})
+	if picked := h.d.selections(); len(picked) != 0 {
+		t.Errorf("a node the filter leaves out: %v", picked)
+	}
+	// A group the filters leave empty has no members, not the direct put
+	// in for sing-box.
+	h.ok("config.apply", map[string]any{"content": strings.Replace(subDoc, `"filter": "香港"}, "jp"]`, `"filter": "香港"}, "jp", "direct"]`, 1)})
+	h.ok("group.select", map[string]any{"group": "proxy", "member": "direct"})
+	h.ok("config.apply", map[string]any{"content": strings.Replace(subDoc, `"filter": "香港"}, "jp"]`, `"filter": "美国"}]`, 1)})
+	if picked := h.d.selections(); len(picked) != 0 {
+		t.Errorf("direct in a group left empty: %v", picked)
+	}
+}
+
+func TestSelectRightAfterConnectReachesTheEngine(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	h.ok("connect", map[string]any{"scenario": "s"})
+	// No status from the engine yet, perhaps: the choice still goes to it.
+	h.ok("group.select", map[string]any{"group": "pick", "member": "b"})
+	h.waitFor("the choice in use", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		pick, _ := g["pick"].(map[string]any)
+		return pick != nil && pick["now"] == "b"
+	})
+}
+
+func TestLineTestAnswersThroughTheEngine(t *testing.T) {
+	h := start(t, nil)
+	h.fails("line.test", map[string]any{"ids": []string{"a"}}, cli.CodeConfigConflict)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	h.ok("connect", map[string]any{"scenario": "s"})
+	// Only what the engine runs; an unknown id is not echoed back at length.
+	h.fails("line.test", map[string]any{"ids": []string{"pick", strings.Repeat("n", 1<<16)}}, cli.CodeConfigConflict)
+	if r := h.ok("line.test", map[string]any{"ids": []string{"direct"}}); r["results"].(map[string]any)["direct"] == nil {
+		t.Errorf("direct: %v", r)
+	}
+	r := h.ok("line.test", map[string]any{"ids": []string{"pick"}})
+	results := r["results"].(map[string]any)
+	// Nothing listens on port 9: each member answers with an error.
+	for _, tag := range []string{"a", "b"} {
+		o, _ := results[tag].(map[string]any)
+		if o == nil || o["error"] == nil {
+			t.Errorf("%s: %v", tag, results)
+		}
+	}
+}
+
 func TestScrubberMasksOverlaps(t *testing.T) {
 	for name, c := range map[string]struct {
 		secrets    map[string]Secret

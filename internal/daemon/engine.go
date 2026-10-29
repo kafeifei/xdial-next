@@ -34,8 +34,47 @@ type engineProc struct {
 	done  chan struct{}
 
 	mu        sync.Mutex
-	endpoints map[string]engine.EndpointStatus // the last status line
-	stdinMu   sync.Mutex                       // commands, one at a time
+	endpoints map[string]engine.EndpointStatus // the last snapshot
+	groups    map[string]engine.GroupStatus
+	tests     map[int]chan engine.TestResult // url_test commands waiting, by id
+	nextTest  int
+	stdinMu   sync.Mutex // commands, one at a time
+}
+
+// groupStatus returns the last status the engine reported for its groups.
+func (p *engineProc) groupStatus() map[string]engine.GroupStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return maps.Clone(p.groups)
+}
+
+// urlTest asks the engine to test tags and waits for the answer.
+func (p *engineProc) urlTest(tags []string, timeout time.Duration) (engine.TestResult, error) {
+	p.mu.Lock()
+	p.nextTest++
+	id := p.nextTest
+	if p.tests == nil {
+		p.tests = map[int]chan engine.TestResult{}
+	}
+	answer := make(chan engine.TestResult, 1)
+	p.tests[id] = answer
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.tests, id)
+		p.mu.Unlock()
+	}()
+	if err := p.send(engine.Command{URLTest: &engine.URLTestCommand{ID: id, Tags: tags}}); err != nil {
+		return engine.TestResult{}, err
+	}
+	select {
+	case r := <-answer:
+		return r, nil
+	case <-p.done:
+		return engine.TestResult{}, errors.New("引擎退出了")
+	case <-time.After(timeout):
+		return engine.TestResult{}, errors.New("测速超时")
+	}
 }
 
 // send writes one command to the engine's stdin, 6.3.
@@ -113,9 +152,9 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 		_ = json.Unmarshal(line, &r)
 		ready <- r
 		// Then status lines, one per change, 6.3. A line longer than
-		// maxStatusLine is skipped to its end and reading goes on.
+		// engine.MaxStatusLine is skipped to its end and reading goes on.
 		for {
-			line, err := readLine(reader, maxStatusLine)
+			line, err := readLine(reader, engine.MaxStatusLine)
 			if err != nil {
 				break
 			}
@@ -123,10 +162,21 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 			if line == nil || json.Unmarshal(line, &status) != nil {
 				continue
 			}
+			if t := status.Test; t != nil {
+				p.mu.Lock()
+				waiter := p.tests[t.ID]
+				p.mu.Unlock()
+				if waiter != nil {
+					waiter <- *t
+				}
+				continue
+			}
+			// Each line carries what changed; the rest stands.
 			scrubEndpoints(status.Endpoints, scrub)
 			p.mu.Lock()
-			previous := p.endpoints
-			p.endpoints = status.Endpoints
+			previous := maps.Clone(p.endpoints)
+			p.endpoints = merged(p.endpoints, status.Endpoints)
+			p.groups = merged(p.groups, status.Groups)
 			p.mu.Unlock()
 			d.endpointsChanged(previous, status.Endpoints)
 		}
@@ -241,8 +291,14 @@ func scrubText(s string, scrub *scrubber) string {
 // maxEndpointText bounds a VPN server's text in status and events.
 const maxEndpointText = 512
 
-// maxStatusLine bounds one status line from the engine.
-const maxStatusLine = 1 << 20
+// merged returns into with what update has added or replaced.
+func merged[V any](into, update map[string]V) map[string]V {
+	if into == nil {
+		into = map[string]V{}
+	}
+	maps.Copy(into, update)
+	return into
+}
 
 // readLine reads one line of at most limit bytes. A longer line is read to
 // its end and returned as nil, so one bad line costs only itself.

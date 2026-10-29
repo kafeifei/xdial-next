@@ -359,6 +359,37 @@ EOF
 else
   report m3-tailscale true "跳过：本机钥匙串里没有 xdial-e2e-tailscale-authkey"
 fi
+
+# --- M4：线路组在运行中（#16）------------------------------------------------
+# selector 组的两个成员分别连测试服务端的 shadowsocks 和 vless 入口：手选之后流量换到另一个入口，
+# 引擎不重启；测速对两个成员都有结果。这个场景的 final 就是这个组，虚拟机的后台流量也走它，
+# 所以只数发往一个固定地址（1.0.0.1）的连接。
+cat > "$work/m4g.jsonc" << EOF
+{
+  "version": 1,
+  "lines": [
+    { "id": "ss", "type": "shadowsocks", "server": "$lan", "server_port": 18388, "method": "aes-128-gcm", "password": { "secret": "ss" } },
+    { "id": "vl", "type": "vless", "server": "$lan", "server_port": 18389, "uuid": { "secret": "vl" } }
+  ],
+  "groups": [{ "id": "pick", "type": "selector", "outbounds": ["ss", "vl"] }],
+  "scenarios": [{ "id": "g", "rules": [], "final": "pick" }]
+}
+EOF
+"$xdial" disconnect --json > /dev/null 2>&1
+printf '1386f85e-657b-4d6e-9d56-78badb75e1fd\n' | "$xdial" secret set vl --json > /dev/null 2>&1
+"$xdial" config apply "$work/m4g.jsonc" --json > /dev/null 2>&1
+st0="$("$xdial" connect --scenario g --json 2>&1)"
+inbound_count() { grep "$1" "$work/ts.log" 2> /dev/null | grep -c 'inbound connection to 1\.0\.0\.1:443'; }
+s0="$(inbound_count ss-in)"; v0="$(inbound_count vless-in)"
+curl -sS -m 15 -o /dev/null https://1.0.0.1 2> /dev/null; sleep 1
+s1="$(inbound_count ss-in)"; v1="$(inbound_count vless-in)"
+sel="$("$xdial" group select pick vl --json 2>&1)"
+curl -sS -m 15 -o /dev/null https://1.0.0.1 2> /dev/null; sleep 1
+s2="$(inbound_count ss-in)"; v2="$(inbound_count vless-in)"
+st1="$("$xdial" status --json 2>&1)"
+check m4-group-select "jq -e '.result.applied' <<< '$sel' > /dev/null && [[ \$(jq -r .result.engine_pid <<< '$st0') == \$(jq -r .result.engine_pid <<< '$st1') ]] && jq -e '.result.groups.pick.now == \"vl\"' <<< '$st1' > /dev/null && (( s1 > s0 && v1 == v0 && v2 > v1 ))" "ss $s0->$s1->$s2 vless $v0->$v1->$v2 $(jq -c '.result.groups.pick.now' <<< "$st1") lines: $(grep 'to 1\.0\.0\.1:443' "$work/ts.log" | tail -4 | cut -c1-120 | tr '\n' ';')"
+tst="$("$xdial" line test pick --json 2>&1)"
+check m4-line-test "jq -e '.result.results.ss.delay_ms > 0 and .result.results.vl.delay_ms > 0' <<< '$tst' > /dev/null" "$tst"
 "$xdial" disconnect --json > /dev/null 2>&1
 "$xdial" config apply "$work/m3.jsonc" --json > /dev/null 2>&1
 "$xdial" connect --scenario s --json > /dev/null 2>&1

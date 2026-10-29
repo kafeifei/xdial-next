@@ -35,6 +35,10 @@ type connection struct {
 	revision  string
 	digest    [32]byte
 	endpoints []string
+	// groups and outbounds are what the engine runs: each group's
+	// members, and every line, group and node, 3.6.
+	groups    map[string][]string
+	outbounds []string
 	physical  []netip.Addr
 	lock      *connectionLock
 	engine    *engineProc
@@ -52,6 +56,9 @@ type plan struct {
 	compiled  []byte
 	digest    [32]byte // of compiled: what the engine would run
 	endpoints []string // AnyConnect and Tailscale lines compiled in
+	groups    map[string][]string
+	outbounds []string
+	stale     []string // groups whose member picked by hand is gone
 	secrets   map[string]Secret
 }
 
@@ -130,6 +137,7 @@ func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[
 	}
 	d.mu.Lock()
 	secrets := maps.Clone(d.secrets)
+	selections := maps.Clone(d.state.Selections)
 	scrubbed := maps.Clone(secrets)
 	for line, key := range authKeys {
 		scrubbed["tailscale-auth-key:"+line] = Secret{Value: key}
@@ -155,9 +163,9 @@ func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[
 	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
 	opts := engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
-		TailscaleAuthKeys: authKeys,
-		PhysicalDNS:       physical[0],
-		Secret:            func(u config.SecretUse) string { return secrets[u.Name].Value },
+		TailscaleAuthKeys: authKeys, Selections: selections,
+		PhysicalDNS: physical[0],
+		Secret:      func(u config.SecretUse) string { return secrets[u.Name].Value },
 		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
 			rules, ok := ruleSets[o.ID]
 			return rules, ok
@@ -207,7 +215,8 @@ func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[
 	if err := checkSecrets(cfg, secrets, result.Secrets); err != nil {
 		return nil, err
 	}
-	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON), endpoints: result.Endpoints, secrets: scrubbed}, nil
+	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON),
+		endpoints: result.Endpoints, groups: result.Groups, outbounds: result.Outbounds, stale: result.StaleSelections, secrets: scrubbed}, nil
 }
 
 // bringUp replaces the connection with p, 6.3: take the connection lock,
@@ -220,7 +229,8 @@ func (d *Daemon) bringUp(p *plan) error {
 	old := d.conn
 	d.conn = nil
 	d.mu.Unlock()
-	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, endpoints: p.endpoints, physical: p.physical}
+	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, endpoints: p.endpoints,
+		groups: p.groups, outbounds: p.outbounds, physical: p.physical}
 	if old != nil {
 		// A reload keeps the lock it holds rather than letting it go and
 		// taking it again.
@@ -271,6 +281,7 @@ func (d *Daemon) bringUp(p *plan) error {
 	d.wakeMonitor()
 	d.setStatus("connected", notFirst(first))
 	go d.watch(c.engine)
+	d.dropSelections(p.stale)
 	return nil
 }
 
@@ -304,7 +315,7 @@ func (d *Daemon) switchLocked(p *plan) error {
 		d.resumeIntentLocked(err.Error())
 		return err
 	}
-	if err := d.persist(State{Scenario: p.scenario, Connected: true}); err != nil {
+	if err := d.persist(State{Scenario: p.scenario, Connected: true, Selections: d.selections()}); err != nil {
 		d.disconnectLocked()
 		d.resumeIntentLocked("保存连接状态失败：" + err.Error())
 		return cli.Errorf(cli.CodeInternal, "", "保存连接状态失败，已断开：%v", err)

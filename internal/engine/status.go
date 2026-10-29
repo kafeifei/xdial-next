@@ -1,9 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"maps"
 	"net/netip"
 	"sort"
 	"strings"
@@ -12,6 +15,9 @@ import (
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing-box/protocol/group"
+	"github.com/sagernet/sing/common/observable"
 )
 
 // EndpointStatus is what the engine reports about one endpoint line after
@@ -40,13 +46,43 @@ type EndpointStatus struct {
 }
 
 // StatusLine is one line the engine writes to stdout after its ready
-// line: the status of every endpoint, by line id.
+// line: the status of one endpoint or one group, by id, whenever it
+// changes, which the daemon merges into what it has; or the answer to a
+// url_test command.
 type StatusLine struct {
-	Endpoints map[string]EndpointStatus `json:"endpoints"`
+	Endpoints map[string]EndpointStatus `json:"endpoints,omitempty"`
+	Groups    map[string]GroupStatus    `json:"groups,omitempty"`
+	Test      *TestResult               `json:"test,omitempty"`
 }
 
-// statusInterval bounds how often the engine writes a status line.
-const statusInterval = 500 * time.Millisecond
+// GroupStatus is a group of lines as it runs: the member in use and what
+// the last tests measured, ARCHITECTURE.md 3.6.
+type GroupStatus struct {
+	Type    string         `json:"type"`
+	Now     string         `json:"now"`
+	Members []MemberStatus `json:"members"`
+}
+
+// MemberStatus is one member of a group and its last test, if any.
+type MemberStatus struct {
+	Tag      string     `json:"tag"`
+	DelayMS  int        `json:"delay_ms,omitempty"`
+	TestedAt *time.Time `json:"tested_at,omitempty"`
+}
+
+// TestResult answers one url_test command.
+type TestResult struct {
+	ID      int                    `json:"id"`
+	Results map[string]TestOutcome `json:"results"`
+	// Error says why nothing was tested.
+	Error string `json:"error,omitempty"`
+}
+
+// TestOutcome is one line's test: a delay, or why there is none.
+type TestOutcome struct {
+	DelayMS int    `json:"delay_ms,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
 
 // probeAddresses ask an AnyConnect endpoint whether its routes take
 // everything, 3.2, per address family: documentation addresses, which only
@@ -55,46 +91,140 @@ const statusInterval = 500 * time.Millisecond
 // 1.1.1.1 included.
 var probeAddresses = map[string]netip.Addr{"ipv4": netip.MustParseAddr("198.51.100.1"), "ipv6": netip.MustParseAddr("2001:db8::1")}
 
-// reportEndpoints writes a StatusLine to w whenever an endpoint's status
-// changes, at most every statusInterval, until ctx ends.
-func reportEndpoints(ctx context.Context, instance *box.Box, w io.Writer) {
-	var mu sync.Mutex
-	statuses := map[string]EndpointStatus{}
-	changed := make(chan struct{}, 1)
-	set := func(tag string, s EndpointStatus) {
-		mu.Lock()
-		statuses[tag] = s
-		mu.Unlock()
-		select {
-		case changed <- struct{}{}:
-		default:
-		}
+// statusInterval bounds how often the engine writes a status line.
+const statusInterval = 500 * time.Millisecond
+
+// MaxStatusLine bounds one status line, which the daemon skips when
+// longer. Each line carries one endpoint, one group or one test result,
+// and the largest the configuration's bounds allow fits: a group of 1024
+// lines and the 20 000 nodes subscriptions expand to, or a test of them
+// all, with tags of at most about 600 bytes.
+const MaxStatusLine = 16 << 20
+
+// reporter writes status lines to the daemon, 6.3.
+type reporter struct {
+	instance *box.Box
+	history  *urltest.HistoryStorage
+	stderr   io.Writer
+	writeMu  sync.Mutex
+	w        io.Writer
+
+	mu        sync.Mutex
+	endpoints map[string]EndpointStatus
+	changed   chan struct{}
+}
+
+func newReporter(instance *box.Box, history *urltest.HistoryStorage, w, stderr io.Writer) *reporter {
+	return &reporter{instance: instance, history: history, w: w, stderr: stderr,
+		endpoints: map[string]EndpointStatus{}, changed: make(chan struct{}, 1)}
+}
+
+// encode writes line as JSON without escaping HTML, which would make
+// names up to six times longer.
+func encode(line StatusLine) ([]byte, error) {
+	var b bytes.Buffer
+	encoder := json.NewEncoder(&b)
+	encoder.SetEscapeHTML(false)
+	err := encoder.Encode(line)
+	return b.Bytes(), err
+}
+
+// poke asks for a new snapshot.
+func (r *reporter) poke() {
+	select {
+	case r.changed <- struct{}{}:
+	default:
 	}
-	for _, e := range instance.Endpoint().Endpoints() {
+}
+
+// write writes one status line; one the daemon would skip is not sent.
+func (r *reporter) write(line StatusLine) error {
+	data, err := encode(line)
+	if err != nil {
+		return err
+	}
+	return r.writeRaw(data)
+}
+
+func (r *reporter) writeRaw(data []byte) error {
+	if len(data) > MaxStatusLine {
+		fmt.Fprintln(r.stderr, "engine: status line too long, not sent:", len(data), "bytes")
+		return nil
+	}
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	_, err := r.w.Write(data)
+	return err
+}
+
+// run writes a snapshot whenever an endpoint's or a group's status
+// changes, at most every statusInterval and at least every groupInterval,
+// until ctx ends.
+func (r *reporter) run(ctx context.Context) {
+	for _, e := range r.instance.Endpoint().Endpoints() {
+		tag := e.Tag()
+		set := func(s EndpointStatus) {
+			r.mu.Lock()
+			r.endpoints[tag] = s
+			r.mu.Unlock()
+			r.poke()
+		}
 		switch ep := e.(type) {
 		case adapter.OpenConnectEndpoint:
-			go watchOpenConnect(ctx, ep, func(s EndpointStatus) { set(e.Tag(), s) })
+			go watchOpenConnect(ctx, ep, set)
 		case adapter.TailscaleEndpoint:
 			go func() {
-				_ = ep.SubscribeTailscaleStatus(ctx, func(st *adapter.TailscaleEndpointStatus) { set(e.Tag(), tailscaleStatus(st)) })
+				_ = ep.SubscribeTailscaleStatus(ctx, func(st *adapter.TailscaleEndpointStatus) { set(tailscaleStatus(st)) })
 			}()
 		}
 	}
-	encoder := json.NewEncoder(w)
+	// Tests a group runs by itself land in the history.
+	hook := observable.NewSubscriber[struct{}](8)
+	r.history.AddUpdateHook(hook)
+	go func() {
+		updates, done := hook.Subscription()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-updates:
+				r.poke()
+			}
+		}
+	}()
+	r.poke()
+	// What was last sent of each endpoint and group: only what changed
+	// goes out again, one line each, which the daemon merges.
+	sent := map[string][]byte{}
+	send := func(key string, line StatusLine) error {
+		data, err := encode(line)
+		if err != nil || bytes.Equal(sent[key], data) {
+			return nil
+		}
+		sent[key] = data
+		return r.writeRaw(data)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-changed:
+		case <-r.changed:
+		case <-time.After(groupInterval):
 		}
-		mu.Lock()
-		line := StatusLine{Endpoints: make(map[string]EndpointStatus, len(statuses))}
-		for tag, s := range statuses {
-			line.Endpoints[tag] = s
+		r.mu.Lock()
+		endpoints := maps.Clone(r.endpoints)
+		r.mu.Unlock()
+		for tag, s := range endpoints {
+			if send("endpoint:"+tag, StatusLine{Endpoints: map[string]EndpointStatus{tag: s}}) != nil {
+				return
+			}
 		}
-		mu.Unlock()
-		if encoder.Encode(line) != nil {
-			return
+		for tag, g := range r.groups() {
+			if send("group:"+tag, StatusLine{Groups: map[string]GroupStatus{tag: g}}) != nil {
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -102,6 +232,37 @@ func reportEndpoints(ctx context.Context, instance *box.Box, w io.Writer) {
 		case <-time.After(statusInterval):
 		}
 	}
+}
+
+// groupInterval is how often a snapshot goes out regardless, so a group
+// that switched by itself is seen.
+const groupInterval = 15 * time.Second
+
+func (r *reporter) groups() map[string]GroupStatus {
+	out := map[string]GroupStatus{}
+	for _, o := range r.instance.Outbound().Outbounds() {
+		g, ok := o.(adapter.OutboundGroup)
+		if !ok {
+			continue
+		}
+		status := GroupStatus{Type: o.Type(), Now: g.Now(), Members: []MemberStatus{}}
+		for _, tag := range g.All() {
+			m := MemberStatus{Tag: tag}
+			// Groups keep a member's result under the tag it leads to, a
+			// group member's under the member in use.
+			key := tag
+			if member, ok := r.instance.Outbound().Outbound(tag); ok {
+				key = group.RealTag(member)
+			}
+			if h := r.history.LoadURLTestHistory(key); h != nil {
+				t := h.Time
+				m.DelayMS, m.TestedAt = int(h.Delay), &t
+			}
+			status.Members = append(status.Members, m)
+		}
+		out[o.Tag()] = status
+	}
+	return out
 }
 
 func watchOpenConnect(ctx context.Context, ep adapter.OpenConnectEndpoint, report func(EndpointStatus)) {
@@ -136,11 +297,16 @@ func openConnectStatus(ep adapter.OpenConnectEndpoint) EndpointStatus {
 		s.BrowserAuth = c.Browser != nil
 	}
 	if t := st.TunnelInfo; t != nil {
+		// The server decides how many; a status line has room for some.
 		for _, p := range append(append([]netip.Prefix{}, t.IPv4...), t.IPv6...) {
-			s.Addresses = append(s.Addresses, p.String())
+			if len(s.Addresses) < maxListed {
+				s.Addresses = append(s.Addresses, p.String())
+			}
 		}
 		for _, a := range t.DNS {
-			s.DNS = append(s.DNS, a.String())
+			if len(s.DNS) < maxListed {
+				s.DNS = append(s.DNS, a.String())
+			}
 		}
 		since := t.ConnectedSince
 		s.Since = &since
@@ -184,6 +350,9 @@ func tailscaleStatus(st *adapter.TailscaleEndpointStatus) EndpointStatus {
 	sort.Strings(s.Self)
 	return s
 }
+
+// maxListed bounds the addresses and DNS servers listed for an endpoint.
+const maxListed = 64
 
 // maxText bounds a VPN server's text in a status line, so one endpoint
 // cannot push every line past the daemon's limit. The daemon keeps only

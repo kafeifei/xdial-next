@@ -7,13 +7,16 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/kafeifei/xdial-next/internal/buildinfo"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/service"
 )
 
 // MaxConfigSize is the most the engine reads from stdin. The daemon checks
@@ -41,10 +44,49 @@ type Command struct {
 	// TailscaleLogout logs the tailscale line with this id out; it then
 	// waits for a new login, 3.5.
 	TailscaleLogout string `json:"tailscale_logout,omitempty"`
+	// Select switches a selector group to a member, 3.6.
+	Select *SelectCommand `json:"select,omitempty"`
+	// URLTest measures lines and the members of groups; the answer is a
+	// status line carrying a TestResult with the same id, 3.6.
+	URLTest *URLTestCommand `json:"url_test,omitempty"`
 }
 
-func runCommand(ctx context.Context, instance *box.Box, c Command, stderr io.Writer) {
-	if c.TailscaleLogout == "" {
+// SelectCommand switches Group to Member.
+type SelectCommand struct {
+	Group  string `json:"group"`
+	Member string `json:"member"`
+}
+
+// URLTestCommand tests Tags: a line, or every member of a group.
+type URLTestCommand struct {
+	ID   int      `json:"id"`
+	Tags []string `json:"tags"`
+}
+
+// testURL is what a test fetches through a line, sing-box's default.
+const testURL = "https://www.gstatic.com/generate_204"
+
+// Line tests, 3.6: each line has testTimeout and a whole test
+// TestDeadline; testWorkers lines are tested at a time, and a test covers
+// at most maxTested lines.
+const (
+	testTimeout  = 10 * time.Second
+	TestDeadline = time.Minute
+	testWorkers  = 16
+	maxTested    = 21 << 10
+)
+
+func runCommand(ctx context.Context, instance *box.Box, r *reporter, c Command, stderr io.Writer) {
+	switch {
+	case c.Select != nil:
+		o, ok := instance.Outbound().Outbound(c.Select.Group)
+		selector, isSelector := o.(interface{ SelectOutbound(string) bool })
+		if !ok || !isSelector || !selector.SelectOutbound(c.Select.Member) {
+			fmt.Fprintln(stderr, "engine: select: cannot select", c.Select.Member, "in", c.Select.Group)
+		}
+		r.poke()
+		return
+	case c.TailscaleLogout == "":
 		return
 	}
 	e, ok := instance.Endpoint().Get(c.TailscaleLogout)
@@ -86,6 +128,13 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	// each, until the daemon goes away, 6.3.
 	orphaned := make(chan struct{})
 	commands := make(chan Command, 8)
+	// Tests take up to a minute; they have a queue of their own, so a
+	// switch or a logout never waits behind one. A test's minute counts
+	// from when it arrived, waiting included, so its answer comes within
+	// what the daemon waits for. One that finds the queue full is answered
+	// at once.
+	tests := make(chan queuedTest, 2)
+	rejected := make(chan int, 64)
 	go func() {
 		defer close(orphaned)
 		in := json.NewDecoder(io.MultiReader(decoder.Buffered(), stdin))
@@ -94,6 +143,17 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 			if err := in.Decode(&c); err != nil {
 				_, _ = io.Copy(io.Discard, stdin)
 				return
+			}
+			if c.URLTest != nil {
+				select {
+				case tests <- queuedTest{c.URLTest, time.Now().Add(TestDeadline)}:
+				default:
+					select {
+					case rejected <- c.URLTest.ID:
+					default:
+					}
+				}
+				continue
 			}
 			select {
 			case commands <- c:
@@ -108,6 +168,10 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	if err := opts.UnmarshalJSONContext(ctx, data); err != nil {
 		return fail("parse", err)
 	}
+	// The engine's own urltest history, so it can report what groups
+	// measured; box.New uses it instead of making one.
+	history := urltest.NewHistoryStorage()
+	ctx = service.ContextWithPtr(ctx, history)
 	instance, err := box.New(box.Options{Context: ctx, Options: opts})
 	if err != nil {
 		return fail("create", err)
@@ -122,8 +186,9 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 		_ = instance.Close()
 		return 1
 	}
-	// After the ready line, stdout carries endpoint status, 6.3.
-	go reportEndpoints(ctx, instance, stdout)
+	// After the ready line, stdout carries status, 6.3.
+	reports := newReporter(instance, history, stdout, stderr)
+	go reports.run(ctx)
 	// Commands run one at a time in a worker of their own: a logout can
 	// wait on the control server, and the loop below must stay free for
 	// the signals and the daemon going away. Leaving cancels the command.
@@ -134,7 +199,28 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 			case <-commandCtx.Done():
 				return
 			case c := <-commands:
-				runCommand(commandCtx, instance, c, stderr)
+				runCommand(commandCtx, instance, reports, c, stderr)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-commandCtx.Done():
+				return
+			case id := <-rejected:
+				_ = reports.write(StatusLine{Test: &TestResult{ID: id, Error: "测速太多，等前面的测完再试"}})
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-commandCtx.Done():
+				return
+			case t := <-tests:
+				_ = reports.write(StatusLine{Test: &TestResult{ID: t.ID, Results: urlTest(commandCtx, t.deadline, instance, reports, t.Tags)}})
+				reports.poke()
 			}
 		}
 	}()
@@ -149,4 +235,78 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 		return 1
 	}
 	return 0
+}
+
+// queuedTest is a test waiting its turn, and when it must be done.
+type queuedTest struct {
+	*URLTestCommand
+	deadline time.Time
+}
+
+// urlTest measures each tag: every line a group leads to, however deep,
+// or the line itself, testWorkers at a time, until deadline. Lines the
+// deadline or maxTested leaves out say so. Every result also goes into the
+// history groups read, 3.6.
+func urlTest(ctx context.Context, deadline time.Time, instance *box.Box, r *reporter, tags []string) map[string]TestOutcome {
+	results := map[string]TestOutcome{}
+	var lines []adapter.Outbound
+	seen := map[string]bool{}
+	var expand func(tag string)
+	expand = func(tag string) {
+		if seen[tag] {
+			return
+		}
+		seen[tag] = true
+		o, ok := instance.Outbound().Outbound(tag)
+		switch g, isGroup := o.(adapter.OutboundGroup); {
+		case !ok:
+			results[tag] = TestOutcome{Error: "没有这条线路"}
+		case isGroup:
+			for _, member := range g.All() {
+				expand(member)
+			}
+		case len(lines) < maxTested:
+			lines = append(lines, o)
+		default:
+			results[tag] = TestOutcome{Error: "一次测的线路太多，没有测"}
+		}
+	}
+	for _, tag := range tags {
+		expand(tag)
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	var mu sync.Mutex
+	work := make(chan adapter.Outbound)
+	var wg sync.WaitGroup
+	for range min(testWorkers, len(lines)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for o := range work {
+				outcome := TestOutcome{Error: "没测完"}
+				if ctx.Err() == nil {
+					testCtx, cancelTest := context.WithTimeout(ctx, testTimeout)
+					delay, err := urltest.URLTest(testCtx, testURL, o)
+					cancelTest()
+					if err == nil {
+						outcome = TestOutcome{DelayMS: int(delay)}
+						r.history.StoreURLTestHistory(o.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
+					} else if ctx.Err() == nil {
+						outcome = TestOutcome{Error: "测不通"}
+						r.history.DeleteURLTestHistory(o.Tag())
+					}
+				}
+				mu.Lock()
+				results[o.Tag()] = outcome
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, o := range lines {
+		work <- o
+	}
+	close(work)
+	wg.Wait()
+	return results
 }

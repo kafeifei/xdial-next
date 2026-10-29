@@ -6,9 +6,11 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/netip"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -62,6 +64,9 @@ type Options struct {
 	RuleSet func(*config.Object) ([]*config.Value, bool)
 	// StateDirectory holds the tailscale state of each line, by id.
 	StateDirectory string
+	// Selections are the members picked by hand in selector groups, by
+	// group id: compiled as the group's default when still a member, 3.6.
+	Selections map[string]string
 	// TailscaleAuthKeys logs tailscale lines in with an auth key, by line
 	// id: given once by xdial tailscale login, never stored, 4.7.
 	TailscaleAuthKeys map[string]string
@@ -111,6 +116,13 @@ type Result struct {
 	TooManyMembers bool
 	// Secrets names the secrets the compiled objects use, sorted.
 	Secrets []string
+	// Groups are the members each compiled group runs with, by id.
+	Groups map[string][]string
+	// Outbounds are the tags of every line, group and node compiled in.
+	Outbounds []string
+	// StaleSelections are the groups whose member picked by hand is no
+	// longer one of theirs, or that are no longer selectors, 3.6.
+	StaleSelections []string
 }
 
 type compiler struct {
@@ -225,6 +237,13 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 		"log": map[string]any{"level": opts.LogLevel},
 	}
 	outbounds := []any{map[string]any{"type": "direct", "tag": config.Direct}}
+	groups := map[string][]string{}
+	var stale []string
+	for id := range opts.Selections {
+		if o := c.Line(id); o == nil || o.Kind != "group" {
+			stale = append(stale, id)
+		}
+	}
 	var endpoints []any
 	var endpointIDs []string
 	for _, list := range [][]*config.Object{c.Lines, c.Groups} {
@@ -239,7 +258,20 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 				v = v.With("domain_resolver", config.String(tagDNSLocal))
 			}
 			if o.Kind == "group" {
-				v = v.With("outbounds", k.expandMembers(o))
+				members := k.expandMembers(o)
+				v = v.With("outbounds", members)
+				tags := make([]string, 0, len(members.Items))
+				for _, m := range members.Items {
+					tags = append(tags, m.String)
+				}
+				groups[o.ID] = tags
+				if picked, ok := opts.Selections[o.ID]; ok {
+					if o.Type == "selector" && slices.Contains(tags, picked) {
+						v = v.With("default", config.String(picked))
+					} else {
+						stale = append(stale, o.ID)
+					}
+				}
 			}
 			if o.Type == "tailscale" {
 				v = v.With("state_directory", config.String(filepath.Join(opts.StateDirectory, o.ID)))
@@ -281,8 +313,16 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 	sort.Strings(k.pending)
 	sort.Strings(k.missing)
 	sort.Strings(k.missingSubs)
+	sort.Strings(stale)
+	tags := []string{config.Direct}
+	for id := range k.lines {
+		tags = append(tags, id)
+	}
+	tags = append(tags, slices.Collect(maps.Keys(k.nodeSeen))...)
+	sort.Strings(tags)
 	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty,
-		TooManyMembers: k.tooMany, Endpoints: endpointIDs, Secrets: k.usedSecrets()}, nil
+		TooManyMembers: k.tooMany, Endpoints: endpointIDs, Secrets: k.usedSecrets(),
+		Groups: groups, Outbounds: tags, StaleSelections: stale}, nil
 }
 
 func newCompiler(c *config.Config, opts Options) *compiler {
@@ -314,6 +354,22 @@ func (k *compiler) subscription(id string) *Subscription {
 	}
 	k.subs[id] = content
 	return content
+}
+
+// GroupMembers are the members group compiles to with the subscription
+// content subscription gives, and the subscriptions it has none for, whose
+// nodes cannot be known, 3.6.
+func GroupMembers(c *config.Config, group *config.Object, subscription func(*config.Object) (*Subscription, bool)) (members, unknown []string) {
+	k := newCompiler(c, Options{Secret: Placeholder, Subscription: subscription})
+	expanded := k.expandMembers(group)
+	if len(k.empty) > 0 {
+		// The direct put in for sing-box's sake is not a member.
+		return nil, k.missingSubs
+	}
+	for _, m := range expanded.Items {
+		members = append(members, m.String)
+	}
+	return members, k.missingSubs
 }
 
 // expandMembers turns the members of group o into outbound tags: ids as
