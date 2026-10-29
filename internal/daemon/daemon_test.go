@@ -1477,3 +1477,10 @@ func TestExplainPointsOutContentNewerThanTheEngine(t *testing.T) {
 		t.Errorf("after an update: %v", e)
 	}
 }
+
+func TestApplyIfAbsentTakesOnlyTheFirst(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": doc, "if_absent": true})
+	h.fails("config.apply", map[string]any{"content": doc, "if_absent": true}, cli.CodeConfigConflict)
+	h.ok("config.apply", map[string]any{"content": doc})
+}

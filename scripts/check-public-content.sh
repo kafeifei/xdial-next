@@ -21,7 +21,8 @@ ambiguous_phrase=$'\xe6\xb1\xa1\xe6\x9f\x93'
 forbidden_regex="${policy_term}|${policy_list}|${policy_geo}|${community_source}|${enterprise_domain}|${enterprise_address}|${restricted_phrase}|${misleading_phrase}|${ambiguous_phrase}"
 
 set +e
-matched_files="$(git grep -I -l -i -E -e "$forbidden_regex" -- .)"
+# --untracked: a new file not yet added is checked before it is committed.
+matched_files="$(git grep -I -l -i -E --untracked -e "$forbidden_regex" -- .)"
 grep_status=$?
 set -e
 if (( grep_status > 1 )); then
@@ -29,7 +30,7 @@ if (( grep_status > 1 )); then
   exit "$grep_status"
 fi
 if [[ -n "$matched_files" ]]; then
-  echo "public-content gate rejected tracked content in:" >&2
+  echo "public-content gate rejected content in:" >&2
   printf '%s\n' "$matched_files" >&2
   exit 1
 fi

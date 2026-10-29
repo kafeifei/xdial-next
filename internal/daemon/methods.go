@@ -165,6 +165,9 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 		Content string `json:"content"`
 		DryRun  bool   `json:"dry_run"`
 		IfMatch string `json:"if_match"`
+		// IfAbsent takes the configuration only where there is none yet,
+		// checked in the same control sequence as the write.
+		IfAbsent bool `json:"if_absent"`
 	}
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
@@ -206,6 +209,9 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	d.mu.Unlock()
 	if p.IfMatch != "" && p.IfMatch != revision {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "重新 xdial config export 后再改", "配置已经被改过：现在是 %s", revision)}
+	}
+	if p.IfAbsent && current != nil {
+		return reply{err: cli.Errorf(cli.CodeConfigConflict, "要整份替换就去掉这个条件", "daemon 里已经有配置（%s）", revision)}
 	}
 	scenarioGone := true
 	for _, s := range c.Scenarios {

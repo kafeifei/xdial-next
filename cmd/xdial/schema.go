@@ -180,6 +180,15 @@ func outputSchemas() map[string]any {
 			e["required"] = []string{"line"}
 			return e
 		}()),
+		"xdial.import.legacy/v1": envelope("xdial.import.legacy/v1", object(
+			[]string{"profiles", "lines", "groups", "rule_sets", "scenarios", "secrets", "left_out", "problems", "applied"},
+			map[string]any{
+				"profiles": map[string]any{"type": "integer"}, "lines": map[string]any{"type": "integer"}, "groups": map[string]any{"type": "integer"},
+				"rule_sets": map[string]any{"type": "integer"}, "scenarios": map[string]any{"type": "integer"}, "secrets": strList(),
+				"left_out": map[string]any{"type": "array", "items": object([]string{"what", "why"}, map[string]any{"what": str(), "why": str()})},
+				"problems": map[string]any{"type": "array", "items": object([]string{"what", "why"}, map[string]any{"what": str(), "why": str()})},
+				"applied":  map[string]any{"type": "boolean"}, "revision": str(),
+			})),
 		"xdial.explain/v1": envelope("xdial.explain/v1", object([]string{"scenario", "host", "line", "notes"}, map[string]any{
 			"scenario": str(), "host": str(), "port": map[string]any{"type": "integer"}, "addresses": strList(), "line": str(),
 			"rule": object([]string{"index", "within"}, map[string]any{
