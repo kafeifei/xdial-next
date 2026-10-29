@@ -263,10 +263,25 @@ func withoutLoginLinks(line string) string {
 // scrubber no longer recognizes.
 func scrubEndpoints(endpoints map[string]engine.EndpointStatus, scrub *scrubber) {
 	for id, e := range endpoints {
-		e.Error = cutText(scrub.scrub(e.Error))
-		e.AuthMessage = cutText(scrub.scrub(e.AuthMessage))
+		e.Error = scrubText(e.Error, scrub)
+		e.AuthMessage = scrubText(e.AuthMessage, scrub)
 		endpoints[id] = e
 	}
+}
+
+// scrubText scrubs one text and cuts it to maxEndpointText bytes. A text
+// the engine cut short may end in part of a secret, which scrubbing does
+// not recognize and which replacing the secrets before it can move into
+// what is kept; its last bytes, as many as the longest secret takes, are
+// dropped after scrubbing.
+func scrubText(s string, scrub *scrubber) string {
+	cut := strings.HasSuffix(s, engine.TruncatedMark)
+	s = scrub.scrub(strings.TrimSuffix(s, engine.TruncatedMark))
+	if cut {
+		s = s[:max(0, len(s)-scrub.longest)]
+		s = strings.ToValidUTF8(s, "") + "…"
+	}
+	return cutText(s)
 }
 
 // maxEndpointText bounds a VPN server's text in status and events.
