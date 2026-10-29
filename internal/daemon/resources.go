@@ -127,6 +127,9 @@ func (d *Daemon) ensureRuleSets(cfg *config.Config, scenario string, secrets map
 				return nil, err
 			}
 			if _, rules, ok := d.cachedRules(o, url); ok {
+				// A cache in use is not collected, 3.4.
+				now := time.Now()
+				_ = os.Chtimes(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), now, now)
 				content[o.ID] = rules
 				continue
 			}
@@ -270,11 +273,16 @@ func (d *Daemon) writeRuleSet(id string, c *cachedRuleSet) error {
 	if err := store.EnsureDir(d.ruleSetDir(), 0o700); err != nil {
 		return err
 	}
-	data, err := json.Marshal(c)
-	if err != nil {
+	// json.Marshal would escape <, > and & inside Source, growing it past
+	// the limit it was checked against and making an unchanged download
+	// compare as changed.
+	var data bytes.Buffer
+	enc := json.NewEncoder(&data)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(c); err != nil {
 		return err
 	}
-	return store.WriteFile(d.ruleSetPath(id, c.Fingerprint), data, 0o600)
+	return store.WriteFile(d.ruleSetPath(id, c.Fingerprint), data.Bytes(), 0o600)
 }
 
 // checkUsable has sing-box construct a configuration routing by the rules
@@ -312,10 +320,17 @@ func (d *Daemon) checkUsable(source []byte) error {
 	return nil
 }
 
-// collectRuleSets removes cached files no rule set of cfg uses any more,
-// once they are an hour old: a download for a configuration being applied
-// may not be in cfg yet. Callers hold d.res.
-func (d *Daemon) collectRuleSets(cfg *config.Config, secrets map[string]Secret) {
+// collectRuleSets removes cached files the current configuration does not
+// use, once they have not been used for an hour: a configuration being
+// applied may use one that is not current yet. Callers hold d.res.
+func (d *Daemon) collectRuleSets() {
+	d.mu.Lock()
+	cfg := d.cfg
+	secrets := maps.Clone(d.secrets)
+	d.mu.Unlock()
+	if cfg == nil {
+		return
+	}
 	keep := map[string]bool{}
 	for _, o := range cfg.RuleSets {
 		if o.Type != "remote" {
@@ -557,7 +572,7 @@ func (d *Daemon) refreshRuleSets() {
 		_, _ = d.downloadRuleSet(cfg, o, secrets)
 	}
 	d.res.Lock()
-	d.collectRuleSets(cfg, secrets)
+	d.collectRuleSets()
 	d.res.Unlock()
 }
 

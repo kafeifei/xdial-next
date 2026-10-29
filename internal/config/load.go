@@ -385,6 +385,9 @@ func (c *Config) checkObjects(w *walker) {
 	}
 }
 
+// reachesDirect follows group members only: a proxy's detour carries the
+// connection to the proxy server, and the download target is still
+// reached from the proxy's side.
 func (c *Config) reachesDirect(id string, seen map[string]bool) bool {
 	if id == Direct {
 		return true
@@ -397,9 +400,11 @@ func (c *Config) reachesDirect(id string, seen map[string]bool) bool {
 	if o == nil {
 		return false
 	}
-	for _, next := range outboundEdges(o) {
-		if c.reachesDirect(next, seen) {
-			return true
+	if members := o.Value.Get("outbounds"); members != nil {
+		for _, m := range members.Items {
+			if c.reachesDirect(m.String, seen) {
+				return true
+			}
 		}
 	}
 	return false

@@ -295,3 +295,24 @@ func TestRuleSetProblemsDoNotEchoRemoteKeys(t *testing.T) {
 		t.Error("an empty rule set was accepted")
 	}
 }
+
+func TestDownloadViaThroughADetourIsAllowed(t *testing.T) {
+	doc := `{"version": 1,
+		"lines": [{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "hk"}, "detour": "g"},
+		          {"id": "jp", "type": "trojan", "server": "jp.example", "server_port": 443, "password": {"secret": "jp"}}],
+		"groups": [{"id": "g", "type": "selector", "outbounds": ["jp", "direct"]}],
+		"rule_sets": [{"id": "r", "type": "remote", "format": "source", "url": "https://rules.example/r.json", "download_via": "hk"}],
+		"scenarios": [{"id": "s", "final": "direct"}]}`
+	if _, problems, _ := Load([]byte(doc)); len(problems) != 0 {
+		t.Errorf("a proxy whose detour may go direct still downloads through the proxy: %+v", problems)
+	}
+}
+
+func TestUnknownKeyLookingLikeAnIndexIsCut(t *testing.T) {
+	_, problems := CheckRuleSetSource([]byte(`{"version": 1, "rules": [{"domain": ["a"], "domain[123456789]": 1}]}`))
+	for _, p := range problems {
+		if strings.Contains(p.Path, "123456789") {
+			t.Errorf("path echoes a remote key: %q", p.Path)
+		}
+	}
+}

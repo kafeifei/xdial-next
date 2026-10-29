@@ -236,7 +236,7 @@ check m3-rule-set-list "jq -e '[.result.rule_sets[] | select(.id == \"apple\" or
 via="$(grep -c raw.githubusercontent.com "$work/ts.log" 2> /dev/null)"
 after_gh="$(sudo grep -c raw.githubusercontent.com "$data/private/engine.log" 2> /dev/null)"
 check m3-download-via-line-and-around-tun '[[ "${via:-0}" -ge 1 && "${after_gh:-0}" == "${before_gh:-0}" ]]' "via test server: $via; engine log lines: $before_gh -> $after_gh"
-perm="$(sudo stat -f '%Sp %Su' "$data/private/resources/rule-sets/apple.json" 2> /dev/null)"
+perm="$(sudo sh -c "stat -f '%Sp %Su' '$data/private/resources/rule-sets/'apple.*.json" 2> /dev/null)"
 check m3-cache-private '[[ "$perm" == "-rw------- root" ]]' "$perm"
 out="$("$xdial" rule-set update apple --json 2>&1)"
 check m3-update-not-modified "jq -e '.ok and .result.updated[0].changed == false and .result.updated[0].rules > 0' <<< '$out' > /dev/null" "$out"

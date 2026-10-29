@@ -60,8 +60,18 @@ func CheckRuleSetSource(data []byte) ([]*Value, []cli.Problem) {
 		w.problems = append(w.problems, cli.Problem{Code: cli.CodeConfigMore, Message: fmt.Sprintf("还有 %d 处问题没有列出", w.dropped)})
 	}
 	if w.failed() {
-		for i := range w.problems {
-			w.problems[i].Path = trustedPath(w.problems[i].Path)
+		for i, p := range w.problems {
+			path := p.Path
+			// The last segment of an unknown key's path is the key itself,
+			// whatever it looks like, even "domain[123]".
+			if p.Code == cli.CodeConfigUnknownKey {
+				if i := strings.LastIndex(path, "."); i >= 0 {
+					path = path[:i] + ".<未登记的键>"
+				} else {
+					path = "<未登记的键>"
+				}
+			}
+			w.problems[i].Path = trustedPath(path)
 		}
 		return nil, w.problems
 	}
@@ -74,6 +84,10 @@ func CheckRuleSetSource(data []byte) ([]*Value, []cli.Problem) {
 func trustedPath(path string) string {
 	var kept []string
 	for _, seg := range strings.Split(path, ".") {
+		if seg == "<未登记的键>" {
+			kept = append(kept, seg)
+			break
+		}
 		m := pathSegment.FindStringSubmatch(seg)
 		if m == nil || !ruleSetKeys()[m[1]] {
 			kept = append(kept, "<未登记的键>")

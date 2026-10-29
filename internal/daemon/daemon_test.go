@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
@@ -824,5 +825,22 @@ func TestRuleSetUpdateNeedsARemoteRuleSet(t *testing.T) {
 	h.fails("rule_set.update", map[string]any{"ids": []string{"r"}}, cli.CodeConfigConflict)
 	if u := h.ok("rule_set.update", nil)["updated"].([]any); len(u) != 0 {
 		t.Errorf("nothing to update, got %v", u)
+	}
+}
+
+func TestCacheKeepsCharactersJSONWouldEscape(t *testing.T) {
+	h := start(t, nil)
+	d := &Daemon{opts: Options{Layout: h.layout}}
+	source := []byte(`{"version":1,"rules":[{"process_name":["a&b<c>"]}]}`)
+	entry := &cachedRuleSet{Fingerprint: fingerprint("https://x.example/r", "source"), Source: source}
+	if err := d.writeRuleSet("r", entry); err != nil {
+		t.Fatal(err)
+	}
+	var back cachedRuleSet
+	if err := store.ReadJSON(d.ruleSetPath("r", entry.Fingerprint), &back); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(back.Source, source) {
+		t.Errorf("stored source changed: %s", back.Source)
 	}
 }
