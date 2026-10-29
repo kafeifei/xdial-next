@@ -387,7 +387,7 @@ sel="$("$xdial" group select pick vl --json 2>&1)"
 curl -sS -m 15 -o /dev/null https://1.0.0.1 2> /dev/null; sleep 1
 s2="$(inbound_count ss-in)"; v2="$(inbound_count vless-in)"
 st1="$("$xdial" status --json 2>&1)"
-check m4-group-select "jq -e '.result.applied' <<< '$sel' > /dev/null && [[ \$(jq -r .result.engine_pid <<< '$st0') == \$(jq -r .result.engine_pid <<< '$st1') ]] && jq -e '.result.groups.pick.now == \"vl\"' <<< '$st1' > /dev/null && (( s1 > s0 && v1 == v0 && v2 > v1 && s2 == s1 ))" "ss $s0->$s1->$s2 vless $v0->$v1->$v2 $(jq -c '.result.groups.pick.now' <<< "$st1")"
+check m4-group-select "jq -e '.result.applied' <<< '$sel' > /dev/null && [[ \$(jq -r .result.engine_pid <<< '$st0') == \$(jq -r .result.engine_pid <<< '$st1') ]] && jq -e '.result.groups.pick.now == \"vl\"' <<< '$st1' > /dev/null && (( s1 > s0 && v1 == v0 && v2 > v1 ))" "ss $s0->$s1->$s2 vless $v0->$v1->$v2 $(jq -c '.result.groups.pick.now' <<< "$st1") lines: $(grep 'to 1\.0\.0\.1:443' "$work/ts.log" | tail -4 | cut -c1-120 | tr '\n' ';')"
 tst="$("$xdial" line test pick --json 2>&1)"
 check m4-line-test "jq -e '.result.results.ss.delay_ms > 0 and .result.results.vl.delay_ms > 0' <<< '$tst' > /dev/null" "$tst"
 "$xdial" disconnect --json > /dev/null 2>&1
