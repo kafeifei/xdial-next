@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -16,8 +17,9 @@ import (
 const (
 	SchemaGroupSelect = "xdial.group.select/v1"
 	SchemaLineTest    = "xdial.line.test/v1"
-	// lineTestTimeout bounds a whole line test; each line has 10 seconds.
-	lineTestTimeout = 2 * time.Minute
+	// lineTestTimeout bounds waiting for a line test, which the engine
+	// ends within engine.TestDeadline.
+	lineTestTimeout = engine.TestDeadline + 15*time.Second
 )
 
 // selections returns a copy of the members picked by hand.
@@ -25,6 +27,47 @@ func (d *Daemon) selections() map[string]string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return maps.Clone(d.state.Selections)
+}
+
+// dropSelections forgets the members picked by hand of groups, which no
+// longer have them: a member that comes back later does not bring the
+// choice back over the group's default, 3.6. Callers hold d.ctl.
+func (d *Daemon) dropSelections(groups []string) {
+	d.mu.Lock()
+	next := d.state
+	d.mu.Unlock()
+	next.Selections = maps.Clone(next.Selections)
+	dropped := false
+	for _, g := range groups {
+		if _, ok := next.Selections[g]; ok {
+			delete(next.Selections, g)
+			dropped = true
+		}
+	}
+	if !dropped {
+		return
+	}
+	if err := d.persist(next); err != nil {
+		d.events.add("state_write_failed", map[string]any{"error": err.Error()})
+		return
+	}
+	d.events.add("selections_dropped", map[string]any{"groups": groups})
+}
+
+// staleSelections are the groups in selections cfg leaves without their
+// member: gone, no longer selectors, or no longer naming it. A node of a
+// subscription the group still names stays: whether the node is still
+// there shows when the group is compiled.
+func staleSelections(cfg *config.Config, selections map[string]string) []string {
+	var stale []string
+	for id, member := range selections {
+		g := cfg.Line(id)
+		if g == nil || g.Kind != "group" || g.Type != "selector" || !memberOf(g, member, nil) {
+			stale = append(stale, id)
+		}
+	}
+	slices.Sort(stale)
+	return stale
 }
 
 // GroupSelection is what group select returns.
@@ -73,7 +116,7 @@ func (d *Daemon) groupSelect(params json.RawMessage) reply {
 	}
 	result := GroupSelection{Group: p.Group, Member: p.Member}
 	if c != nil {
-		if _, running := c.engine.groupStatus()[p.Group]; running {
+		if _, running := c.groups[p.Group]; running {
 			if err := c.engine.send(engine.Command{Select: &engine.SelectCommand{Group: p.Group, Member: p.Member}}); err == nil {
 				result.Applied = waitGroup(c, p.Group, p.Member)
 			}
@@ -83,23 +126,21 @@ func (d *Daemon) groupSelect(params json.RawMessage) reply {
 	return reply{schema: SchemaGroupSelect, result: result}
 }
 
-// memberOf reports whether member may be picked in group: one of its ids,
-// or a node a subscription member brings, as the running group lists it
-// or by its tag when not connected.
+// memberOf reports whether member may be picked in group: one of the
+// members the running engine compiled it with, or, when it does not run
+// the group, one of its ids or a node of a subscription it names.
 func memberOf(group *config.Object, member string, c *connection) bool {
+	if c != nil {
+		if members, ok := c.groups[group.ID]; ok {
+			return slices.Contains(members, member)
+		}
+	}
 	for _, m := range config.Members(group) {
 		if m.Subscription == "" && m.ID == member {
 			return true
 		}
 		if m.Subscription != "" && strings.HasPrefix(member, engine.NodeTag(m.Subscription, "")) {
-			if c == nil {
-				return true
-			}
-		}
-	}
-	if c != nil {
-		if g, ok := c.engine.groupStatus()[group.ID]; ok {
-			return slices.ContainsFunc(g.Members, func(m engine.MemberStatus) bool { return m.Tag == member })
+			return true
 		}
 	}
 	return false
@@ -134,15 +175,26 @@ func (d *Daemon) lineTest(params json.RawMessage) reply {
 	}
 	tags := p.IDs
 	if len(tags) == 0 {
-		for tag := range c.engine.groupStatus() {
-			tags = append(tags, tag)
-		}
-		slices.Sort(tags)
+		tags = slices.Sorted(maps.Keys(c.groups))
 	}
 	if len(tags) == 0 {
 		return reply{err: cli.Errorf(cli.CodeConfigConflict, "写出要测的线路 id", "当前场景没有线路组")}
 	}
+	// Only what the engine runs: an unknown id would come back in the
+	// answer, as long as the caller wrote it.
+	var unknown []string
+	for _, tag := range tags {
+		if _, found := slices.BinarySearch(c.outbounds, tag); !found {
+			unknown = append(unknown, tag)
+		}
+	}
+	if len(unknown) > 0 {
+		return reply{err: cli.Errorf(cli.CodeConfigConflict, "用 xdial status 查看当前连接的线路和组", "当前连接里没有 %d 个线路：%s", len(unknown), truncate(strings.Join(unknown, " "), 200))}
+	}
 	result, err := c.engine.urlTest(tags, lineTestTimeout)
+	if err == nil && result.Error != "" {
+		err = errors.New(result.Error)
+	}
 	if err != nil {
 		return reply{err: cli.Errorf(cli.CodeEngineFailed, "", "%v", err)}
 	}

@@ -1174,16 +1174,58 @@ func TestSubscriptionMembersCanBeSelectedAndTested(t *testing.T) {
 	}
 }
 
+func TestSelectionOfARemovedMemberIsDropped(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("group.select", map[string]any{"group": "pick", "member": "b"})
+	// b leaves the group and comes back: the group's default is in use
+	// again, not the old choice.
+	without := strings.Replace(groupDoc, `"outbounds": ["a", "b"]},
+	           {"id": "fast"`, `"outbounds": ["a"]},
+	           {"id": "fast"`, 1)
+	if without == groupDoc {
+		t.Fatal("the test document changed")
+	}
+	h.ok("config.apply", map[string]any{"content": without})
+	if picked := h.d.selections(); len(picked) != 0 {
+		t.Errorf("after b left: %v", picked)
+	}
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	h.ok("connect", map[string]any{"scenario": "s"})
+	h.waitFor("the group's default", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		pick, _ := g["pick"].(map[string]any)
+		return pick != nil && pick["now"] == "a"
+	})
+}
+
+func TestSelectRightAfterConnectReachesTheEngine(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": groupDoc})
+	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
+	h.ok("connect", map[string]any{"scenario": "s"})
+	// No status from the engine yet, perhaps: the choice still goes to it.
+	h.ok("group.select", map[string]any{"group": "pick", "member": "b"})
+	h.waitFor("the choice in use", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		pick, _ := g["pick"].(map[string]any)
+		return pick != nil && pick["now"] == "b"
+	})
+}
+
 func TestLineTestAnswersThroughTheEngine(t *testing.T) {
 	h := start(t, nil)
 	h.fails("line.test", map[string]any{"ids": []string{"a"}}, cli.CodeConfigConflict)
 	h.ok("config.apply", map[string]any{"content": groupDoc})
 	h.ok("secret.set", map[string]any{"name": "p", "value": "a-password"})
 	h.ok("connect", map[string]any{"scenario": "s"})
-	r := h.ok("line.test", map[string]any{"ids": []string{"pick", "nope"}})
+	// Only what the engine runs; an unknown id is not echoed back at length.
+	h.fails("line.test", map[string]any{"ids": []string{"pick", strings.Repeat("n", 1<<16)}}, cli.CodeConfigConflict)
+	r := h.ok("line.test", map[string]any{"ids": []string{"pick"}})
 	results := r["results"].(map[string]any)
 	// Nothing listens on port 9: each member answers with an error.
-	for _, tag := range []string{"a", "b", "nope"} {
+	for _, tag := range []string{"a", "b"} {
 		o, _ := results[tag].(map[string]any)
 		if o == nil || o["error"] == nil {
 			t.Errorf("%s: %v", tag, results)

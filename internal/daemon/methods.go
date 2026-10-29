@@ -255,6 +255,7 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	d.mu.Lock()
 	d.cfg, d.raw = c, canonical
 	d.mu.Unlock()
+	d.dropSelections(staleSelections(c, d.selections()))
 	result.Applied = true
 	d.events.add("config_applied", map[string]any{"revision": result.Revision, "previous": result.PreviousRevision})
 	d.wakeResources()
