@@ -219,7 +219,9 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 			return err
 		}
 		format := o.Value.Get("format").String
-		old, hasOld := d.ruleSetMeta(o, url)
+		// Only content that still passes the checks may answer a 304; a
+		// cache that does not is downloaded in full.
+		old, _, hasOld := d.cachedRules(o, url)
 		req, err := d.fetchRequest(cfg, o, url, secrets)
 		if err != nil {
 			return err
@@ -297,6 +299,7 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 		return result, e
 	}
 	d.events.add("rule_set_updated", map[string]any{"id": o.ID, "changed": result.Changed, "rules": result.Rules})
+	go d.resumeAfterFetch()
 	return result, nil
 }
 

@@ -422,6 +422,7 @@ func (d *Daemon) connect(params json.RawMessage) reply {
 		scenario = d.state.Scenario
 	}
 	d.mu.Unlock()
+	scenario = defaultScenario(cfg, scenario)
 	if err := d.fetchFor(cfg, scenario); err != nil {
 		return reply{err: err}
 	}

@@ -160,6 +160,7 @@ type harness struct {
 	client *api.Client
 	cancel context.CancelFunc
 	done   chan error
+	d      *Daemon
 }
 
 func start(t *testing.T, authorize func(uint32) bool) *harness {
@@ -199,6 +200,7 @@ func startAt(t *testing.T, root, id string, authorize func(uint32) bool) *harnes
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
+	h.d = d
 	go func() { h.done <- d.Run(ctx) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -845,5 +847,24 @@ func TestCacheKeepsCharactersJSONWouldEscape(t *testing.T) {
 	}
 	if !bytes.Equal(back.Source, source) {
 		t.Errorf("stored source changed: %s", back.Source)
+	}
+}
+
+func TestConnectionResumesWhenTheCacheIsFilled(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://rules.example.com/r.json"
+	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
+	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	// The user wants a connection that is down: retries found the rule set
+	// missing from the cache and stopped.
+	h.d.mu.Lock()
+	h.d.state = State{Connected: true, Scenario: "s"}
+	h.d.status = "failed"
+	h.d.mu.Unlock()
+	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"domain": ["b.example"]}]}`)
+	// A download completing is what calls this.
+	h.d.resumeAfterFetch()
+	if s := h.ok("status", nil); s["state"] != "connected" {
+		t.Errorf("a filled cache did not bring the connection back: %v", s)
 	}
 }

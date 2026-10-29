@@ -53,6 +53,34 @@ type plan struct {
 	secrets  map[string]Secret
 }
 
+// defaultScenario is scenario, or the first one of cfg when none is named.
+func defaultScenario(cfg *config.Config, scenario string) string {
+	if scenario == "" && cfg != nil && len(cfg.Scenarios) > 0 {
+		return cfg.Scenarios[0].ID
+	}
+	return scenario
+}
+
+// resumeAfterFetch tries to connect again when the user wants a connection
+// that is down for now, typically because retries stopped while what the
+// scenario needs was still downloading. A download that completes calls
+// it: retries alone stop after 15 seconds, downloads can take longer.
+func (d *Daemon) resumeAfterFetch() {
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
+	d.mu.Lock()
+	waiting := d.state.Connected && !d.closing && d.conn == nil && d.status == "failed"
+	d.mu.Unlock()
+	if !waiting {
+		return
+	}
+	d.failures = nil
+	d.gen++
+	if err := d.establishLocked(); err != nil {
+		d.retryLocked(err.Error())
+	}
+}
+
 // prepare compiles scenario of cfg with the real secrets and the physical
 // DNS and checks everything that can be checked without touching the
 // running connection. A request that fails here changes nothing.
@@ -60,9 +88,7 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if cfg == nil {
 		return nil, cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")
 	}
-	if scenario == "" && len(cfg.Scenarios) > 0 {
-		scenario = cfg.Scenarios[0].ID
-	}
+	scenario = defaultScenario(cfg, scenario)
 	found := false
 	for _, s := range cfg.Scenarios {
 		found = found || s.ID == scenario
