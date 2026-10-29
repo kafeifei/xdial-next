@@ -34,3 +34,31 @@ func Revision() string {
 	}
 	return revision
 }
+
+// Build names this binary: the version and the revision. The daemon only
+// runs an engine that reports the same build as itself, ARCHITECTURE.md 6.3.
+func Build() string { return Version + "+" + Revision() }
+
+// SingBox returns the sing-box module version linked into this binary.
+func SingBox() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "github.com/sagernet/sing-box" {
+			if dep.Replace != nil {
+				return dep.Replace.Version
+			}
+			return dep.Version
+		}
+	}
+	return "unknown"
+}
+
+// Identity is the daemon identity this build installs and talks to,
+// ARCHITECTURE.md 6.1. Development builds are Debug; releases set it at
+// link time:
+//
+//	-ldflags "-X github.com/kafeifei/xdial-next/internal/buildinfo.Identity=com.kafeifei.xdial"
+var Identity = "com.kafeifei.xdial.debug"

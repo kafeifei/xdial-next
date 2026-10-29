@@ -2,3 +2,4 @@
 # 新增条目必须先经用户批准；改这个文件属于高风险。
 # 格式：每行一个模块路径，# 之后写批准日期和理由。
 github.com/sagernet/sing-box  # 2026-10-25 重写方案：唯一引入的上游项目
+github.com/sagernet/sing  # 2026-10-28 用户批准：sing-box 的底层库，同一作者，组装配置和解析 plugin_opts 要直接用

@@ -21,9 +21,10 @@ type rules struct {
 	Description string   `json:"description"`
 	Default     string   `json:"default"`
 	High        []string `json:"high"`
+	Medium      []string `json:"medium"`
 	Low         []string `json:"low"`
 
-	high, low []*regexp.Regexp
+	high, medium, low []*regexp.Regexp
 }
 
 func parseRules(data []byte) (*rules, error) {
@@ -42,6 +43,9 @@ func parseRules(data []byte) (*rules, error) {
 	if r.high, err = compileGlobs(r.High); err != nil {
 		return nil, err
 	}
+	if r.medium, err = compileGlobs(r.Medium); err != nil {
+		return nil, err
+	}
 	if r.low, err = compileGlobs(r.Low); err != nil {
 		return nil, err
 	}
@@ -49,30 +53,35 @@ func parseRules(data []byte) (*rules, error) {
 }
 
 // classify returns the tier of a change set with one reason per path. Any
-// path matching a high pattern makes it high; it is low only when every path
-// matches a low pattern; anything else, an empty change set included, gets
-// the default tier.
+// path matching a high pattern makes it high. Otherwise it is low when every
+// path matches a low pattern, and medium when every path matches a low or a
+// medium pattern. Anything else, an empty change set included, gets the
+// default tier, so a path nobody listed falls to the default rather than to
+// a tier that merges on its own.
 func (r *rules) classify(paths []string) (string, []string) {
 	reasons := make([]string, 0, len(paths))
-	high := false
-	allLow := len(paths) > 0
+	high, listed, medium := false, len(paths) > 0, false
 	for _, path := range paths {
 		switch {
 		case matchAny(r.high, path):
 			high = true
-			allLow = false
-			reasons = append(reasons, "high:  "+path)
+			reasons = append(reasons, "high:   "+path)
 		case matchAny(r.low, path):
-			reasons = append(reasons, "low:   "+path)
+			reasons = append(reasons, "low:    "+path)
+		case matchAny(r.medium, path):
+			medium = true
+			reasons = append(reasons, "medium: "+path)
 		default:
-			allLow = false
-			reasons = append(reasons, "other: "+path)
+			listed = false
+			reasons = append(reasons, "other:  "+path)
 		}
 	}
 	switch {
 	case high:
 		return tierHigh, reasons
-	case allLow:
+	case listed && medium:
+		return tierMedium, reasons
+	case listed:
 		return tierLow, reasons
 	default:
 		return r.Default, reasons

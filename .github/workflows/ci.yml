@@ -26,6 +26,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      # 构建 tag 和 Makefile 用同一份清单，见 ARCHITECTURE.md 2.3、2.6。
+      - name: build tags
+        run: echo "GOFLAGS=-tags=$(cat .github/build-tags.txt)" >> "$GITHUB_ENV"
       - name: gofmt
         run: test -z "$(gofmt -l . | tee /dev/stderr)"
       - name: go vet

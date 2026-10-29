@@ -53,10 +53,20 @@ func TestRepositoryRules(t *testing.T) {
 		want  string
 	}{
 		{"docs/incidents/README.md", tierLow},
-		{"README.md cmd/xdial/main_test.go", tierLow},
-		{"cmd/xdial/main.go", tierMedium},
-		{"docs/incidents/README.md cmd/xdial/main.go", tierMedium},
-		{"", tierMedium},
+		{"README.md docs/incidents/README.md", tierLow},
+		// The default is high: a path nobody listed waits for the owner.
+		// e2e scripts run on the host that drives the test VM.
+		{"e2e/run.sh", tierHigh},
+		{"pkg/daemon/api.go", tierHigh},
+		{"main.go", tierHigh},
+		{".golangci.yaml", tierHigh},
+		// Product code under cmd/ and internal/ carries the CLI surface, the
+		// configuration format and the daemon, so even its tests are high.
+		{"cmd/xdial/main.go", tierHigh},
+		{"cmd/xdial/main_test.go", tierHigh},
+		{"internal/config/parse.go", tierHigh},
+		{"ARCHITECTURE.md", tierHigh},
+		{"", tierHigh},
 		{"docs/agent/loop.md", tierHigh},
 		{"docs/agent/review-filters.md README.md", tierHigh},
 		{".github/workflows/ci.yml", tierHigh},
@@ -111,5 +121,28 @@ func TestReadPaths(t *testing.T) {
 	}
 	if strings.Join(paths, ",") != "a.go,docs/b.md" {
 		t.Errorf("readPaths = %q", paths)
+	}
+}
+
+func TestMediumIsAnAllowList(t *testing.T) {
+	r, err := parseRules([]byte(`{"default": "high", "high": ["secret/**"], "medium": ["app/ui/**"], "low": ["docs/**"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		paths string
+		want  string
+	}{
+		{"app/ui/view.swift", tierMedium},
+		{"app/ui/view.swift docs/a.md", tierMedium},
+		{"docs/a.md", tierLow},
+		{"app/ui/view.swift other.go", tierHigh},
+		{"app/ui/view.swift secret/x", tierHigh},
+		{"app/model.swift", tierHigh},
+	}
+	for _, c := range cases {
+		if got, _ := r.classify(strings.Fields(c.paths)); got != c.want {
+			t.Errorf("classify(%q) = %s, want %s", c.paths, got, c.want)
+		}
 	}
 }

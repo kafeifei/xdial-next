@@ -1,8 +1,9 @@
 # xdial-next
 
-XDial 的下一代：macOS 网络分流工具，CLI 是核心，只用上游 sing-box。现在处于 M0（搭项目循环骨架），还没有产品功能。
+XDial 的下一代：macOS 网络分流工具，CLI 是核心，只用上游 sing-box。M0（项目循环骨架）已完成，现在处于 M1（CLI 与配置），还没有产品功能。
 
 - 方案：[docs/plan.md](docs/plan.md)
+- 已定的架构（配置格式、凭据）：[ARCHITECTURE.md](ARCHITECTURE.md)
 - 项目循环的完整规则：[docs/agent/loop.md](docs/agent/loop.md)
 - 测试虚拟机与 e2e：[docs/agent/e2e.md](docs/agent/e2e.md)
 
@@ -27,9 +28,9 @@ XDial 的下一代：macOS 网络分流工具，CLI 是核心，只用上游 sin
 4. 处理审核意见：先把本轮的全部修复合在一起推送，再逐条回复 `[fixed]`、`[wrong]`、`[intended]`、`[wontfix]` 之一，最后 resolve。只靠回复理由处理 [重要] 意见、没有改代码时，回复完加 `re-review` 标签请审核复核。
 5. 同一个 PR 审了 3 轮还不通过（出现 `needs-rethink` 标签）：停止打补丁，在 PR 里写思路复盘，交给用户。
 6. 合并：
-   - 低风险 PR 由 risk 工作流开启自动合并；PR 落后 main 时，执行 `gh pr update-branch`，再等 CI。
-   - 中、高风险 PR 由用户加 `owner-approved` 批准后自动合并。agent 写全证据后说明"等用户批准"，然后停手。
-   - agent 不加 `owner-approved` 和 `allow-more-rounds`，不开自动合并，也不直接合并中、高风险的 PR。
+   - 低、中风险 PR 由 risk 工作流开启自动合并；PR 落后 main 时，执行 `gh pr update-branch`，再等 CI。
+   - 高风险 PR 由用户加 `owner-approved` 批准后自动合并。agent 写全证据后说明"等用户批准"，然后停手。
+   - agent 不加 `owner-approved` 和 `allow-more-rounds`，不开自动合并，也不直接合并高风险的 PR。
 7. 不碰 secrets、环境、分支保护和风险定档。确实需要改时，告诉用户。
 
 ## 命令
