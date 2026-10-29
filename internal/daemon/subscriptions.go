@@ -348,6 +348,8 @@ type subscriptionSource struct {
 	cfg     *config.Config
 	secrets map[string]Secret
 	content map[string]*engine.Subscription
+	// changed is when each subscription read last changed.
+	changed map[string]time.Time
 	err     error
 }
 
@@ -363,9 +365,13 @@ func (s *subscriptionSource) get(o *config.Object) (*engine.Subscription, bool) 
 		s.content[o.ID] = nil
 		return nil, false
 	}
-	_, c, ok := s.d.cachedSubscription(o, url)
+	meta, c, ok := s.d.cachedSubscription(o, url)
 	path := s.d.subscriptionPath(o.ID, subscriptionFingerprint(o, url))
 	if ok {
+		if s.changed == nil {
+			s.changed = map[string]time.Time{}
+		}
+		s.changed[o.ID] = meta.ChangedAt
 		// A cache in use is not collected.
 		now := time.Now()
 		_ = os.Chtimes(path, now, now)

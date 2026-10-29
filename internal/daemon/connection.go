@@ -40,6 +40,9 @@ type connection struct {
 	groups    map[string][]string
 	outbounds []string
 	physical  []netip.Addr
+	// up is when the engine came up: remote content that changed later
+	// is not in it, 3.4.
+	up        time.Time
 	lock      *connectionLock
 	engine    *engineProc
 	resolver  Resolver
@@ -275,6 +278,7 @@ func (d *Daemon) bringUp(p *plan) error {
 	if err := d.sys.FlushCache(); err != nil {
 		d.events.add("dns_flush_failed", map[string]any{"error": err.Error()})
 	}
+	c.up = time.Now()
 	d.mu.Lock()
 	d.conn = c
 	d.mu.Unlock()

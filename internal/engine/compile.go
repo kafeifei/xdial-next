@@ -166,6 +166,7 @@ type generatedSet struct {
 	tag      string
 	rules    []*config.Value
 	policies []string // each rule's policy
+	within   []int    // each rule's index among the subscription's rules
 }
 
 // Subscription is the checked content of one subscription, 1.5.
@@ -451,7 +452,7 @@ func (k *compiler) bindSubscription(index int, r config.ScenarioRule) {
 	}
 	var run *generatedSet
 	var runLine string
-	for _, rule := range content.Rules {
+	for i, rule := range content.Rules {
 		line, ok := r.Policies[rule.Policy]
 		if !ok {
 			line = r.Other
@@ -468,6 +469,7 @@ func (k *compiler) bindSubscription(index int, r config.ScenarioRule) {
 		}
 		run.rules = append(run.rules, rule.Rule)
 		run.policies = append(run.policies, rule.Policy)
+		run.within = append(run.within, i)
 	}
 }
 
