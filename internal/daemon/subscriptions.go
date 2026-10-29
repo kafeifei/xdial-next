@@ -222,7 +222,9 @@ func (d *Daemon) downloadSubscription(cfg *config.Config, o *config.Object, secr
 		return result, e
 	}
 	d.events.add("subscription_updated", map[string]any{"id": o.ID, "changed": result.Changed, "nodes": result.Nodes, "rules": result.Rules, "unsupported": result.Unsupported})
-	go d.resumeAfterFetch()
+	if result.Changed {
+		go d.resumeAfterFetch()
+	}
 	return result, nil
 }
 
