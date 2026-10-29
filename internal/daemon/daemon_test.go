@@ -1043,4 +1043,10 @@ func TestEndpointTextIsScrubbed(t *testing.T) {
 	if strings.Contains(e.Error+e.AuthMessage, "hunter2") || e.AuthURL == "" {
 		t.Errorf("scrubbed status: %+v", e)
 	}
+	// A secret straddling the cut is scrubbed before it is cut.
+	long := map[string]engine.EndpointStatus{"corp": {Error: strings.Repeat("x", maxEndpointText-5) + "hunter2-secret"}}
+	scrubEndpoints(long, newScrubber(map[string]Secret{"corp": {Value: "hunter2-secret"}}))
+	if strings.Contains(long["corp"].Error, "hunt") {
+		t.Errorf("part of a secret survived the cut: %s", long["corp"].Error[maxEndpointText-10:])
+	}
 }

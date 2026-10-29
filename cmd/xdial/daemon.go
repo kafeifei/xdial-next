@@ -649,8 +649,9 @@ func endpointLine(id string, e engine.EndpointStatus) string {
 	if len(e.Self) > 0 {
 		line += "，地址 " + strings.Join(e.Self, " ")
 	}
-	if e.DefaultRoute {
-		line += "；服务器推送了默认路由，原本走 final 的流量都会进这条 VPN"
+	if len(e.DefaultRoute) > 0 {
+		families := strings.ReplaceAll(strings.ReplaceAll(strings.Join(e.DefaultRoute, "、"), "ipv4", "IPv4"), "ipv6", "IPv6")
+		line += "；服务器推送了 " + families + " 的默认路由，原本走 final 的这些流量都会进这条 VPN"
 	}
 	return line
 }
