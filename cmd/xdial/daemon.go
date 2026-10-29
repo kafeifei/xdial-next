@@ -592,10 +592,11 @@ func runSubscriptionUpdate(ctx *context_) int {
 	return call(ctx, "subscription.update", map[string]any{"ids": ctx.args}, func(w io.Writer, raw json.RawMessage) {
 		var r struct {
 			Updated []struct {
-				ID      string `json:"id"`
-				Changed bool   `json:"changed"`
-				Nodes   int    `json:"nodes"`
-				Rules   int    `json:"rules"`
+				ID          string         `json:"id"`
+				Changed     bool           `json:"changed"`
+				Nodes       int            `json:"nodes"`
+				Rules       int            `json:"rules"`
+				Unsupported map[string]int `json:"unsupported"`
 			} `json:"updated"`
 		}
 		_ = json.Unmarshal(raw, &r)
@@ -605,6 +606,9 @@ func runSubscriptionUpdate(ctx *context_) int {
 				state = "已更新"
 			}
 			fmt.Fprintf(w, "%s：%s，%d 个节点，%d 条规则\n", cli.Escape(u.ID), state, u.Nodes, u.Rules)
+			if len(u.Unsupported) > 0 {
+				fmt.Fprintln(w, "  没收的条目：", cli.Escape(fmt.Sprint(u.Unsupported)))
+			}
 		}
 		if len(r.Updated) > 0 {
 			fmt.Fprintln(w, "新内容在下一次连接或切场景时生效")

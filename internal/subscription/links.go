@@ -150,10 +150,13 @@ func parseVMess(line string) (string, map[string]any, bool) {
 	if scy := m.str("scy"); scy != "" {
 		out["security"] = scy
 	}
-	if m.str("tls") == "tls" {
+	withTLS := m.str("tls") == "tls"
+	if withTLS {
 		tls := map[string]any{"enabled": true}
 		if sni := m.str("sni"); sni != "" {
 			tls["server_name"] = sni
+		} else if host := m.str("host"); host != "" && m.str("net") == "ws" {
+			tls["server_name"] = host
 		}
 		if fp := m.str("fp"); fp != "" {
 			tls["utls"] = map[string]any{"enabled": true, "fingerprint": fp}
@@ -163,7 +166,12 @@ func parseVMess(line string) (string, map[string]any, bool) {
 		}
 		out["tls"] = tls
 	}
-	transport, ok := linkTransport(m.str("net"), m.str("host"), m.str("path"), m.str("path"))
+	network := m.str("net")
+	if network == "tcp" && m.str("type") == "http" {
+		// v2rayN's HTTP/1.1 disguise over TCP.
+		network = "http/1.1"
+	}
+	transport, ok := linkTransport(network, m.str("host"), m.str("path"), m.str("path"), withTLS)
 	if !ok {
 		return "", nil, false
 	}
@@ -198,12 +206,15 @@ func parseURLLink(typ, line string) (string, map[string]any, bool) {
 	if typ != "vless" && security == "" {
 		security = "tls"
 	}
-	if security == "tls" || security == "reality" {
+	withTLS := security == "tls" || security == "reality"
+	if withTLS {
 		tls := map[string]any{"enabled": true}
 		if sni := q.Get("sni"); sni != "" {
 			tls["server_name"] = sni
 		} else if peer := q.Get("peer"); peer != "" {
 			tls["server_name"] = peer
+		} else if host := q.Get("host"); host != "" && q.Get("type") == "ws" {
+			tls["server_name"] = host
 		}
 		if q.Get("allowInsecure") == "1" || q.Get("insecure") == "1" {
 			tls["insecure"] = true
@@ -222,7 +233,7 @@ func parseURLLink(typ, line string) (string, map[string]any, bool) {
 		return "", nil, false
 	}
 	if typ != "anytls" {
-		transport, ok := linkTransport(q.Get("type"), q.Get("host"), q.Get("path"), q.Get("serviceName"))
+		transport, ok := linkTransport(q.Get("type"), q.Get("host"), q.Get("path"), q.Get("serviceName"), withTLS)
 		if !ok {
 			return "", nil, false
 		}
@@ -237,7 +248,10 @@ func parseURLLink(typ, line string) (string, map[string]any, bool) {
 	return name, out, true
 }
 
-func linkTransport(network, host, path, service string) (map[string]any, bool) {
+// linkTransport converts a share link's network. In these links "http" is
+// Xray's, which is HTTP/2 like "h2" and needs TLS; v2rayN's HTTP/1.1
+// disguise arrives as "http/1.1" and must go without, as in clashTransport.
+func linkTransport(network, host, path, service string, withTLS bool) (map[string]any, bool) {
 	switch network {
 	case "", "tcp", "raw":
 		return nil, true
@@ -252,7 +266,10 @@ func linkTransport(network, host, path, service string) (map[string]any, bool) {
 		return t, true
 	case "grpc":
 		return map[string]any{"type": "grpc", "service_name": service}, true
-	case "h2", "http":
+	case "h2", "http", "http/1.1":
+		if withTLS != (network != "http/1.1") {
+			return nil, false
+		}
 		t := map[string]any{"type": "http"}
 		if host != "" {
 			t["host"] = strings.Split(host, ",")

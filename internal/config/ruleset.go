@@ -113,3 +113,29 @@ var ruleSetKeys = sync.OnceValue(func() map[string]bool {
 	walk(headlessRuleSpecWithin(0, maxRuleSetList))
 	return keys
 })
+
+// CheckRules checks rules from a remote one at a time, as a subscription's
+// are: a rule that fails is left out by the caller rather than failing the
+// rest. All of them share one budget for regular expressions, so splitting
+// them does not raise what they may cost. It returns each rule's checked
+// value, or nil where it failed, and false once the budget is spent.
+func CheckRules(rules [][]byte) ([]*Value, bool) {
+	w := &walker{remote: true}
+	spec := headlessRuleSpecWithin(0, maxRuleSetList)
+	out := make([]*Value, len(rules))
+	for i, raw := range rules {
+		v, err := parseWithin(raw, RuleSetMaxSize, maxRuleSetValues)
+		if err != nil {
+			continue
+		}
+		before := len(w.problems) + w.dropped
+		w.field(v, spec, "rule", nil)
+		if w.regexInsts > maxDocumentRegexInsts {
+			return nil, false
+		}
+		if len(w.problems)+w.dropped == before {
+			out[i] = v
+		}
+	}
+	return out, true
+}

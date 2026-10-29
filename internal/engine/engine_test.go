@@ -567,8 +567,10 @@ func TestCompileSubscription(t *testing.T) {
 }
 
 func TestCompileSubscriptionMissingOrEmpty(t *testing.T) {
+	// Scenario o ends at the group, so the group and its placeholder node
+	// are compiled; its subscription rules, without content, add nothing.
 	c := loadDoc(t, subscriptionDoc)
-	r, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir(), TUN: true})
+	r, err := Compile(c, Options{Scenario: "o", StateDirectory: t.TempDir(), TUN: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,5 +589,63 @@ func TestCompileSubscriptionMissingOrEmpty(t *testing.T) {
 	}
 	if fmt.Sprint(r.EmptyGroups) != "[proxy]" {
 		t.Errorf("empty groups: %v", r.EmptyGroups)
+	}
+}
+
+func TestCompileSubscriptionBounds(t *testing.T) {
+	// Repeated references collapse; an unused mapping reaches nothing.
+	doc := strings.Replace(subscriptionDoc, `[{"subscription": "air", "filter": "香港", "exclude": "剩余"}, "jp"]`,
+		`[{"subscription": "air"}, {"subscription": "air"}, "jp", "jp"]`, 1)
+	doc = strings.Replace(doc, `"other": "direct"`, `"other": "proxy"`, 1)
+	c := loadDoc(t, doc)
+	content := airContent(t)
+	r, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir(), TUN: true,
+		Subscription: func(*config.Object) (*Subscription, bool) { return content, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	_ = json.Unmarshal(r.JSON, &out)
+	for _, o := range out.Outbounds {
+		if o["tag"] == "proxy" && len(o["outbounds"].([]any)) != 5 {
+			t.Errorf("members not deduplicated: %v", o["outbounds"])
+		}
+	}
+	// Scenario s maps Proxy, DIRECT and REJECT; a scenario whose rules all
+	// go elsewhere must not bring jp up through an unused mapping.
+	unused := loadDoc(t, strings.Replace(subscriptionDoc, `"policies": {"Proxy": "proxy", "DIRECT": "direct", "REJECT": "block"}`,
+		`"policies": {"Proxy": "direct", "DIRECT": "direct", "REJECT": "block", "Nobody": "jp"}`, 1))
+	r, err = Compile(unused, Options{Scenario: "s", StateDirectory: t.TempDir(), TUN: true,
+		Subscription: func(*config.Object) (*Subscription, bool) { return content, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(r.JSON), `"tag":"jp"`) {
+		t.Error("a mapping no rule uses compiled its line")
+	}
+	// Many groups naming a large subscription stop at the budget.
+	big := &Subscription{}
+	for i := range 2000 {
+		big.Nodes = append(big.Nodes, SubscriptionNode{Name: fmt.Sprint("n", i), Outbound: content.Nodes[0].Outbound})
+	}
+	var groups []string
+	for i := range 20 {
+		groups = append(groups, fmt.Sprintf(`{"id": "g%d", "type": "selector", "outbounds": [{"subscription": "air"}]}`, i))
+	}
+	var finals []string
+	for i := range 20 {
+		finals = append(finals, fmt.Sprintf(`{"id": "s%d", "rules": [], "final": "g%d"}`, i, i))
+	}
+	many := loadDoc(t, `{"version": 1, "groups": [`+strings.Join(groups, ",")+`],
+		"subscriptions": [{"id": "air", "url": {"secret": "u"}}], "scenarios": [`+strings.Join(finals, ",")+`]}`)
+	r, err = Compile(many, Options{StateDirectory: t.TempDir(),
+		Subscription: func(*config.Object) (*Subscription, bool) { return big, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.TooManyMembers {
+		t.Error("20 groups of 2000 nodes did not hit the member budget")
 	}
 }

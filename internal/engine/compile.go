@@ -101,6 +101,9 @@ type Result struct {
 	// EmptyGroups are groups none of whose members exist: every member
 	// came from subscriptions whose nodes the filters left out.
 	EmptyGroups []string
+	// TooManyMembers is set when groups expand to more than
+	// MaxExpandedMembers members; the configuration is then not complete.
+	TooManyMembers bool
 	// Secrets names the secrets the compiled objects use, sorted.
 	Secrets []string
 }
@@ -120,6 +123,8 @@ type compiler struct {
 	nodes       []any
 	nodeSeen    map[string]bool
 	empty       []string
+	members     int
+	tooMany     bool
 	// bindings are the scenario's rules as compiled: a rule set tag and
 	// the line it goes to, in order. generated holds the inline rule sets
 	// made from subscription rules.
@@ -156,6 +161,11 @@ type SubscriptionRule struct {
 	Policy string
 	Rule   *config.Value
 }
+
+// MaxExpandedMembers bounds the members all groups expand to together:
+// subscription members multiply, a group may name a subscription many
+// times and many groups may name it, 1.5.
+const MaxExpandedMembers = 20000
 
 // NodeTag is the tag a subscription node compiles to.
 func NodeTag(subscription, name string) string {
@@ -262,7 +272,8 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 	sort.Strings(k.pending)
 	sort.Strings(k.missing)
 	sort.Strings(k.missingSubs)
-	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty, Secrets: k.usedSecrets()}, nil
+	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty,
+		TooManyMembers: k.tooMany, Secrets: k.usedSecrets()}, nil
 }
 
 func newCompiler(c *config.Config, opts Options) *compiler {
@@ -301,16 +312,28 @@ func (k *compiler) subscription(id string) *Subscription {
 // select, each node compiled once, 1.5.
 func (k *compiler) expandMembers(o *config.Object) *config.Value {
 	list := &config.Value{Kind: config.KindArray}
+	seen := map[string]bool{}
+	add := func(tag string) {
+		if seen[tag] || k.tooMany {
+			return
+		}
+		if k.members++; k.members > MaxExpandedMembers {
+			k.tooMany = true
+			return
+		}
+		seen[tag] = true
+		list.Items = append(list.Items, config.String(tag))
+	}
 	for _, m := range config.Members(o) {
 		if m.Subscription == "" {
-			list.Items = append(list.Items, config.String(m.ID))
+			add(m.ID)
 			continue
 		}
 		content := k.subscription(m.Subscription)
 		if content == nil {
 			tag := NodeTag(m.Subscription, "placeholder")
 			k.addNode(tag, placeholderNode())
-			list.Items = append(list.Items, config.String(tag))
+			add(tag)
 			continue
 		}
 		filter, _ := regexp.Compile(m.Filter)
@@ -320,8 +343,10 @@ func (k *compiler) expandMembers(o *config.Object) *config.Value {
 				continue
 			}
 			tag := NodeTag(m.Subscription, n.Name)
-			k.addNode(tag, n.Outbound)
-			list.Items = append(list.Items, config.String(tag))
+			if !seen[tag] && !k.tooMany {
+				k.addNode(tag, n.Outbound)
+			}
+			add(tag)
 		}
 	}
 	if len(list.Items) == 0 {
@@ -351,13 +376,9 @@ func placeholderNode() *config.Value {
 // rules: in their order, each to the line its policy maps to, else to
 // Other, else left out. Consecutive rules going to the same line share one
 // generated rule set, 1.5.
+// Only the lines its kept rules go to are reached: a mapping no rule uses
+// must not bring a line up, an endpoint least of all.
 func (k *compiler) bindSubscription(r config.ScenarioRule) {
-	for _, line := range r.Policies {
-		k.reach(line)
-	}
-	if r.Other != "" {
-		k.reach(r.Other)
-	}
 	content := k.subscription(r.Subscription)
 	if content == nil {
 		return
@@ -373,6 +394,7 @@ func (k *compiler) bindSubscription(r config.ScenarioRule) {
 			continue
 		}
 		if run == nil || line != runLine {
+			k.reach(line)
 			k.generated = append(k.generated, generatedSet{tag: fmt.Sprintf("%ssub:%s:rules-%d", tagPrefix, r.Subscription, len(k.generated))})
 			run = &k.generated[len(k.generated)-1]
 			runLine = line

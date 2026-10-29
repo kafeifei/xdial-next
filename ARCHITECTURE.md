@@ -131,6 +131,10 @@
     - 凭据字段直接写值，写成凭据引用就拒绝，否则恶意订阅能把用户设置的凭据引到自己的服务器。
   - 没通过的节点不收，按 `node:invalid` 计数；不支持的类型（hysteria2、tuic 等）按 `node:<类型>` 计数。一个可用节点都没有就算下载失败。
   - 名字去掉控制字符，最长 256 字节，重名的按顺序加 ` (2)`、` (3)`。最多 2000 个节点。
+  - 转换按这些格式的实际语义（以 mihomo 为准），sing-box 表达不了的组合不收：
+    - WebSocket 节点没写 `servername` 时，用 `Host` 头当 SNI；
+    - Clash 的 `network: h2` 要有 TLS，`network: http`（TLS 外面的 HTTP/1.1 伪装）不能有 TLS：sing-box 的 http 传输有 TLS 时走 HTTP/2；
+    - shadowsocks 插件的默认 `host` 是 bing.com，v2ray-plugin 写了 `mux: false` 才关多路复用，`skip-cert-verify` 不收。
   - 节点自带的凭据只存在 daemon 的缓存里，不出现在任何输出：`xdial subscription show` 只列名字、类型、服务器和端口。
 - **线路组引用节点**：`outbounds` 里写
 
@@ -140,6 +144,7 @@
   ```
 
   - 编译时展开成名字被 `filter` 匹配、不被 `exclude` 匹配的节点，按订阅里的顺序。两个都不写就是全部节点。正则按 1.3 的预算计。
+  - 同一个组里重复的成员只算一次；所有组展开后的成员合计最多 2 万个，超过就报 `resource.too_large`，现有连接不动。
   - 节点编成 tag 为 `xdial:sub:<订阅 id>:<名字>` 的出站，只编被组用到的；和线路一样用物理网络的 DNS 解析自己服务器的域名（3.3）。
   - 一个组展开后一个成员都没有，连接时报 `resource.missing`，现有连接不动。
   - 节点不能直接当场景的目标或 `detour`，只能经组用。`download_via` 经过的组不能有订阅成员：下载子进程只装配置里的线路（3.4）。
@@ -152,14 +157,15 @@
   ```
 
   - 订阅里的规则按原来的顺序放在这条场景规则的位置上，每条走它的策略名在 `policies` 里对应的线路；`policies` 里没有的走 `other`，不写 `other` 就不收。
+  - 只有真被规则用到的线路才会编进去：写了映射却没有规则走它，那条线路（比如一条 VPN）不会因此上线。
   - 连续走同一条线路的规则合成一个编译生成的规则集，tag 为 `xdial:sub:<订阅 id>:rules-<序号>`。所以订阅里规则的先后关系不变。
   - 策略名是订阅里写的原样（Clash 规则的第三段），`xdial subscription list` / `show` 列出每个策略名和用到它的规则数。
   - 这些规则和普通规则集一样参与 DNS（3.3）：纯域名条件的部分交给所选线路的 DNS server。
 - **规则**：
   - Clash 规则按类型转换：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-REGEX`、`IP-CIDR`、`IP-CIDR6`、`DST-PORT`、`PROCESS-NAME`、`PROCESS-PATH`、`NETWORK`。
-  - `no-resolve` 忽略：XDial 先解析域名目的地再路由（3.2）。`MATCH` 不收，由场景的 `final` 代替。
+  - `no-resolve` 忽略：XDial 先解析域名目的地再路由（3.2）。带其他参数的规则（例如 `src`，按来源 IP 匹配）不收，按 `rule:<类型>,<参数>` 计数。`MATCH` 不收，由场景的 `final` 代替。
   - 其余类型（`GEOIP`、`GEOSITE`、`RULE-SET`、`AND`/`OR`/`NOT`、`SRC-*` 等）不收，按 `rule:<类型>` 计数。需要的话，用远程规则集补在场景里，例如订阅规则后面加一条国内 IP 直连。
-  - 每条规则再过一遍和规则集相同的检查，没通过的按 `rule:invalid` 计数。最多 5 万条。
+  - 每条规则再过一遍和规则集相同的检查，没通过的按 `rule:invalid` 计数。最多 5 万条。所有规则共用一份正则预算（同一个规则集的预算），超了整份订阅不收。
 - **不悄悄丢掉**：上面所有没收的条目按类型计数，存在缓存里，`xdial subscription list`、`update` 的结果和事件日志里都有。
 - **缓存**：在 `private/resources/subscriptions/<id>.<指纹前 16 位>.json`，指纹是 url 和 User-Agent 的 SHA-256；写法、清理、`ETag` 同远程规则集（3.4）。
 - **什么时候下载**：同远程规则集。连接或切场景时，编译器报出场景用到而缓存里没有的订阅，先下载再编译一次；失败则这次请求失败。后台按 `update_interval` 更新，新内容在下一次连接或切场景时生效。

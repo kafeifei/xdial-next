@@ -95,16 +95,22 @@ func checkContent(c *subscription.Content) (*engine.Subscription, int, error) {
 		nodes = append(nodes, n)
 		out.Nodes = append(out.Nodes, engine.SubscriptionNode{Name: n.Name, Outbound: v})
 	}
+	raw := make([][]byte, len(c.Rules))
+	for i, r := range c.Rules {
+		raw[i] = r.Rule
+	}
+	checked, ok := config.CheckRules(raw)
+	if !ok {
+		return nil, 0, cli.Errorf(cli.CodeResourceTooLarge, "", "订阅规则里的正则合计超出上限")
+	}
 	var rules []subscription.Rule
-	for _, r := range c.Rules {
-		set, _ := json.Marshal(map[string]any{"version": config.MaxRuleSetVersion, "rules": []json.RawMessage{r.Rule}})
-		checked, problems := config.CheckRuleSetSource(set)
-		if len(problems) > 0 || len(checked) != 1 {
+	for i, r := range c.Rules {
+		if checked[i] == nil {
 			dropped++
 			continue
 		}
 		rules = append(rules, r)
-		out.Rules = append(out.Rules, engine.SubscriptionRule{Policy: r.Policy, Rule: checked[0]})
+		out.Rules = append(out.Rules, engine.SubscriptionRule{Policy: r.Policy, Rule: checked[i]})
 	}
 	if dropped > 0 {
 		if c.Unsupported == nil {
@@ -199,7 +205,7 @@ func (d *Daemon) downloadSubscription(cfg *config.Config, o *config.Object, secr
 		d.events.add("subscription_update_failed", map[string]any{"id": o.ID, "code": e.Code, "error": e.Message})
 		return result, e
 	}
-	d.events.add("subscription_updated", map[string]any{"id": o.ID, "changed": result.Changed, "nodes": result.Nodes, "rules": result.Rules})
+	d.events.add("subscription_updated", map[string]any{"id": o.ID, "changed": result.Changed, "nodes": result.Nodes, "rules": result.Rules, "unsupported": result.Unsupported})
 	return result, nil
 }
 

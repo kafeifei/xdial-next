@@ -180,11 +180,19 @@ func clashOutbound(m clashMap) (map[string]any, bool) {
 	}
 	typ := out["type"].(string)
 	// TLS: on by default for trojan and anytls, by "tls: true" otherwise.
-	if typ == "trojan" || typ == "anytls" || m.bool("tls") {
+	withTLS := typ == "trojan" || typ == "anytls" || m.bool("tls")
+	if withTLS {
 		tls := map[string]any{"enabled": true}
 		for _, key := range []string{"sni", "servername"} {
 			if s := m.str(key); s != "" {
 				tls["server_name"] = s
+			}
+		}
+		// Like mihomo, a WebSocket node without a server name verifies
+		// the certificate against its Host header.
+		if _, set := tls["server_name"]; !set && strings.EqualFold(m.str("network"), "ws") {
+			if host := m.sub("ws-opts").sub("headers").str("Host"); host != "" {
+				tls["server_name"] = host
 			}
 		}
 		if m.bool("skip-cert-verify") {
@@ -202,7 +210,7 @@ func clashOutbound(m clashMap) (map[string]any, bool) {
 		out["tls"] = tls
 	}
 	if typ == "vmess" || typ == "vless" || typ == "trojan" {
-		transport, ok := clashTransport(m)
+		transport, ok := clashTransport(m, withTLS)
 		if !ok {
 			return nil, false
 		}
@@ -216,9 +224,11 @@ func clashOutbound(m clashMap) (map[string]any, bool) {
 	return out, true
 }
 
-// clashTransport converts network and its options; false for a network
-// sing-box has no transport for.
-func clashTransport(m clashMap) (map[string]any, bool) {
+// clashTransport converts network and its options; false for one sing-box
+// cannot express. sing-box's http transport speaks HTTP/2 over TLS and
+// HTTP/1.1 without it, so Clash's h2 needs TLS and its http, HTTP/1.1
+// disguise, must go without.
+func clashTransport(m clashMap, withTLS bool) (map[string]any, bool) {
 	switch network := strings.ToLower(m.str("network")); network {
 	case "", "tcp":
 		return nil, true
@@ -240,15 +250,33 @@ func clashTransport(m clashMap) (map[string]any, bool) {
 		return t, true
 	case "grpc":
 		return map[string]any{"type": "grpc", "service_name": m.sub("grpc-opts").str("grpc-service-name")}, true
-	case "h2", "http":
-		key := network + "-opts"
-		o := m.sub(key)
+	case "h2":
+		if !withTLS {
+			return nil, false
+		}
+		o := m.sub("h2-opts")
 		t := map[string]any{"type": "http"}
 		if hosts := o.strs("host"); len(hosts) > 0 {
 			t["host"] = hosts
 		}
+		if path := o.str("path"); path != "" {
+			t["path"] = path
+		}
+		return t, true
+	case "http":
+		if withTLS {
+			return nil, false
+		}
+		o := m.sub("http-opts")
+		t := map[string]any{"type": "http"}
+		if hosts := o.sub("headers").strs("Host"); len(hosts) > 0 {
+			t["host"] = hosts
+		}
 		if paths := o.strs("path"); len(paths) > 0 {
 			t["path"] = paths[0]
+		}
+		if method := o.str("method"); method != "" {
+			t["method"] = method
 		}
 		return t, true
 	}
@@ -259,25 +287,31 @@ func clashTransport(m clashMap) (map[string]any, bool) {
 // plugin_opts; false for one it does not support.
 func clashPlugin(m clashMap) (string, string, bool) {
 	o := m.sub("plugin-opts")
-	switch m.str("plugin") {
-	case "":
+	if m.str("plugin") == "" {
 		return "", "", true
+	}
+	// Defaults are mihomo's, written out where sing-box's differ: the host
+	// is bing.com, and v2ray-plugin multiplexes unless mux is false.
+	host := o.str("host")
+	if host == "" {
+		host = "bing.com"
+	}
+	switch m.str("plugin") {
 	case "obfs":
-		opts := "obfs=" + o.str("mode")
-		if host := o.str("host"); host != "" {
-			opts += ";obfs-host=" + host
-		}
-		return "obfs-local", opts, true
+		return "obfs-local", "obfs=" + o.str("mode") + ";obfs-host=" + host, true
 	case "v2ray-plugin":
-		opts := []string{"mode=" + o.str("mode")}
+		if o.bool("skip-cert-verify") || (o.str("mode") != "" && o.str("mode") != "websocket") {
+			return "", "", false
+		}
+		opts := []string{"mode=websocket", "host=" + host}
 		if o.bool("tls") {
 			opts = append(opts, "tls")
 		}
-		if host := o.str("host"); host != "" {
-			opts = append(opts, "host="+host)
-		}
 		if path := o.str("path"); path != "" {
 			opts = append(opts, "path="+path)
+		}
+		if mux, set := o["mux"]; set && mux == false {
+			opts = append(opts, "mux=0")
 		}
 		return "v2ray-plugin", strings.Join(opts, ";"), true
 	}
@@ -301,6 +335,13 @@ func clashRule(line string) (rule map[string]any, policy, typ string, ok bool) {
 	value, policy := parts[1], clean(parts[2])
 	if policy == "" || value == "" {
 		return nil, "", typ, false
+	}
+	// no-resolve is the only parameter with nothing to carry over; any
+	// other, such as src, changes what the rule matches.
+	for _, param := range parts[3:] {
+		if !strings.EqualFold(param, "no-resolve") {
+			return nil, "", typ + "," + strings.ToLower(param), false
+		}
 	}
 	// no-resolve is dropped: XDial resolves domain destinations before
 	// routing either way, ARCHITECTURE.md 3.2.

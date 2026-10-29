@@ -285,14 +285,17 @@ list="$("$xdial" subscription list --json 2>&1)"
 check m3-subscription-list "jq -e '.result.subscriptions[0] | .cached and .format == \"clash\" and .nodes == 2 and .rules == 2 and .unsupported[\"node:hysteria2\"] == 1 and .unsupported[\"rule:geoip\"] == 1 and ([.policies[].name] == [\"Proxy\", \"DIRECT\"])' <<< '$list' > /dev/null" "$(jq -c '.result.subscriptions[0] | {cached, format, nodes, rules, unsupported, policies}' <<< "$list")"
 show="$("$xdial" subscription show air --json 2>&1)"
 check m3-subscription-show-no-secrets "jq -e '.ok and (.result.nodes | length) == 2' <<< '$show' > /dev/null && ! grep -q e2e-ss-pass <<< '$show'" "$(jq -c '.result.nodes' <<< "$show")"
-before_vless="$(grep -c 'vless-in.*example.org' "$work/ts.log" 2> /dev/null)"
-before_apple="$(grep -c 'apple.com' "$work/ts.log" 2> /dev/null)"
+# 经 TUN 进来的连接交给节点时带的是 IP，测试服务端日志里看不到域名：比较 vless 入站的连接数。
+# example.org 按订阅规则走 proxy 组（vless 节点），它的 DNS 也经这个组；apple.com 走 direct，不该增加。
+vless_count() { grep -c 'vless-in' "$work/ts.log" 2> /dev/null; }
+c0="$(vless_count)"
 code_org="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://example.org 2>&1)"
+sleep 1
+c1="$(vless_count)"
 code_apple="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://www.apple.com 2>&1)"
 sleep 1
-after_vless="$(grep -c 'vless-in.*example.org' "$work/ts.log" 2> /dev/null)"
-after_apple="$(grep -c 'apple.com' "$work/ts.log" 2> /dev/null)"
-check m3-subscription-rules-route '[[ "$code_org" == 200 && "$code_apple" == 200 && "${after_vless:-0}" -gt "${before_vless:-0}" && "${after_apple:-0}" == "${before_apple:-0}" ]]' "example.org=$code_org via vless node: $before_vless -> $after_vless; apple=$code_apple lines at the test server: $before_apple -> $after_apple"
+c2="$(vless_count)"
+check m3-subscription-rules-route '[[ "$code_org" == 200 && "$code_apple" == 200 && "${c1:-0}" -gt "${c0:-0}" && "${c2:-0}" == "${c1:-0}" ]]' "example.org=$code_org apple=$code_apple vless connections: $c0 -> $c1 -> $c2"
 "$xdial" disconnect --json > /dev/null 2>&1
 "$xdial" config apply "$work/m3.jsonc" --json > /dev/null 2>&1
 "$xdial" connect --scenario s --json > /dev/null 2>&1

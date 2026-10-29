@@ -151,8 +151,11 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 		},
 		Subscription: source.get,
 	}
+	// A downloaded subscription can reach lines that reach others, so
+	// compile until nothing new is missing; each round downloads at least
+	// one subscription, which bounds the rounds.
 	result, err := engine.Compile(cfg, opts)
-	if err == nil && len(result.MissingSubscriptions) > 0 {
+	for round := 0; err == nil && len(result.MissingSubscriptions) > 0 && round <= len(cfg.Subscriptions); round++ {
 		if source.err != nil {
 			return nil, source.err
 		}
@@ -174,6 +177,9 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	}
 	if len(result.MissingSubscriptions) > 0 {
 		return nil, cli.Errorf(cli.CodeResourceMissing, "", "场景 %s 用到的订阅读不出来：%v", scenario, result.MissingSubscriptions)
+	}
+	if result.TooManyMembers {
+		return nil, cli.Errorf(cli.CodeResourceTooLarge, "用 filter 少选一些节点，或者少引用几次订阅", "线路组展开后的成员合计超过 %d 个", engine.MaxExpandedMembers)
 	}
 	if len(result.EmptyGroups) > 0 {
 		return nil, cli.Errorf(cli.CodeResourceMissing, "改一下组里订阅成员的 filter 或 exclude，用 xdial subscription show 看节点名", "线路组 %v 从订阅里筛不出任何节点", result.EmptyGroups)

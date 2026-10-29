@@ -175,3 +175,60 @@ func TestNamesAreCleaned(t *testing.T) {
 		t.Errorf("name %q", c.Nodes[0].Name)
 	}
 }
+
+func TestClashSemantics(t *testing.T) {
+	doc := `
+proxies:
+  - {name: ws-host-sni, type: vmess, server: 1.2.3.4, port: 443, uuid: 1386f85e-657b-4d6e-9d56-78badb75e1fd, alterId: 0, cipher: auto, tls: true, network: ws, ws-opts: {path: /v, headers: {Host: cdn.example.com}}}
+  - {name: http-tls, type: vmess, server: a.example, port: 443, uuid: 1386f85e-657b-4d6e-9d56-78badb75e1fd, tls: true, network: http}
+  - {name: h2-plain, type: vmess, server: a.example, port: 443, uuid: 1386f85e-657b-4d6e-9d56-78badb75e1fd, network: h2}
+  - {name: http-plain, type: vmess, server: a.example, port: 80, uuid: 1386f85e-657b-4d6e-9d56-78badb75e1fd, network: http, http-opts: {method: GET, path: [/x], headers: {Host: [h.example]}}}
+  - {name: mux-off, type: ss, server: a.example, port: 443, cipher: aes-128-gcm, password: p, plugin: v2ray-plugin, plugin-opts: {mode: websocket, mux: false}}
+  - {name: mux-default, type: ss, server: a.example, port: 443, cipher: aes-128-gcm, password: p, plugin: v2ray-plugin, plugin-opts: {mode: websocket, tls: true, host: v.example}}
+rules:
+  - IP-CIDR,192.168.1.0/24,DIRECT,src
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+`
+	c, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]string{}
+	for _, n := range c.Nodes {
+		byName[n.Name] = string(n.Outbound)
+	}
+	if !strings.Contains(byName["ws-host-sni"], `"server_name":"cdn.example.com"`) {
+		t.Errorf("ws node without servername should verify against Host: %s", byName["ws-host-sni"])
+	}
+	if _, ok := byName["http-tls"]; ok {
+		t.Error("network http over TLS cannot be expressed and should be left out")
+	}
+	if _, ok := byName["h2-plain"]; ok {
+		t.Error("network h2 without TLS should be left out")
+	}
+	if got := byName["http-plain"]; !strings.Contains(got, `"method":"GET"`) || !strings.Contains(got, `"host":["h.example"]`) {
+		t.Errorf("http transport: %s", got)
+	}
+	if got := byName["mux-off"]; !strings.Contains(got, "mux=0") || !strings.Contains(got, "host=bing.com") {
+		t.Errorf("v2ray-plugin with mux false: %s", got)
+	}
+	if got := byName["mux-default"]; strings.Contains(got, "mux=") || !strings.Contains(got, "host=v.example") {
+		t.Errorf("v2ray-plugin defaults: %s", got)
+	}
+	if c.Unsupported["node:vmess"] != 2 || c.Unsupported["rule:ip-cidr,src"] != 1 || len(c.Rules) != 1 {
+		t.Errorf("unsupported %v, rules %d", c.Unsupported, len(c.Rules))
+	}
+	checkNodes(t, c)
+}
+
+func TestVMessLinkHTTPDisguise(t *testing.T) {
+	link := func(tls string) string {
+		return "vmess://" + base64.StdEncoding.EncodeToString([]byte(`{"ps":"x","add":"a.example","port":"80","id":"1386f85e-657b-4d6e-9d56-78badb75e1fd","net":"tcp","type":"http","host":"h.example","path":"/p","tls":"`+tls+`"}`)) + "\n"
+	}
+	if c, err := Parse([]byte(link(""))); err != nil || len(c.Nodes) != 1 {
+		t.Errorf("HTTP/1.1 disguise without TLS: %v %+v", err, c)
+	}
+	if _, err := Parse([]byte(link("tls"))); err == nil {
+		t.Error("HTTP/1.1 disguise over TLS was accepted")
+	}
+}
