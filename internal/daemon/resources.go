@@ -254,19 +254,33 @@ func (d *Daemon) cacheComplete(cfg *config.Config, scenario string) bool {
 	d.mu.Lock()
 	secrets := maps.Clone(d.secrets)
 	d.mu.Unlock()
+	complete := true
 	for _, o := range remoteRuleSets(cfg, scenario) {
 		url, err := remoteURL(cfg, o, secrets)
 		if err != nil {
 			return false
 		}
 		if _, _, ok := d.cachedRules(o, url); !ok {
-			return false
+			// As when compiling: a refused file is dropped or marked, so
+			// the background loop downloads it again however fresh.
+			d.dropInvalid(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), func() bool {
+				_, _, ok := d.cachedRules(o, url)
+				return ok
+			})
+			complete = false
 		}
 	}
 	// Subscriptions: what the compiler reaches through the cache only.
+	// subscriptionSource.get drops or marks a refused cache, as above.
 	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
 	result, err := engine.Compile(cfg, engine.Options{Scenario: scenario, Subscription: source.get})
-	return err == nil && source.err == nil && len(result.MissingSubscriptions) == 0
+	if err != nil || source.err != nil || len(result.MissingSubscriptions) > 0 {
+		complete = false
+	}
+	if !complete {
+		d.wakeResources()
+	}
+	return complete
 }
 
 // markedInvalid reports whether compiling found path's content refused
