@@ -427,6 +427,18 @@ for _ in $(seq 1 30); do
   jq -e '.result.state == "connected" and .result.physical_dns != ["192.0.2.1"] and .result.system_dns' <<< "$st" > /dev/null 2>&1 && break
 done
 
+# daemon restart（6.1）：App 升级后用它换上新的二进制。daemon 答复后退出，launchd 拉起新进程，连接恢复。
+dpid0="$(pgrep -f "$data/bin/xdial daemon run" | head -1)"
+out="$("$xdial" daemon restart --json 2>&1)"
+dpid1=""
+for _ in $(seq 1 60); do
+  sleep 0.5
+  st="$("$xdial" status --json 2> /dev/null)"
+  dpid1="$(pgrep -f "$data/bin/xdial daemon run" | head -1)"
+  [ -n "$dpid1" ] && [ "$dpid1" != "$dpid0" ] && jq -e '.ok and .result.state == "connected" and .result.system_dns' <<< "$st" > /dev/null 2>&1 && break
+done
+check m5-daemon-restart "jq -e '.ok and .result.restarting' <<< '$out' > /dev/null && [[ -n '$dpid1' && '$dpid1' != '$dpid0' ]] && jq -e '.result.state == \"connected\" and .result.system_dns' <<< '$st' > /dev/null" "pid $dpid0 -> $dpid1 $(jq -c '.result | {state, system_dns}' <<< "$st" 2> /dev/null) $(head -c 200 <<< "$out")"
+
 # 连接中重装：先断开，换掉二进制，新 daemon 恢复连接。
 pre="$("$xdial" status --json 2>&1 | jq -c '.result | {state, last_error, physical_dns}' 2>&1)"
 out="$(sudo "$xdial" daemon install --json 2>&1)"
