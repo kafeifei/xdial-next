@@ -94,7 +94,7 @@ func commands() []*command {
 			Path: []string{"schema"}, Summary: "列出全部命令、输出格式、错误码和配置格式", Output: schemaSchema,
 			Options: []option{jsonOption}, run: runSchema,
 		},
-	}, daemonCommands()...)
+	}, append(daemonCommands(), importCommands()...)...)
 }
 
 const usageHint = "运行 xdial schema 查看全部命令"

@@ -541,3 +541,16 @@ func TestDoctorContract(t *testing.T) {
 		t.Errorf("text: %s", out.String())
 	}
 }
+
+func TestImportWritesOnlyANewFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	if err := writeNew(path, []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNew(path, []byte("{\"x\": 1}")); err == nil {
+		t.Error("an existing file was written over")
+	}
+	if data, _ := os.ReadFile(path); string(data) != "{}" {
+		t.Errorf("file: %s", data)
+	}
+}

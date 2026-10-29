@@ -638,7 +638,25 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
   - 由用户身份的 CLI 读旧库 `~/.xdial/configuration/profiles.enc`，密钥在用户的钥匙串里。读出后转成新格式，再通过本地 API 交给 daemon：配置走 apply，凭据走 `secret set`。
   - root daemon 不读用户的钥匙串。
   - 旧文件不写回，也不删除。
-  - 表达不了的部分整体报错并列出，不悄悄丢掉。细节在 M6 定。
+  - 表达不了的部分整体报错并列出，不悄悄丢掉。新版按设计不做的（下表"不迁移"）照样列出，但不挡导入。
+  - 命令：`xdial import legacy [--dry-run] [--out <文件>] [--replace]`，以用户自己的身份运行，拒绝 root。`--dry-run` 只转换、跑和 `config check` 一样的检查（含 sing-box 的编译检查）、出报告，不连 daemon；有转不了的就报 `config.invalid` 并列出，和正式导入一样。`--out` 只写还不存在的文件，旧库和别的文件都不会被覆盖。正式导入先 apply 配置，再逐个 `secret set`；不加 `--replace` 时 apply 带 `if_absent`，daemon 在写入的同一个控制序列里确认还没有配置，有就拒绝。
+  - 只认第 3 版的库（旧版 App 打开时会升级）。所有 Profile 合成一份配置；旧 id 换成新格式允许的 id（取名字里的字母数字，没有就用类别加序号），名字保留；正在用的场景排第一。
+  - **怎么转**（用户 2026-10-29 定：订阅导入的节点当手写线路导入，每个密码一个凭据）：
+
+    | 旧 | 新 |
+    |---|---|
+    | AnyTLS、Trojan、Shadowsocks、VMess 线路 | 同类型的线路，密码或 UUID 存成凭据 `<线路 id>-password`（`-uuid`）；Trojan、Shadowsocks、VMess 的 TFO 和 UDP 开关照旧版转成 `tcp_fast_open`、`udp_over_tcp`；开了 TFO 的 AnyTLS 和缺字段的线路旧版也用不了，不导入并列出；用到它们的场景和组旧版也连不上，算转不了 |
+    | AnyConnect（`vpn`）线路 | `openconnect` 线路（`flavor: anyconnect`），密码存成凭据，跳过证书校验照搬到 `tls.insecure` |
+    | Tailscale 线路 | `tailscale` 线路，主机名取所在 Profile 的；登录状态不迁移，导入后重新登录 |
+    | 直连线路 | 内置的 `direct` |
+    | 关着的线路、组、规则 | 不导入；场景里用到它们的绑定跳过，和旧版一样 |
+    | 线路组（selector、urltest） | 同类型的线路组，`group_url`、`group_interval` 照搬 |
+    | 规则（分组里的每个匹配条件、不分组的规则） | 一个条件一个规则集：手动规则转成 `domain_suffix` 和 `ip_cidr`；sing-box 规则照搬；按应用匹配的转成 `process_name`、`process_path`、`process_path_regex`，各成一条规则（sing-box 一条规则里的字段要同时满足，旧版是任一命中；应用按它包里的可执行文件匹配，只有 bundle id 没有路径的转不了）；远程规则集照搬，格式按旧版的推断 |
+    | 场景的绑定和匹配顺序 | 场景规则，按旧版实际匹配的顺序排（保留的导入顺序在前，新条件跟在它规则的最后一个后面，新绑定在最后） |
+    | 默认线路 | `final`；关着的和旧版一样走直连，并列出 |
+
+  - **不迁移**（列在报告里，不挡导入）：按 SSID 自动切换场景（方案 3.3 不做）；`no_resolve`（新版先解析再分流，3.3）；场景图标；Tailscale 的登录状态；经 VPN 线路下载的远程规则集改成直连下载（VPN 线路下载时还没上线，3.4），直连下不了要自己把 `download_via` 改成代理线路。
+  - **转不了**（挡导入）：带额外 sing-box 选项（`native_options`，旧版留下的空对象不算）的线路、绑到订阅上的场景规则、只有 bundle id 的应用、引用不存在的东西、转出来过不了检查的。
 - **种子配置**：只含配置，不含凭据。
 
 ## 5. CLI 约定
@@ -809,7 +827,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - 被允许的连接同时最多 32 个，满了之后新连接收到 `daemon.busy`。
   - `logs --follow` 可以一直开着、中间没有输出，客户端对它不设读超时。
 - **凭据只走 API**：`secret.set` 的值在请求里传，不进命令行参数和环境变量（4.3）。
-- **第一批方法**：`version`、`status`、`config.export`、`config.apply`（`dry_run`、`if_match`）、`secret.set`、`secret.list`、`secret.rm`、`connect`、`disconnect`、`scenario.use`、`logs`（`lines`、`follow`）。M3 加 `rule_set.list`、`rule_set.update`（`ids`），见 3.4；`subscription.list`、`subscription.show`（`id`）、`subscription.update`（`ids`），见 1.5。
+- **第一批方法**：`version`、`status`、`config.export`、`config.apply`（`dry_run`、`if_match`；M6 加 `if_absent`：只在还没有配置时提交）、`secret.set`、`secret.list`、`secret.rm`、`connect`、`disconnect`、`scenario.use`、`logs`（`lines`、`follow`）。M3 加 `rule_set.list`、`rule_set.update`（`ids`），见 3.4；`subscription.list`、`subscription.show`（`id`）、`subscription.update`（`ids`），见 1.5。
   - `connect` 对已经连着的同一场景、同一配置不做任何事。
 - **状态**：`status` 和改变连接的方法返回同一个结构。
   - `state`：`disconnected`、`connecting`（正在连接、重载或等待重连）、`connected`、`failed`。
