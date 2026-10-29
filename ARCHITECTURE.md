@@ -505,6 +505,19 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
   - 测速在引擎里单独排队，不挡手选和登出；1 分钟从引擎收到时算起，排队的时间也算在内，所以 daemon 总能在等待的时限内拿到回应。已经有 2 次在排队时，新的立即报错。
   - 只能测当前连接里有的线路和组（包括 `direct`），别的 id 直接报 `config.conflict`。
 
+### 3.7 explain（M4）
+
+`xdial explain <域名|IP|URL> [--scenario <id>] [--config <文件>]`：说明目标在场景里命中哪条规则、走哪条线路、DNS 经哪个服务器解析。
+
+- **用 sing-box 自己的规则实现判断**：把场景编译一遍，按编译出的顺序逐条用 sing-box 的规则对象去匹配，不另写一份匹配逻辑。订阅规则说明是订阅里的第几条、哪个策略。
+- **TCP 和 UDP**：结论按 TCP 判断；UDP（例如 QUIC）命中的规则或线路不同时，`notes` 里写明。
+- **名字**：按引擎看到的样子判断，小写，去掉末尾的点。
+- **地址**：目标是域名、而且问的正是连着的场景时，daemon 经系统解析它，也就是经 sing-box 的 DNS，和流量会拿到的地址一样，按地址的规则据此判断；没连着、问的是别的场景或离线时不解析（系统的 DNS 只代表运行中的场景），按地址的规则按不匹配算，结果里写明。
+- **缓存和引擎不是同一份**：daemon 记着每次连接编进去的远程规则集和订阅是哪一份（各自最后一次变化的时间）。缓存里的和它不同时（例如连接期间或之后更新过），结论按缓存里的内容给出（下一次连接或切场景就是它），`notes` 里写明运行中的引擎用的不是这一份（3.4）。
+- **DNS**：按 3.3 的 DNS 规则顺序，说明经物理网络的 DNS 还是经哪条线路的 DoH。没有按域名命中、场景里又有 AnyConnect 或 Tailscale 线路时，提醒这个名字如果是它们推送的域名，由那条线路的 DNS 解析。
+- **说不了的**：AnyConnect 和 Tailscale 推送的网段和域名只有引擎知道，场景里有这类线路、而 TCP 或 UDP 没有规则命中时，提醒可能被它们接管；按进程判断的规则不知道是哪个进程；缓存里没有的远程内容按不匹配算。这些都写在 `notes` 里。
+- **离线**：`--config` 不经 daemon，对一份配置文件判断，远程规则集和订阅按不匹配算。
+
 ## 4. 存放与修改
 
 ### 4.1 配置
@@ -806,7 +819,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - 另有 `scenario`、`revision`、`since`、`last_error`、`engine_pid`。
   - `endpoints`：AnyConnect 和 Tailscale 线路各自的状态，见 3.5（M3）。
 - **M3 加的方法**：`tailscale.login`（`line`、`auth_key`）、`tailscale.logout`（`line`），见 3.5。
-- **M4 加的方法**：`group.select`（`group`、`member`）、`line.test`（`ids`），见 3.6；`status` 加 `groups`。
+- **M4 加的方法**：`group.select`（`group`、`member`）、`line.test`（`ids`），见 3.6；`explain`（`target`、`scenario`），见 3.7；`status` 加 `groups`。
 - **新增的错误码**（退出码按 5.3）：
 
   | 错误码 | 退出码 | 说明 |

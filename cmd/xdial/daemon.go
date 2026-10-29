@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 	"github.com/kafeifei/xdial-next/internal/api"
 	"github.com/kafeifei/xdial-next/internal/buildinfo"
 	"github.com/kafeifei/xdial-next/internal/cli"
+	"github.com/kafeifei/xdial-next/internal/config"
 	"github.com/kafeifei/xdial-next/internal/daemon"
 	"github.com/kafeifei/xdial-next/internal/engine"
 	"github.com/kafeifei/xdial-next/internal/paths"
@@ -79,6 +81,11 @@ func daemonCommands() []*command {
 			Summary: "列出订阅的节点（名字、类型、服务器，不含凭据）和策略名，用来写组的 filter 和场景的 policies", Options: []option{jsonOption}},
 		{Path: []string{"subscription", "update"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaSubscriptionUpdate, run: runSubscriptionUpdate,
 			Summary: "现在下载订阅，不写 id 就下载全部；新内容在下一次连接或切场景时生效（ARCHITECTURE.md 1.5）", Options: []option{jsonOption}},
+		{Path: []string{"explain"}, Args: []string{"<域名|IP|URL>"}, Output: daemon.SchemaExplain, run: runExplain,
+			Summary: "说明目标在场景里命中哪条规则、走哪条线路、DNS 经哪个服务器解析；--config 对一份配置文件离线判断（ARCHITECTURE.md 3.7）",
+			Options: []option{jsonOption,
+				{Name: "--scenario", Value: "<id>", Summary: "按这个场景判断，不写就用当前场景"},
+				{Name: "--config", Value: "<文件>", Summary: "不经 daemon，对这份配置判断；远程规则集和订阅按不匹配算"}}},
 		{Path: []string{"group", "select"}, Args: []string{"<组>", "<成员>"}, Output: daemon.SchemaGroupSelect, run: runGroupSelect,
 			Summary: "手选 selector 组的成员：连接中不重载就切换，重载和重启后保持（ARCHITECTURE.md 3.6）", Options: []option{jsonOption}},
 		{Path: []string{"line", "test"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaLineTest, run: runLineTest,
@@ -761,6 +768,82 @@ func groupLine(id string, g engine.GroupStatus) string {
 		line += "；" + strings.Join(delays, "，")
 	}
 	return line
+}
+
+func runExplain(ctx *context_) int {
+	path, offline := ctx.options["--config"]
+	if !offline {
+		return call(ctx, "explain", map[string]string{"target": ctx.args[0], "scenario": ctx.options["--scenario"]}, printExplanation)
+	}
+	target, err := engine.ParseTarget(ctx.args[0])
+	if err != nil {
+		return ctx.out.Fail(cli.Errorf(cli.CodeUsage, "例如 xdial explain https://example.com", "%v", err))
+	}
+	data, err := readFile(path)
+	if err != nil {
+		return ctx.out.Fail(err)
+	}
+	c, problems, err := config.Load(data)
+	if err != nil {
+		return ctx.out.Fail(cli.Errorf(cli.CodeConfigVersion, "升级 xdial", "%v", err))
+	}
+	if len(problems) > 0 {
+		return ctx.out.Fail(&cli.Error{Code: cli.CodeConfigInvalid, Message: fmt.Sprintf("配置有 %d 处问题", len(problems)), Hint: "先用 xdial config check 修好", Problems: problems})
+	}
+	scenario := ctx.options["--scenario"]
+	if scenario == "" && len(c.Scenarios) > 0 {
+		scenario = c.Scenarios[0].ID
+	}
+	found := false
+	for _, s := range c.Scenarios {
+		found = found || s.ID == scenario
+	}
+	if !found {
+		return ctx.out.Fail(cli.Errorf(cli.CodeConfigConflict, "", "场景 %q 不存在", scenario))
+	}
+	e, err := engine.Explain(c, engine.Options{Scenario: scenario, StateDirectory: os.TempDir()}, target, nil)
+	if err != nil {
+		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "%v", err))
+	}
+	raw, _ := json.Marshal(e)
+	return ctx.out.Succeed(daemon.SchemaExplain, e, func(w io.Writer) { printExplanation(w, raw) })
+}
+
+var dnsServers = map[string]string{"physical": "物理网络的 DNS", "xdial": "XDial 自己"}
+
+func printExplanation(w io.Writer, raw json.RawMessage) {
+	var e engine.Explanation
+	if json.Unmarshal(raw, &e) != nil {
+		return
+	}
+	where := e.Host
+	if e.Port > 0 {
+		where = net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
+	}
+	fmt.Fprintln(w, cli.Escape(fmt.Sprintf("%s → %s（场景 %s）", where, e.Line, e.Scenario)))
+	switch r := e.Rule; {
+	case r == nil:
+		fmt.Fprintln(w, "  没有规则命中，走 final")
+	case r.Subscription != "":
+		fmt.Fprintln(w, cli.Escape(fmt.Sprintf("  场景第 %d 条规则：订阅 %s 的第 %d 条规则，策略 %s", r.Index+1, r.Subscription, r.Within+1, r.Policy)))
+	case r.Invert:
+		fmt.Fprintln(w, cli.Escape(fmt.Sprintf("  场景第 %d 条规则：不在规则集 %s 里（取反）", r.Index+1, r.RuleSet)))
+	default:
+		fmt.Fprintln(w, cli.Escape(fmt.Sprintf("  场景第 %d 条规则：规则集 %s 的第 %d 条规则", r.Index+1, r.RuleSet, r.Within+1)))
+	}
+	if len(e.Addresses) > 0 {
+		fmt.Fprintln(w, cli.Escape("  解析到 "+strings.Join(e.Addresses, " ")))
+	}
+	if e.DNS != nil {
+		server := dnsServers[e.DNS.Server]
+		if server == "" {
+			server = "经线路 " + strings.TrimPrefix(e.DNS.Server, "via:") + " 的 DoH"
+		}
+		fmt.Fprintln(w, cli.Escape(fmt.Sprintf("  DNS：%s，%s", server, e.DNS.Reason)))
+	}
+	for _, n := range e.Notes {
+		fmt.Fprintln(w, cli.Escape("  注："+n))
+	}
 }
 
 // bootoutTimeout bounds the wait for the running daemon to go. It stops

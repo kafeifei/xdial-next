@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -726,6 +727,140 @@ func TestStatusTextIsBoundedButFarAboveWhatIsKept(t *testing.T) {
 	}
 	if maxText <= 4096 {
 		t.Error("the engine's bound must stay far above what the daemon keeps")
+	}
+}
+
+func TestExplain(t *testing.T) {
+	c := loadDoc(t, `{"version": 1,
+		"lines": [{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "p"}},
+		          {"id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://vpn.example", "username": "u", "password": {"secret": "c"}}],
+		"rule_sets": [
+			{"id": "work", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]},
+			{"id": "lan", "type": "inline", "rules": [{"ip_cidr": ["10.0.0.0/8"]}]},
+			{"id": "ads", "type": "inline", "rules": [{"domain_keyword": ["ads"]}]},
+			{"id": "cn", "type": "inline", "rules": [{"domain_suffix": [".cn"]}]},
+			{"id": "udp", "type": "inline", "rules": [{"network": ["udp"]}]}],
+		"subscriptions": [{"id": "air", "url": {"secret": "u"}}],
+		"scenarios": [{"id": "s", "final": "hk", "rules": [
+			{"rule_set": "work", "line": "corp"},
+			{"rule_set": "lan", "line": "direct"},
+			{"rule_set": "ads", "line": "block"},
+			{"subscription": "air", "policies": {"Proxy": "hk", "DIRECT": "direct"}},
+			{"rule_set": "cn", "line": "hk", "invert": true}]},
+			{"id": "udp", "final": "hk", "rules": [{"rule_set": "udp", "line": "block"}]}]}`)
+	sub := &Subscription{Rules: []SubscriptionRule{
+		{Policy: "DIRECT", Rule: mustParse(t, `{"domain_suffix": ["direct.example"]}`)},
+		{Policy: "Proxy", Rule: mustParse(t, `{"domain": ["proxy.example.cn"]}`)},
+	}}
+	opts := Options{Scenario: "s", StateDirectory: t.TempDir(), Subscription: func(*config.Object) (*Subscription, bool) { return sub, true }}
+	for _, tc := range []struct {
+		target    string
+		addresses []string
+		line      string
+		index     int // -1: final
+		policy    string
+		dns       string
+	}{
+		{"https://a.corp.example/x", nil, "corp", 0, "", "physical"},
+		{"10.1.2.3", nil, "direct", 1, "", ""},
+		{"intranet.example", []string{"10.9.9.9"}, "direct", 1, "", "via:hk"},
+		{"ads.example.com:443", nil, "block", 2, "", "via:hk"},
+		{"www.direct.example", nil, "direct", 3, "DIRECT", "physical"},
+		{"proxy.example.cn", nil, "hk", 3, "Proxy", "via:hk"},
+		{"PROXY.Example.CN.", nil, "hk", 3, "Proxy", "via:hk"},
+		{"example.com", nil, "hk", 4, "", "via:hk"},
+		{"www.example.cn", nil, "hk", -1, "", "via:hk"},
+	} {
+		target, err := ParseTarget(tc.target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var addrs []netip.Addr
+		for _, a := range tc.addresses {
+			addrs = append(addrs, netip.MustParseAddr(a))
+		}
+		e, err := Explain(c, opts, target, addrs)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.target, err)
+		}
+		index, policy := -1, ""
+		if e.Rule != nil {
+			index, policy = e.Rule.Index, e.Rule.Policy
+		}
+		dns := ""
+		if e.DNS != nil {
+			dns = e.DNS.Server
+		}
+		if policy == "Proxy" && e.Rule.Within != 1 {
+			t.Errorf("%s: subscription rule %d, want 1", tc.target, e.Rule.Within)
+		}
+		if e.Line != tc.line || index != tc.index || policy != tc.policy || dns != tc.dns {
+			t.Errorf("%s: line %s, rule %d, policy %q, dns %q; want %s, %d, %q, %q (notes %v)", tc.target, e.Line, index, policy, dns, tc.line, tc.index, tc.policy, tc.dns, e.Notes)
+		}
+	}
+}
+
+func TestExplainNotes(t *testing.T) {
+	c := loadDoc(t, `{"version": 1,
+		"lines": [{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "p"}},
+		          {"id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://vpn.example", "username": "u", "password": {"secret": "c"}}],
+		"rule_sets": [{"id": "udp", "type": "inline", "rules": [{"network": ["udp"]}]},
+		              {"id": "work", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]}],
+		"scenarios": [{"id": "s", "final": "hk", "rules": [{"rule_set": "work", "line": "corp"}, {"rule_set": "udp", "line": "block"}]}]}`)
+	target, _ := ParseTarget("https://www.example.com")
+	e, err := Explain(c, Options{Scenario: "s", StateDirectory: t.TempDir()}, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := strings.Join(e.Notes, "\n")
+	// TCP goes to final; UDP is blocked, and a name corp pushes would
+	// resolve through corp.
+	if e.Line != "hk" || !strings.Contains(notes, "UDP（例如 QUIC）命中场景第 2 条规则，走 block") || !strings.Contains(notes, "corp 推送的域名") {
+		t.Errorf("line %s, notes:\n%s", e.Line, notes)
+	}
+	// TCP goes by a rule, UDP falls to final, which a VPN's routes could
+	// take over.
+	c2 := loadDoc(t, `{"version": 1,
+		"lines": [{"id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://vpn.example", "username": "u", "password": {"secret": "c"}}],
+		"rule_sets": [{"id": "tcp", "type": "inline", "rules": [{"network": ["tcp"]}]},
+		              {"id": "work", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]}],
+		"scenarios": [{"id": "s", "final": "block", "rules": [{"rule_set": "work", "line": "corp"}, {"rule_set": "tcp", "line": "direct"}]}]}`)
+	ip, _ := ParseTarget("10.1.2.3")
+	if e, err := Explain(c2, Options{Scenario: "s", StateDirectory: t.TempDir()}, ip, nil); err != nil || !strings.Contains(strings.Join(e.Notes, "\n"), "可能被它们接管") {
+		t.Errorf("UDP to final: %v %v", e, err)
+	}
+	nx, _ := ParseTarget("USE-APPLICATION-DNS.NET.")
+	if e, err := Explain(c, Options{Scenario: "s", StateDirectory: t.TempDir()}, nx, nil); err != nil || e.DNS.Server != "xdial" {
+		t.Errorf("canary: %+v %v", e.DNS, err)
+	}
+}
+
+func mustParse(t *testing.T, s string) *config.Value {
+	t.Helper()
+	v, err := config.Parse([]byte(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func TestParseTarget(t *testing.T) {
+	for in, want := range map[string]Target{
+		"example.com":           {Host: "example.com"},
+		"https://example.com/a": {Host: "example.com", Port: 443},
+		"http://[::1]:8080/":    {Host: "::1", Port: 8080},
+		"1.2.3.4:53":            {Host: "1.2.3.4", Port: 53},
+		"2001:db8::1":           {Host: "2001:db8::1"},
+	} {
+		got, err := ParseTarget(in)
+		if err != nil || got != want {
+			t.Errorf("ParseTarget(%q) = %+v, %v", in, got, err)
+		}
+	}
+	for _, bad := range []string{"", "a b", "https://", "x:99999"} {
+		if _, err := ParseTarget(bad); err == nil {
+			t.Errorf("ParseTarget(%q) accepted", bad)
+		}
 	}
 }
 

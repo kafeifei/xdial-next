@@ -153,11 +153,20 @@ type binding struct {
 	tag    string
 	line   string
 	invert bool
+	// Where it comes from, for explain: the scenario rule's index, and a
+	// rule set id or, for subscription rules, the subscription id and the
+	// generated set.
+	index        int
+	ruleSet      string
+	subscription string
+	generated    int
 }
 
 type generatedSet struct {
-	tag   string
-	rules []*config.Value
+	tag      string
+	rules    []*config.Value
+	policies []string // each rule's policy
+	within   []int    // each rule's index among the subscription's rules
 }
 
 // Subscription is the checked content of one subscription, 1.5.
@@ -193,6 +202,13 @@ func NodeTag(subscription, name string) string {
 // Compile builds the sing-box configuration for one scenario, or for every
 // object when opts.Scenario is empty.
 func Compile(c *config.Config, opts Options) (*Result, error) {
+	_, r, err := compileScenario(c, opts)
+	return r, err
+}
+
+// compileScenario is Compile, also returning the compiler's view of the
+// scenario, which explain walks.
+func compileScenario(c *config.Config, opts Options) (*compiler, *Result, error) {
 	if opts.Secret == nil {
 		opts.Secret = Placeholder
 	}
@@ -209,16 +225,16 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 			}
 		}
 		if scenario == nil {
-			return nil, fmt.Errorf("scenario %q does not exist", opts.Scenario)
+			return nil, nil, fmt.Errorf("scenario %q does not exist", opts.Scenario)
 		}
-		for _, r := range scenario.Rules {
+		for i, r := range scenario.Rules {
 			if r.Subscription != "" {
-				k.bindSubscription(r)
+				k.bindSubscription(i, r)
 				continue
 			}
 			k.reach(r.Line)
 			k.ruleSets[r.RuleSet] = true
-			k.bindings = append(k.bindings, binding{tag: r.RuleSet, line: r.Line, invert: r.Invert})
+			k.bindings = append(k.bindings, binding{tag: r.RuleSet, line: r.Line, invert: r.Invert, index: i, ruleSet: r.RuleSet, generated: -1})
 		}
 		k.reach(scenario.Final)
 	} else {
@@ -308,7 +324,7 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sort.Strings(k.pending)
 	sort.Strings(k.missing)
@@ -320,7 +336,7 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 	}
 	tags = append(tags, slices.Collect(maps.Keys(k.nodeSeen))...)
 	sort.Strings(tags)
-	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty,
+	return k, &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty,
 		TooManyMembers: k.tooMany, Endpoints: endpointIDs, Secrets: k.usedSecrets(),
 		Groups: groups, Outbounds: tags, StaleSelections: stale}, nil
 }
@@ -445,14 +461,14 @@ func placeholderNode() *config.Value {
 // generated rule set, 1.5.
 // Only the lines its kept rules go to are reached: a mapping no rule uses
 // must not bring a line up, an endpoint least of all.
-func (k *compiler) bindSubscription(r config.ScenarioRule) {
+func (k *compiler) bindSubscription(index int, r config.ScenarioRule) {
 	content := k.subscription(r.Subscription)
 	if content == nil {
 		return
 	}
 	var run *generatedSet
 	var runLine string
-	for _, rule := range content.Rules {
+	for i, rule := range content.Rules {
 		line, ok := r.Policies[rule.Policy]
 		if !ok {
 			line = r.Other
@@ -465,9 +481,11 @@ func (k *compiler) bindSubscription(r config.ScenarioRule) {
 			k.generated = append(k.generated, generatedSet{tag: fmt.Sprintf("%ssub:%s:rules-%d", tagPrefix, r.Subscription, len(k.generated))})
 			run = &k.generated[len(k.generated)-1]
 			runLine = line
-			k.bindings = append(k.bindings, binding{tag: run.tag, line: line})
+			k.bindings = append(k.bindings, binding{tag: run.tag, line: line, index: index, subscription: r.Subscription, generated: len(k.generated) - 1})
 		}
 		run.rules = append(run.rules, rule.Rule)
+		run.policies = append(run.policies, rule.Policy)
+		run.within = append(run.within, i)
 	}
 }
 
