@@ -184,6 +184,74 @@ for _ in $(seq 1 40); do
 done
 check m2-engine-crash "[[ '$during_gap' == 0 ]] && jq -e '.result.state == \"connected\" and .result.system_dns' <<< '$st' > /dev/null" "key_during_gap=$during_gap $(jq -c '.result | {state, engine_pid, system_dns}' <<< "$st")"
 
+# --- M3：远程规则集下载（#10）----------------------------------------------
+# 用公网上真实的规则集。代理线路连虚拟机里的测试服务端（e2e/testserver），它自己也绑物理接口，
+# 所以经它下载同样不经过 TUN：引擎日志里不该出现规则集的主机名。
+iface="$(printf 'show State:/Network/Global/IPv4\n' | scutil | awk '/PrimaryInterface/{print $3}')"
+lan="$(ipconfig getifaddr "$iface")"
+cat > "$work/ts.json" << EOF
+{
+  "log": { "level": "info", "output": "$work/ts.log" },
+  "dns": { "servers": [{ "type": "udp", "tag": "d", "server": "1.1.1.1" }], "final": "d" },
+  "inbounds": [{ "type": "shadowsocks", "tag": "ss-in", "listen": "0.0.0.0", "listen_port": 18388,
+                 "method": "aes-128-gcm", "password": "e2e-ss-pass" }],
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": { "default_interface": "$iface", "default_domain_resolver": "d" }
+}
+EOF
+# 共享目录不能直接执行，和 xdial 一样先拷到工作目录。
+cp "$dir/testserver" "$work/testserver"
+"$work/testserver" "$work/ts.json" > "$work/ts.out" 2>&1 &
+tspid=$!
+sleep 1
+cat > "$work/m3.jsonc" << EOF
+{
+  "version": 1,
+  "mixed": { "port": 17890, "username": "e2e", "password": { "secret": "mixed" } },
+  "lines": [{ "id": "ss", "type": "shadowsocks", "server": "$lan", "server_port": 18388,
+              "method": "aes-128-gcm", "password": { "secret": "ss" } }],
+  "rule_sets": [
+    { "id": "apple", "type": "remote", "format": "source",
+      "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple.json" },
+    { "id": "cn-ip", "type": "remote", "format": "binary", "download_via": "ss",
+      "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" },
+    { "id": "local", "type": "remote", "format": "source", "url": "https://localtest.me/rules.json" },
+    { "id": "to-http", "type": "remote", "format": "source",
+      "url": "https://httpbingo.org/redirect-to?url=http%3A%2F%2Fexample.com%2F" }
+  ],
+  "scenarios": [
+    { "id": "s", "rules": [{ "rule_set": "apple", "line": "direct" }, { "rule_set": "cn-ip", "line": "direct" }], "final": "direct" },
+    { "id": "t", "rules": [], "final": "direct" },
+    { "id": "u", "rules": [{ "rule_set": "local", "line": "direct" }], "final": "direct" }
+  ]
+}
+EOF
+printf 'e2e-ss-pass\n' | "$xdial" secret set ss --json > /dev/null 2>&1
+before_gh="$(sudo grep -c raw.githubusercontent.com "$data/private/engine.log" 2> /dev/null)"
+# 连着场景 s 时 apply：两个规则集都没缓存，重载前先下载，一个经 direct、一个经代理线路。
+out="$("$xdial" config apply "$work/m3.jsonc" --json 2>&1)"
+check m3-apply-downloads "jq -e '.ok and .result.applied and .result.reloaded' <<< '$out' > /dev/null" "iface=$iface lan=$lan testserver=[$(head -c 300 "$work/ts.out" | tr '\n' ';')] $out"
+list="$("$xdial" rule-set list --json 2>&1)"
+check m3-rule-set-list "jq -e '[.result.rule_sets[] | select(.id == \"apple\" or .id == \"cn-ip\") | select(.cached and .rules > 0)] | length == 2' <<< '$list' > /dev/null" "$(jq -c '[.result.rule_sets[] | {id, cached, rules, last_error: .last_error.code}]' <<< "$list")"
+via="$(grep -c raw.githubusercontent.com "$work/ts.log" 2> /dev/null)"
+after_gh="$(sudo grep -c raw.githubusercontent.com "$data/private/engine.log" 2> /dev/null)"
+check m3-download-via-line-and-around-tun '[[ "${via:-0}" -ge 1 && "${after_gh:-0}" == "${before_gh:-0}" ]]' "via test server: $via; engine log lines: $before_gh -> $after_gh"
+perm="$(sudo sh -c "stat -f '%Sp %Su' '$data/private/resources/rule-sets/'apple.*.json" 2> /dev/null)"
+check m3-cache-private '[[ "$perm" == "-rw------- root" ]]' "$perm"
+out="$("$xdial" rule-set update apple --json 2>&1)"
+check m3-update-not-modified "jq -e '.ok and .result.updated[0].changed == false and .result.updated[0].rules > 0' <<< '$out' > /dev/null" "$out"
+out="$("$xdial" rule-set update local --json 2>&1)"
+check m3-refuses-loopback "jq -e '.error.code == \"resource.blocked\"' <<< '$out' > /dev/null" "$out"
+out="$("$xdial" rule-set update to-http --json 2>&1)"
+check m3-refuses-http-redirect "jq -e '.error.code == \"resource.blocked\"' <<< '$out' > /dev/null" "$out"
+# 场景 u 的规则集下载不了：切场景失败，现有连接不变。
+out="$("$xdial" scenario use u --json 2>&1)"
+st="$("$xdial" status --json 2>&1)"
+check m3-missing-keeps-connection "jq -e '.error.code == \"resource.blocked\"' <<< '$out' > /dev/null && jq -e '.result.state == \"connected\" and .result.scenario == \"s\"' <<< '$st' > /dev/null" "$out | $(jq -c '.result | {state, scenario}' <<< "$st")"
+out="$("$xdial" scenario use t --json 2>&1)" && out2="$("$xdial" scenario use s --json 2>&1)"
+check m3-switch-from-cache "jq -e '.ok and .result.scenario == \"s\" and .result.state == \"connected\"' <<< '$out2' > /dev/null" "$out2"
+kill "$tspid" 2> /dev/null
+
 # 连接中重装：先断开，换掉二进制，新 daemon 恢复连接。
 out="$(sudo "$xdial" daemon install --json 2>&1)"
 for _ in $(seq 1 40); do

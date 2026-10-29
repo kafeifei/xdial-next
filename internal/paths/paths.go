@@ -54,6 +54,10 @@ func (l Layout) EngineLog() string { return filepath.Join(l.Private(), "engine.l
 // DaemonLog receives launchd's stdout and stderr for the daemon.
 func (l Layout) DaemonLog() string { return filepath.Join(l.Private(), "daemon.log") }
 
+// Resources holds downloaded rule sets and subscriptions, ARCHITECTURE.md
+// 3.4. It is private: subscriptions carry the credentials of their nodes.
+func (l Layout) Resources() string { return filepath.Join(l.Private(), "resources") }
+
 // Tailscale holds tailscale state, one directory per line.
 func (l Layout) Tailscale() string { return filepath.Join(l.Private(), "tailscale") }
 

@@ -14,6 +14,10 @@ import (
 	"github.com/sagernet/sing-box/option"
 )
 
+// MaxConfigSize is the most the engine reads from stdin. The daemon checks
+// a compiled configuration against it before replacing a connection.
+const MaxConfigSize = 64 << 20
+
 // EngineCommand is the hidden subcommand the daemon starts sing-box with,
 // ARCHITECTURE.md 6.1: xdial __engine <allowed directory>...
 const EngineCommand = "__engine"
@@ -45,7 +49,7 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 		_ = json.NewEncoder(stdout).Encode(Ready{Version: buildinfo.Build(), Error: stage + ": " + err.Error()})
 		return 1
 	}
-	decoder := json.NewDecoder(io.LimitReader(stdin, 64<<20))
+	decoder := json.NewDecoder(io.LimitReader(stdin, MaxConfigSize))
 	var data json.RawMessage
 	if err := decoder.Decode(&data); err != nil {
 		return fail("read", err)

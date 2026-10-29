@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
@@ -16,8 +17,11 @@ import (
 
 	"github.com/kafeifei/xdial-next/internal/api"
 	"github.com/kafeifei/xdial-next/internal/cli"
+	"github.com/kafeifei/xdial-next/internal/config"
 	"github.com/kafeifei/xdial-next/internal/engine"
 	"github.com/kafeifei/xdial-next/internal/paths"
+	"github.com/kafeifei/xdial-next/internal/resource"
+	"github.com/kafeifei/xdial-next/internal/store"
 )
 
 // The test binary doubles as the check child and the engine child.
@@ -28,6 +32,10 @@ func TestMain(m *testing.M) {
 			os.Exit(engine.RunCheckChild(os.Stdin, os.Stdout))
 		case engine.EngineCommand:
 			os.Exit(engine.RunEngineChild(os.Stdin, os.Stdout, os.Stderr, os.Args[2:]))
+		case resource.FetchCommand:
+			os.Exit(resource.RunFetchChild(os.Stdin, os.Stdout))
+		case resource.DecodeCommand:
+			os.Exit(resource.RunDecodeChild(os.Stdin, os.Stdout, os.Stderr))
 		}
 	}
 	os.Exit(m.Run())
@@ -79,6 +87,8 @@ func (f *fakeSystem) PhysicalDNS() ([]netip.Addr, error) {
 	}
 	return f.physical, nil
 }
+
+func (f *fakeSystem) PhysicalInterface() (string, error) { return loopback(), nil }
 
 func (f *fakeSystem) setPhysical(addr string) {
 	f.mu.Lock()
@@ -150,6 +160,7 @@ type harness struct {
 	client *api.Client
 	cancel context.CancelFunc
 	done   chan error
+	d      *Daemon
 }
 
 func start(t *testing.T, authorize func(uint32) bool) *harness {
@@ -189,6 +200,7 @@ func startAt(t *testing.T, root, id string, authorize func(uint32) bool) *harnes
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
+	h.d = d
 	go func() { h.done <- d.Run(ctx) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -549,13 +561,19 @@ func TestScrubber(t *testing.T) {
 	}
 }
 
+// remoteDoc is doc with rule set r downloaded from url.
+func remoteDoc(url string) string {
+	return strings.Replace(doc, `{"id": "r", "type": "inline", "rules": [{"domain_suffix": ["example.com"]}]}`,
+		`{"id": "r", "type": "remote", "format": "source", "url": "`+url+`"}`, 1)
+}
+
 func TestMissingRemoteRuleSetRefusesToConnect(t *testing.T) {
 	h := start(t, nil)
-	remote := strings.Replace(doc, `{"id": "r", "type": "inline", "rules": [{"domain_suffix": ["example.com"]}]}`,
-		`{"id": "r", "type": "remote", "format": "source", "url": "https://rules.example.com/r.json"}`, 1)
-	h.ok("config.apply", map[string]any{"content": remote})
+	h.ok("config.apply", map[string]any{"content": remoteDoc("https://rules.example.com/r.json")})
 	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
-	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceMissing)
+	// Not in the cache, so connecting downloads it first; the test network
+	// resolves nothing, and without the rule set there is no connection.
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceDownload)
 	if s := h.ok("status", nil); s["state"] != "disconnected" || s["intent"] != "disconnected" {
 		t.Errorf("a refused connect changed the state: %v", s)
 	}
@@ -718,5 +736,168 @@ func TestFollowSendsEachEventOnce(t *testing.T) {
 	// A restarted daemon reads the latest events back from the file.
 	if again := newEventLog(path).recent(10); len(again) != 2 || again[1].Type != "after" {
 		t.Errorf("after restart %v", again)
+	}
+}
+
+// loopback is the name of the loopback interface, which tests bind to.
+func loopback() string {
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if i.Flags&net.FlagLoopback != 0 {
+			return i.Name
+		}
+	}
+	return "lo"
+}
+
+// seedRuleSet writes a downloaded rule set into the cache, as a download of
+// url would have.
+func (h *harness) seedRuleSet(id, url, source string) {
+	h.t.Helper()
+	fp := fingerprint(url, "source")
+	path := filepath.Join(h.layout.Resources(), "rule-sets", id+"."+fp[:16]+".json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		h.t.Fatal(err)
+	}
+	rules, _ := config.CheckRuleSetSource([]byte(source))
+	entry := cachedRuleSet{Fingerprint: fp, Rules: len(rules), FetchedAt: time.Now(), ChangedAt: time.Now(), Source: json.RawMessage(source)}
+	if err := store.WriteJSON(path, entry, 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func TestCachedRuleSetConnects(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://rules.example.com/r.json"
+	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
+	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	h.seedRuleSet("r", url, `{"version": 3, "rules": [{"domain_suffix": ["example.com"]}, {"ip_cidr": ["192.0.2.0/24"]}]}`)
+	if s := h.ok("connect", map[string]any{"scenario": "s"}); s["state"] != "connected" {
+		t.Fatalf("connect with a cached rule set: %v", s)
+	}
+	list := h.ok("rule_set.list", nil)["rule_sets"].([]any)
+	r := list[0].(map[string]any)
+	if r["id"] != "r" || r["cached"] != true || r["rules"] != float64(2) || r["next_update"] == nil {
+		t.Errorf("rule-set list: %v", r)
+	}
+}
+
+func TestCacheOfAnotherURLDoesNotCount(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": remoteDoc("https://rules.example.com/new.json")})
+	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	h.seedRuleSet("r", "https://rules.example.com/old.json", `{"version": 1, "rules": [{"domain": ["a.example"]}]}`)
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceDownload)
+	if r := h.ok("rule_set.list", nil)["rule_sets"].([]any)[0].(map[string]any); r["cached"] != false {
+		t.Errorf("a cache of the old url counted: %v", r)
+	}
+}
+
+func TestCorruptCacheIsNotConnectedFrom(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://rules.example.com/r.json"
+	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
+	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"process_name": ["x"], "query_type": ["A"]}]}`)
+	// Connecting checks the cached content: content that fails is not
+	// used but downloaded again, which the test network refuses.
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceDownload)
+}
+
+func TestRuleSetUpdateRefusesLoopback(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": remoteDoc("https://127.0.0.1:9/token-in-path")})
+	resp := h.call("rule_set.update", map[string]any{"ids": []string{"r"}})
+	if resp.OK || resp.Error.Code != cli.CodeResourceBlocked {
+		t.Fatalf("want resource.blocked, got %+v", resp)
+	}
+	if strings.Contains(resp.Error.Message, "token-in-path") {
+		t.Errorf("the url leaked into the error: %s", resp.Error.Message)
+	}
+	r := h.ok("rule_set.list", nil)["rule_sets"].([]any)[0].(map[string]any)
+	if e, _ := r["last_error"].(map[string]any); e == nil || e["code"] != cli.CodeResourceBlocked {
+		t.Errorf("list does not show the failure: %v", r)
+	}
+	if events, _ := os.ReadFile(h.layout.Events()); !strings.Contains(string(events), "rule_set_update_failed") {
+		t.Error("no event for the failed download")
+	}
+}
+
+func TestRuleSetUpdateNeedsARemoteRuleSet(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": doc})
+	h.fails("rule_set.update", map[string]any{"ids": []string{"nope"}}, cli.CodeConfigConflict)
+	h.fails("rule_set.update", map[string]any{"ids": []string{"r"}}, cli.CodeConfigConflict)
+	if u := h.ok("rule_set.update", nil)["updated"].([]any); len(u) != 0 {
+		t.Errorf("nothing to update, got %v", u)
+	}
+}
+
+func TestCacheKeepsCharactersJSONWouldEscape(t *testing.T) {
+	h := start(t, nil)
+	d := &Daemon{opts: Options{Layout: h.layout}}
+	source := []byte(`{"version":1,"rules":[{"process_name":["a&b<c>"]}]}`)
+	entry := &cachedRuleSet{Fingerprint: fingerprint("https://x.example/r", "source"), Source: source}
+	if err := d.writeRuleSet("r", entry); err != nil {
+		t.Fatal(err)
+	}
+	var back cachedRuleSet
+	if err := store.ReadJSON(d.ruleSetPath("r", entry.Fingerprint), &back); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(back.Source, source) {
+		t.Errorf("stored source changed: %s", back.Source)
+	}
+}
+
+func TestConnectionResumesWhenTheCacheIsFilled(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://rules.example.com/r.json"
+	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
+	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	// The user wants a connection that is down: retries found the rule set
+	// missing from the cache and stopped.
+	h.d.mu.Lock()
+	h.d.state = State{Connected: true, Scenario: "s"}
+	h.d.status = "failed"
+	h.d.mu.Unlock()
+	// Retries that stopped for another reason are left alone.
+	h.d.resumeAfterFetch()
+	if s := h.ok("status", nil); s["state"] != "failed" {
+		t.Errorf("a download lifted retries that stopped for another reason: %v", s)
+	}
+	h.d.mu.Lock()
+	h.d.awaitingCache = true
+	h.d.mu.Unlock()
+	// A download for something else while the rule set is still missing
+	// leaves the stopped retries alone.
+	h.d.resumeAfterFetch()
+	if s := h.ok("status", nil); s["state"] != "failed" {
+		t.Errorf("an unrelated download lifted the stopped retries: %v", s)
+	}
+	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"domain": ["b.example"]}]}`)
+	// A download that brings content in is what calls this.
+	h.d.resumeAfterFetch()
+	if s := h.ok("status", nil); s["state"] != "connected" {
+		t.Errorf("a filled cache did not bring the connection back: %v", s)
+	}
+}
+
+func TestRedownloadMarkSurvivesAFailedDownload(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://rules.example.com/r.json"
+	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
+	path := filepath.Join(h.layout.Resources(), "rule-sets", "r."+fingerprint(url, "source")[:16]+".json")
+	h.d.mu.Lock()
+	h.d.invalid = map[string]bool{path: true}
+	h.d.mu.Unlock()
+	h.d.refreshResources() // the download fails on the test network
+	if !h.d.markedInvalid(path) {
+		t.Error("a failed download dropped the mark")
+	}
+	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"domain": ["a.example"]}]}`)
+	h.d.dropInvalid(path, func() bool { return true })
+	if h.d.markedInvalid(path) {
+		t.Error("a valid cache kept the mark")
 	}
 }

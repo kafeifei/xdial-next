@@ -376,7 +376,38 @@ func (c *Config) checkObjects(w *walker) {
 		if endpoint := c.reachesEndpoint(via.String, map[string]bool{}); endpoint != "" {
 			problem(o, cli.CodeConfigReference, o.Path+".download_via", "换一条代理线路或 direct", "下载线路会经过 endpoint 线路 %q，下载时它还没上线", endpoint)
 		}
+		// direct named as download_via is checked against local and internal
+		// addresses; direct reached through a group would dial with sing-box's
+		// own direct outbound, which checks nothing.
+		if via.String != Direct && c.reachesDirect(via.String, map[string]bool{}) {
+			problem(o, cli.CodeConfigReference, o.Path+".download_via", "直连下载写 direct；经组下载时组里不要有 direct", "下载线路 %q 经组会走到 direct，绕过对本机和内网地址的检查", via.String)
+		}
 	}
+}
+
+// reachesDirect follows group members only: a proxy's detour carries the
+// connection to the proxy server, and the download target is still
+// reached from the proxy's side.
+func (c *Config) reachesDirect(id string, seen map[string]bool) bool {
+	if id == Direct {
+		return true
+	}
+	if seen[id] {
+		return false
+	}
+	seen[id] = true
+	o := c.Line(id)
+	if o == nil {
+		return false
+	}
+	if members := o.Value.Get("outbounds"); members != nil {
+		for _, m := range members.Items {
+			if c.reachesDirect(m.String, seen) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func outboundEdges(o *Object) []string {

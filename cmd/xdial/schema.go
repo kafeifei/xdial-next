@@ -104,6 +104,20 @@ func outputSchemas() map[string]any {
 		)),
 		"xdial.secret/v1":      envelope("xdial.secret/v1", secretRefSchema()),
 		"xdial.secret.list/v1": envelope("xdial.secret.list/v1", object([]string{"secrets"}, map[string]any{"secrets": map[string]any{"type": "array", "items": secretRefSchema()}})),
+		"xdial.rule-set.list/v1": envelope("xdial.rule-set.list/v1", object([]string{"rule_sets"}, map[string]any{
+			"rule_sets": map[string]any{"type": "array", "items": object([]string{"id", "type", "cached", "rules"}, map[string]any{
+				"id": str(), "name": str(), "type": map[string]any{"enum": []string{"inline", "remote"}},
+				"format": str(), "download_via": str(), "cached": map[string]any{"type": "boolean"},
+				"rules": map[string]any{"type": "integer"}, "fetched_at": str(), "changed_at": str(), "next_update": str(),
+				"last_error": object([]string{"code", "message"}, map[string]any{"code": str(), "message": str(), "hint": str(),
+					"problems": map[string]any{"type": "array"}}),
+			})},
+		})),
+		"xdial.rule-set.update/v1": envelope("xdial.rule-set.update/v1", object([]string{"updated"}, map[string]any{
+			"updated": map[string]any{"type": "array", "items": object([]string{"id", "changed", "rules", "fetched_at"}, map[string]any{
+				"id": str(), "changed": map[string]any{"type": "boolean"}, "rules": map[string]any{"type": "integer"}, "fetched_at": str(),
+			})},
+		})),
 		"xdial.logs/v1": envelope("xdial.logs/v1", object([]string{"time", "type"}, map[string]any{
 			"time": str(), "type": str(), "fields": map[string]any{"type": "object"},
 		})),

@@ -237,3 +237,92 @@ func TestDetourDirectIsRejected(t *testing.T) {
 		t.Errorf("detour direct passed: %s", codes(problems))
 	}
 }
+
+func TestCheckRuleSetSource(t *testing.T) {
+	long := `"` + strings.Repeat(`a.example", "`, maxListItems) + `b.example"`
+	rules, problems := CheckRuleSetSource([]byte(`{"version": 2, "rules": [{"domain_suffix": [` + long + `]}, {"ip_cidr": ["10.0.0.0/8"], "invert": true}]}`))
+	if len(problems) > 0 || len(rules) != 2 {
+		t.Fatalf("a long list beyond what a configuration takes: %d rules, %v", len(rules), problems)
+	}
+	for name, doc := range map[string]string{
+		"not an object":  `[]`,
+		"no rules":       `{"version": 1}`,
+		"no version":     `{"rules": []}`,
+		"future version": `{"version": 9, "rules": []}`,
+		"unknown key":    `{"version": 1, "rules": [], "extra": 1}`,
+		"forbidden":      `{"version": 1, "rules": [{"query_type": ["A"]}]}`,
+		"adguard":        `{"version": 1, "rules": [{"adguard_domain": ["||x^"]}]}`,
+		"bad cidr":       `{"version": 1, "rules": [{"ip_cidr": ["10.0.0.0/99"]}]}`,
+		"bad regex":      `{"version": 1, "rules": [{"domain_regex": ["("]}]}`,
+		"syntax":         `{"version": 1, "rules": [}`,
+	} {
+		if _, problems := CheckRuleSetSource([]byte(doc)); len(problems) == 0 {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	tooMany := `"` + strings.Repeat(`a", "`, maxRuleSetList) + `b"`
+	if _, problems := CheckRuleSetSource([]byte(`{"version": 1, "rules": [{"domain": [` + tooMany + `]}]}`)); len(problems) == 0 {
+		t.Error("a list over the cap was accepted")
+	}
+}
+
+func TestDownloadViaMustNotReachDirectThroughAGroup(t *testing.T) {
+	doc := `{"version": 1,
+		"lines": [{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "hk"}}],
+		"groups": [{"id": "g", "type": "selector", "outbounds": ["hk", "direct"]}],
+		"rule_sets": [{"id": "r", "type": "remote", "format": "source", "url": "https://rules.example/r.json", "download_via": "g"}],
+		"scenarios": [{"id": "s", "final": "direct"}]}`
+	_, problems, _ := Load([]byte(doc))
+	if len(problems) != 1 || problems[0].Path != "rule_sets[0].download_via" || problems[0].Code != cli.CodeConfigReference {
+		t.Errorf("want one problem on download_via, got %+v", problems)
+	}
+	if _, problems, _ := Load([]byte(strings.Replace(doc, `["hk", "direct"]`, `["hk"]`, 1))); len(problems) != 0 {
+		t.Errorf("a group of proxies only: %+v", problems)
+	}
+}
+
+func TestRuleSetProblemsDoNotEchoRemoteKeys(t *testing.T) {
+	_, problems := CheckRuleSetSource([]byte(`{"version": 1, "rules": [{"domain": ["a"], "token_s3cret": 1, "domain[0]x": 2}]}`))
+	if len(problems) == 0 {
+		t.Fatal("unknown keys were accepted")
+	}
+	for _, p := range problems {
+		if strings.Contains(p.Path, "s3cret") || strings.Contains(p.Path, "]x") {
+			t.Errorf("path echoes a remote key: %q", p.Path)
+		}
+	}
+	if _, problems := CheckRuleSetSource([]byte(`{"version": 1, "rules": []}`)); len(problems) == 0 {
+		t.Error("an empty rule set was accepted")
+	}
+}
+
+func TestDownloadViaThroughADetourIsAllowed(t *testing.T) {
+	doc := `{"version": 1,
+		"lines": [{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "hk"}, "detour": "g"},
+		          {"id": "jp", "type": "trojan", "server": "jp.example", "server_port": 443, "password": {"secret": "jp"}}],
+		"groups": [{"id": "g", "type": "selector", "outbounds": ["jp", "direct"]}],
+		"rule_sets": [{"id": "r", "type": "remote", "format": "source", "url": "https://rules.example/r.json", "download_via": "hk"}],
+		"scenarios": [{"id": "s", "final": "direct"}]}`
+	if _, problems, _ := Load([]byte(doc)); len(problems) != 0 {
+		t.Errorf("a proxy whose detour may go direct still downloads through the proxy: %+v", problems)
+	}
+}
+
+func TestUnknownKeyLookingLikeAnIndexIsCut(t *testing.T) {
+	for _, doc := range []string{
+		`{"version": 1, "rules": [{"domain": ["a"], "domain[123456789]": 1}]}`,
+		`{"version": 1, "rules": [{"domain": ["a"], "domain[123456789].x": 1}]}`,
+		`{"version": 1, "rules": [{"domain": ["a"]}], "rules[42].token": 1}`,
+	} {
+		_, problems := CheckRuleSetSource([]byte(doc))
+		if len(problems) == 0 {
+			t.Errorf("%s: accepted", doc)
+		}
+		for _, p := range problems {
+			if strings.Contains(p.Path, "123456789") || strings.Contains(p.Path, "42") || strings.Contains(p.Path, "token") ||
+				strings.Contains(p.Message, "123456789") || strings.Contains(p.Message, "token") {
+				t.Errorf("problem echoes a remote key: %+v", p)
+			}
+		}
+	}
+}

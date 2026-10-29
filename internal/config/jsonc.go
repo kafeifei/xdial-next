@@ -93,8 +93,14 @@ func (e *DuplicateKeyError) Error() string {
 // are compared exactly; a duplicate key, invalid UTF-8, a byte order mark or
 // a document deeper or larger than the limits is an error.
 func Parse(data []byte) (*Value, error) {
-	if len(data) > MaxDocumentSize {
-		return nil, &SyntaxError{Line: 1, Column: 1, Message: fmt.Sprintf("文档超过 %d 字节", MaxDocumentSize)}
+	return parseWithin(data, MaxDocumentSize, maxNodes)
+}
+
+// parseWithin is Parse with other limits, for content that is not a
+// configuration, such as a downloaded rule set.
+func parseWithin(data []byte, maxSize, maxValues int) (*Value, error) {
+	if len(data) > maxSize {
+		return nil, &SyntaxError{Line: 1, Column: 1, Message: fmt.Sprintf("文档超过 %d 字节", maxSize)}
 	}
 	if !utf8.Valid(data) {
 		line, column := position(data, invalidUTF8Offset(data))
@@ -103,7 +109,7 @@ func Parse(data []byte) (*Value, error) {
 	if bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}) {
 		return nil, &SyntaxError{Line: 1, Column: 1, Message: "文档以字节顺序标记（BOM）开头"}
 	}
-	p := &parser{data: data, line: 1, column: 1}
+	p := &parser{data: data, line: 1, column: 1, maxNodes: maxValues}
 	p.skipSpace()
 	if p.err != nil {
 		return nil, p.err
@@ -124,12 +130,13 @@ func Parse(data []byte) (*Value, error) {
 }
 
 type parser struct {
-	data   []byte
-	nodes  int
-	pos    int
-	line   int
-	column int
-	err    error
+	data     []byte
+	nodes    int
+	maxNodes int
+	pos      int
+	line     int
+	column   int
+	err      error
 }
 
 // fail records the first error at the current position; parsing stops at
@@ -192,8 +199,8 @@ func (p *parser) value(depth int) *Value {
 		p.fail("嵌套超过 %d 层", maxDepth)
 		return nil
 	}
-	if p.nodes++; p.nodes > maxNodes {
-		p.fail("值超过 %d 个", maxNodes)
+	if p.nodes++; p.nodes > p.maxNodes {
+		p.fail("值超过 %d 个", p.maxNodes)
 		return nil
 	}
 	v := &Value{Line: p.line, Column: p.column}

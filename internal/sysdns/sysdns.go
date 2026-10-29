@@ -229,6 +229,23 @@ func Physical() ([]netip.Addr, error) {
 	return nil, nil
 }
 
+// PrimaryInterface returns the interface of the primary network service,
+// IPv4 first: the physical interface downloads bind to, ARCHITECTURE.md
+// 3.4. TUN does not register a network service, so it is never this.
+func PrimaryInterface() (string, error) {
+	globals, err := showAll(primaryIPv4, primaryIPv6)
+	if err != nil {
+		return "", err
+	}
+	for _, g := range globals {
+		iface := parseValue(g, "PrimaryInterface")
+		if iface != "" && !strings.ContainsAny(iface, " \n/") {
+			return iface, nil
+		}
+	}
+	return "", nil
+}
+
 func hasAddresses(block string) bool {
 	return strings.Contains(block, "Addresses : <array>")
 }

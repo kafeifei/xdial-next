@@ -1,9 +1,13 @@
 package daemon
 
 import (
+	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"maps"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/kafeifei/xdial-next/internal/cli"
@@ -29,6 +33,7 @@ const (
 type connection struct {
 	scenario  string
 	revision  string
+	digest    [32]byte
 	physical  []netip.Addr
 	lock      *connectionLock
 	engine    *engineProc
@@ -44,7 +49,59 @@ type plan struct {
 	revision string
 	physical []netip.Addr
 	compiled []byte
+	digest   [32]byte // of compiled: what the engine would run
 	secrets  map[string]Secret
+}
+
+// defaultScenario is scenario, or the first one of cfg when none is named.
+func defaultScenario(cfg *config.Config, scenario string) string {
+	if scenario == "" && cfg != nil && len(cfg.Scenarios) > 0 {
+		return cfg.Scenarios[0].ID
+	}
+	return scenario
+}
+
+// resumeAfterFetch tries to connect again when the user wants a connection
+// that is down for now, typically because retries stopped while what the
+// scenario needs was still downloading. A download that completes calls
+// it: retries alone stop after 15 seconds, downloads can take longer.
+func (d *Daemon) resumeAfterFetch() {
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
+	d.mu.Lock()
+	// Only a connection that is down for want of the cache: one that
+	// failed for any other reason keeps its stopped retries.
+	waiting := d.state.Connected && !d.closing && d.conn == nil && d.status == "failed" && d.awaitingCache
+	d.mu.Unlock()
+	if !waiting {
+		return
+	}
+	// Only when the cache now holds everything: a download for another
+	// scenario must not lift the stopped retries.
+	d.mu.Lock()
+	cfg, scenario := d.cfg, d.state.Scenario
+	d.mu.Unlock()
+	scenario = defaultScenario(cfg, scenario)
+	if !d.cacheComplete(cfg, scenario) {
+		return
+	}
+	p, err := d.prepare(cfg, scenario)
+	// The cache is complete: retries start over, through the usual
+	// backoff should anything else, such as reading the physical DNS,
+	// fail for a moment.
+	d.failures = nil
+	d.gen++
+	d.mu.Lock()
+	d.awaitingCache = false
+	d.mu.Unlock()
+	if err == nil {
+		err = d.bringUp(p)
+	} else {
+		d.setStatus("failed", err.Error())
+	}
+	if err != nil {
+		d.retryLocked(err.Error())
+	}
 }
 
 // prepare compiles scenario of cfg with the real secrets and the physical
@@ -54,9 +111,7 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if cfg == nil {
 		return nil, cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")
 	}
-	if scenario == "" && len(cfg.Scenarios) > 0 {
-		scenario = cfg.Scenarios[0].ID
-	}
+	scenario = defaultScenario(cfg, scenario)
 	found := false
 	for _, s := range cfg.Scenarios {
 		found = found || s.ID == scenario
@@ -78,10 +133,18 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if len(physical) == 0 {
 		return nil, cli.Errorf(cli.CodeEngineFailed, "连上网络后再试；已经连着时，网络就绪后会自动重连", "物理网络还没有 DNS 服务器")
 	}
+	ruleSets, err := d.cachedRuleSets(cfg, scenario, secrets)
+	if err != nil {
+		return nil, err
+	}
 	result, err := engine.Compile(cfg, engine.Options{
 		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
 		PhysicalDNS: physical[0],
 		Secret:      func(u config.SecretUse) string { return secrets[u.Name].Value },
+		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
+			rules, ok := ruleSets[o.ID]
+			return rules, ok
+		},
 	})
 	if err != nil {
 		return nil, cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
@@ -89,12 +152,35 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	// Placeholders are for checks only: a rule set that never matches would
 	// quietly send its traffic elsewhere, 3.4.
 	if len(result.MissingRuleSets) > 0 {
-		return nil, cli.Errorf(cli.CodeResourceMissing, "远程规则集的下载在 M3 实现，现在只能用 inline 规则集", "场景 %s 用到的远程规则集还没下载：%v", scenario, result.MissingRuleSets)
+		return nil, cli.Errorf(cli.CodeResourceMissing, "", "场景 %s 用到的远程规则集还没下载：%v", scenario, result.MissingRuleSets)
+	}
+	// Downloaded content joined the configuration only now: check the
+	// whole of it before anything running is replaced. The check sees
+	// placeholders for secrets, as every check does, 4.5.
+	if len(result.JSON) > engine.MaxConfigSize {
+		return nil, cli.Errorf(cli.CodeResourceTooLarge, "少用几个大的远程规则集", "场景 %s 编译出的配置超过 %d 字节", scenario, engine.MaxConfigSize)
+	}
+	checked, err := engine.Compile(cfg, engine.Options{
+		Scenario: scenario, TUN: !d.opts.NoTUN, Stack: engine.DefaultStack, StateDirectory: d.opts.Layout.Tailscale(),
+		PhysicalDNS: physical[0],
+		RuleSet: func(o *config.Object) ([]*config.Value, bool) {
+			rules, ok := ruleSets[o.ID]
+			return rules, ok
+		},
+	})
+	if err != nil {
+		return nil, cli.Errorf(cli.CodeInternal, "", "编译失败：%v", err)
+	}
+	if err := engine.Check(context.Background(), d.opts.Executable, checked.JSON); err != nil {
+		if errors.Is(err, engine.ErrCheckUnavailable) {
+			return nil, cli.Errorf(cli.CodeInternal, "", "%v", err)
+		}
+		return nil, cli.Errorf(cli.CodeEngineFailed, "", "场景 %s 的配置 sing-box 不接受：%s", scenario, truncate(err.Error(), 300))
 	}
 	if err := checkSecrets(cfg, secrets, result.Secrets); err != nil {
 		return nil, err
 	}
-	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, secrets: secrets}, nil
+	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON), secrets: secrets}, nil
 }
 
 // bringUp replaces the connection with p, 6.3: take the connection lock,
@@ -107,7 +193,7 @@ func (d *Daemon) bringUp(p *plan) error {
 	old := d.conn
 	d.conn = nil
 	d.mu.Unlock()
-	c := &connection{scenario: p.scenario, revision: p.revision, physical: p.physical}
+	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, physical: p.physical}
 	if old != nil {
 		// A reload keeps the lock it holds rather than letting it go and
 		// taking it again.
@@ -168,7 +254,13 @@ func (d *Daemon) establishLocked() error {
 	cfg, scenario := d.cfg, d.state.Scenario
 	d.mu.Unlock()
 	p, err := d.prepare(cfg, scenario)
+	d.mu.Lock()
+	d.awaitingCache = cli.Is(err, cli.CodeResourceMissing)
+	d.mu.Unlock()
 	if err != nil {
+		// Content missing from the cache is downloaded in the background,
+		// outside the control sequence; a download that brings it in
+		// tries again, resumeAfterFetch.
 		d.setStatus("failed", err.Error())
 		return err
 	}
@@ -445,4 +537,11 @@ func (d *Daemon) reconcile() {
 		return
 	}
 	c.probeMiss = 0
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n], "") + "…"
 }

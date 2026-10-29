@@ -28,16 +28,18 @@ const (
 
 func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 	return map[string]func(json.RawMessage) reply{
-		"version":       d.version,
-		"status":        d.statusMethod,
-		"config.export": d.export,
-		"config.apply":  d.apply,
-		"secret.set":    d.secretSet,
-		"secret.list":   d.secretList,
-		"secret.rm":     d.secretRemove,
-		"connect":       d.connect,
-		"disconnect":    d.disconnect,
-		"scenario.use":  d.scenarioUse,
+		"version":         d.version,
+		"status":          d.statusMethod,
+		"config.export":   d.export,
+		"config.apply":    d.apply,
+		"secret.set":      d.secretSet,
+		"secret.list":     d.secretList,
+		"secret.rm":       d.secretRemove,
+		"connect":         d.connect,
+		"disconnect":      d.disconnect,
+		"scenario.use":    d.scenarioUse,
+		"rule_set.list":   d.ruleSetList,
+		"rule_set.update": d.ruleSetUpdate,
 	}
 }
 
@@ -164,6 +166,17 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 		return reply{err: &cli.Error{Code: cli.CodeConfigInvalid, Message: fmt.Sprintf("配置有 %d 处问题", len(verification.Problems)), Problems: verification.Problems}}
 	}
 
+	// Connected, the new configuration's scenario must come up: what it
+	// needs is downloaded first, outside the control sequence.
+	d.mu.Lock()
+	want, scenario := d.state.Connected, d.state.Scenario
+	d.mu.Unlock()
+	if want && !p.DryRun {
+		if err := d.fetchFor(c, scenario); err != nil {
+			return reply{err: err}
+		}
+	}
+
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
 	d.mu.Lock()
@@ -225,6 +238,7 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 	d.mu.Unlock()
 	result.Applied = true
 	d.events.add("config_applied", map[string]any{"revision": result.Revision, "previous": result.PreviousRevision})
+	d.wakeResources()
 	return reply{schema: SchemaConfigApply, result: result}
 }
 
@@ -347,6 +361,7 @@ func (d *Daemon) secretSet(params json.RawMessage) reply {
 		return reply{err: err}
 	}
 	d.events.add("secret_set", map[string]any{"name": p.Name})
+	d.wakeResources()
 	for _, r := range secretRefs(d.cfg, d.secrets) {
 		if r.Name == p.Name {
 			return reply{schema: SchemaSecret, result: r}
@@ -401,19 +416,28 @@ func (d *Daemon) connect(params json.RawMessage) reply {
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
 	}
-	d.ctl.Lock()
-	defer d.ctl.Unlock()
 	d.mu.Lock()
-	cfg, c, scenario := d.cfg, d.conn, p.Scenario
+	cfg, scenario := d.cfg, p.Scenario
 	if scenario == "" {
 		scenario = d.state.Scenario
 	}
+	d.mu.Unlock()
+	scenario = defaultScenario(cfg, scenario)
+	if err := d.fetchFor(cfg, scenario); err != nil {
+		return reply{err: err}
+	}
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
+	d.mu.Lock()
+	cfg, c := d.cfg, d.conn
 	d.mu.Unlock()
 	next, err := d.prepare(cfg, scenario)
 	if err != nil {
 		return reply{err: err}
 	}
-	if c != nil && c.scenario == next.scenario && c.revision == next.revision && c.physical[0] == next.physical[0] {
+	// Nothing to do only if the engine would run exactly this: a rule set
+	// downloaded since, or a new physical DNS, makes it differ.
+	if c != nil && c.scenario == next.scenario && c.digest == next.digest {
 		return reply{schema: SchemaStatus, result: d.currentStatus()}
 	}
 	if err := d.switchLocked(next); err != nil {
@@ -452,10 +476,18 @@ func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
 	}
+	d.mu.Lock()
+	cfg, want := d.cfg, d.state.Connected
+	d.mu.Unlock()
+	if want {
+		if err := d.fetchFor(cfg, p.ID); err != nil {
+			return reply{err: err}
+		}
+	}
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
 	d.mu.Lock()
-	cfg, want := d.cfg, d.state.Connected
+	cfg, want = d.cfg, d.state.Connected
 	d.mu.Unlock()
 	if cfg == nil {
 		return reply{err: cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/kafeifei/xdial-next/internal/cli"
 	"github.com/kafeifei/xdial-next/internal/config"
 	"github.com/kafeifei/xdial-next/internal/engine"
+	"github.com/kafeifei/xdial-next/internal/resource"
 )
 
 // The test binary doubles as the check child, as xdial itself does.
@@ -182,7 +184,8 @@ func contract(t *testing.T, stdout, stderr string) map[string]any {
 }
 
 func TestUsageErrors(t *testing.T) {
-	cases := [][]string{nil, {"nope"}, {"version", "--nope"}, {"version", "extra"}, {"config", "check"}, {"config", "check", "a", "b"}, {"version", "--json=1"}}
+	cases := [][]string{nil, {"nope"}, {"version", "--nope"}, {"version", "extra"}, {"config", "check"}, {"config", "check", "a", "b"}, {"version", "--json=1"},
+		{"rule-set", "list", "extra"}}
 	for _, args := range cases {
 		code, stdout, stderr := execute(args...)
 		if code != cli.ExitUsage {
@@ -455,5 +458,40 @@ func TestStageBinaryChecksTheSource(t *testing.T) {
 		if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {
 			t.Errorf("a file of another user was installed: %v", err)
 		}
+	}
+}
+
+func TestArgCount(t *testing.T) {
+	for _, c := range []struct {
+		args   []string
+		lo, hi int
+	}{
+		{nil, 0, 0},
+		{[]string{"<文件>"}, 1, 1},
+		{[]string{"[<id>]"}, 0, 1},
+		{[]string{"[<id>...]"}, 0, math.MaxInt},
+		{[]string{"<a>", "[<b>...]"}, 1, math.MaxInt},
+	} {
+		if lo, hi := argCount(c.args); lo != c.lo || hi != c.hi {
+			t.Errorf("argCount(%q) = %d, %d; want %d, %d", c.args, lo, hi, c.lo, c.hi)
+		}
+	}
+}
+
+func TestDownloadChildrenAreDispatched(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, resource.FetchCommand)
+	cmd.Stdin = strings.NewReader(`{"url": "http://example.com/", "max_bytes": 10, "via": "direct"}`)
+	out, _ := cmd.Output()
+	if !strings.Contains(string(out), `"code":"resource.blocked"`) {
+		t.Errorf("fetch child: %q", out)
+	}
+	cmd = exec.Command(exe, resource.DecodeCommand)
+	cmd.Stdin = strings.NewReader("not a rule set")
+	if err := cmd.Run(); err == nil {
+		t.Error("decode child accepted garbage")
 	}
 }
