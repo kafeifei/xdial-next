@@ -77,6 +77,11 @@ func (d *Daemon) tailscaleLogin(params json.RawMessage) reply {
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
 	}
+	// The key is scrubbed from the engine's text like a secret, so it is
+	// bounded like one, 3.5.
+	if len(p.AuthKey) > MaxSecretLength {
+		return reply{err: cli.Errorf(cli.CodeSecretFormat, "", "auth key 最长 %d 字节", MaxSecretLength)}
+	}
 	if p.AuthKey == "" {
 		c, err := d.tailscaleLine(p.Line)
 		if err != nil {
