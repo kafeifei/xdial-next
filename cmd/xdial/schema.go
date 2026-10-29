@@ -33,6 +33,10 @@ func envelope(name string, result map[string]any) map[string]any {
 	})
 }
 
+func policySchema() map[string]any {
+	return object([]string{"name", "rules"}, map[string]any{"name": str(), "rules": map[string]any{"type": "integer"}})
+}
+
 // secretRefSchema never has a value field: secrets are write-only.
 func secretRefSchema() map[string]any {
 	return object([]string{"name", "set", "references"}, map[string]any{
@@ -116,6 +120,33 @@ func outputSchemas() map[string]any {
 		"xdial.rule-set.update/v1": envelope("xdial.rule-set.update/v1", object([]string{"updated"}, map[string]any{
 			"updated": map[string]any{"type": "array", "items": object([]string{"id", "changed", "rules", "fetched_at"}, map[string]any{
 				"id": str(), "changed": map[string]any{"type": "boolean"}, "rules": map[string]any{"type": "integer"}, "fetched_at": str(),
+			})},
+		})),
+		"xdial.subscription.list/v1": envelope("xdial.subscription.list/v1", object([]string{"subscriptions"}, map[string]any{
+			"subscriptions": map[string]any{"type": "array", "items": object(
+				[]string{"id", "download_via", "cached", "nodes", "rules", "policies", "unsupported"},
+				map[string]any{
+					"id": str(), "name": str(), "download_via": str(), "cached": map[string]any{"type": "boolean"}, "format": str(),
+					"nodes": map[string]any{"type": "integer"}, "rules": map[string]any{"type": "integer"},
+					"policies":    map[string]any{"type": "array", "items": policySchema()},
+					"unsupported": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "integer"}},
+					"fetched_at":  str(), "changed_at": str(), "next_update": str(),
+					"last_error": object([]string{"code", "message"}, map[string]any{"code": str(), "message": str(), "hint": str(),
+						"problems": map[string]any{"type": "array"}}),
+				})},
+		})),
+		"xdial.subscription.show/v1": envelope("xdial.subscription.show/v1", object([]string{"id", "nodes", "policies"}, map[string]any{
+			"id": str(),
+			"nodes": map[string]any{"type": "array", "items": object([]string{"name", "type", "server", "server_port"}, map[string]any{
+				"name": str(), "type": str(), "server": str(), "server_port": map[string]any{"type": "integer"},
+			})},
+			"policies": map[string]any{"type": "array", "items": policySchema()},
+		})),
+		"xdial.subscription.update/v1": envelope("xdial.subscription.update/v1", object([]string{"updated"}, map[string]any{
+			"updated": map[string]any{"type": "array", "items": object([]string{"id", "changed", "nodes", "rules", "unsupported", "fetched_at"}, map[string]any{
+				"id": str(), "changed": map[string]any{"type": "boolean"}, "nodes": map[string]any{"type": "integer"},
+				"rules": map[string]any{"type": "integer"}, "fetched_at": str(),
+				"unsupported": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "integer"}},
 			})},
 		})),
 		"xdial.logs/v1": envelope("xdial.logs/v1", object([]string{"time", "type"}, map[string]any{

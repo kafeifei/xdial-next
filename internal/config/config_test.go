@@ -326,3 +326,17 @@ func TestUnknownKeyLookingLikeAnIndexIsCut(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckRulesSharesTheRegexBudget(t *testing.T) {
+	var rules [][]byte
+	for range 100 {
+		rules = append(rules, []byte(`{"domain_regex": ["[a-z]{1000}"]}`))
+	}
+	if _, ok := CheckRules(rules); ok {
+		t.Error("100 costly regular expressions passed one by one")
+	}
+	checked, ok := CheckRules([][]byte{[]byte(`{"domain": ["a.example"]}`), []byte(`{"query_type": ["A"]}`), []byte(`{`)})
+	if !ok || checked[0] == nil || checked[1] != nil || checked[2] != nil {
+		t.Errorf("per-rule results: %v %v", checked, ok)
+	}
+}

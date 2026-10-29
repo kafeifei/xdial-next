@@ -157,6 +157,26 @@ func (d *Daemon) fetchFor(cfg *config.Config, scenario string) error {
 			return prefixed(err, fmt.Sprintf("场景 %s 用到的规则集 %s 还没下载，下载失败：", scenario, o.ID))
 		}
 	}
+	// Subscriptions: the compiler says which the scenario reaches and the
+	// cache lacks. A downloaded one can reach lines that reach others, so
+	// repeat; each round downloads at least one, which bounds the rounds,
+	// 1.5.
+	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
+	for round := 0; round <= len(cfg.Subscriptions); round++ {
+		result, err := engine.Compile(cfg, engine.Options{Scenario: scenario, Subscription: source.get})
+		if err != nil || len(result.MissingSubscriptions) == 0 {
+			return nil
+		}
+		if source.err != nil {
+			return source.err
+		}
+		for _, id := range result.MissingSubscriptions {
+			if _, err := d.downloadSubscription(cfg, findSubscription(cfg, id), secrets); err != nil {
+				return prefixed(err, fmt.Sprintf("场景 %s 用到的订阅 %s 还没下载，下载失败：", scenario, id))
+			}
+			delete(source.content, id)
+		}
+	}
 	return nil
 }
 
@@ -249,6 +269,13 @@ func (d *Daemon) cacheComplete(cfg *config.Config, scenario string) bool {
 			})
 			complete = false
 		}
+	}
+	// Subscriptions: what the compiler reaches through the cache only.
+	// subscriptionSource.get drops or marks a refused cache, as above.
+	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
+	result, err := engine.Compile(cfg, engine.Options{Scenario: scenario, Subscription: source.get})
+	if err != nil || source.err != nil || len(result.MissingSubscriptions) > 0 {
+		complete = false
 	}
 	if !complete {
 		d.wakeResources()
@@ -385,7 +412,7 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 	if d.attempts == nil {
 		d.attempts = map[string]resourceAttempt{}
 	}
-	d.attempts[o.ID] = resourceAttempt{at: time.Now(), err: e}
+	d.attempts["rule_set:"+o.ID] = resourceAttempt{at: time.Now(), err: e}
 	d.mu.Unlock()
 	if e != nil {
 		d.events.add("rule_set_update_failed", map[string]any{"id": o.ID, "code": e.Code, "error": e.Message})
@@ -701,8 +728,8 @@ func (d *Daemon) wakeResources() {
 	}
 }
 
-// refreshResources downloads remote content missing from the cache or past
-// its interval.
+// refreshResources downloads remote rule sets and subscriptions missing
+// from the cache or past their interval.
 func (d *Daemon) refreshResources() {
 	d.mu.Lock()
 	cfg := d.cfg
@@ -717,7 +744,7 @@ func (d *Daemon) refreshResources() {
 		if o.Type != "remote" {
 			continue
 		}
-		if a, ok := attempts[o.ID]; ok && a.err != nil && now.Sub(a.at) < resourceRetryDelay {
+		if a, ok := attempts["rule_set:"+o.ID]; ok && a.err != nil && now.Sub(a.at) < resourceRetryDelay {
 			continue
 		}
 		url, err := remoteURL(cfg, o, secrets)
@@ -730,8 +757,23 @@ func (d *Daemon) refreshResources() {
 		}
 		_, _ = d.downloadRuleSet(cfg, o, secrets)
 	}
+	for _, o := range cfg.Subscriptions {
+		if a, ok := attempts["subscription:"+o.ID]; ok && a.err != nil && now.Sub(a.at) < resourceRetryDelay {
+			continue
+		}
+		url, err := remoteURL(cfg, o, secrets)
+		if err != nil {
+			continue
+		}
+		marked := d.markedInvalid(d.subscriptionPath(o.ID, subscriptionFingerprint(o, url)))
+		if c, ok := d.subscriptionMeta(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) && !marked {
+			continue
+		}
+		_, _ = d.downloadSubscription(cfg, o, secrets)
+	}
 	d.res.Lock()
 	d.collectRuleSets()
+	d.collectSubscriptions()
 	d.res.Unlock()
 }
 
@@ -778,7 +820,7 @@ func (d *Daemon) ruleSetList(json.RawMessage) reply {
 					info.FetchedAt, info.ChangedAt, info.NextUpdate = &c.FetchedAt, &c.ChangedAt, &next
 				}
 			}
-			if a, ok := attempts[o.ID]; ok && a.err != nil {
+			if a, ok := attempts["rule_set:"+o.ID]; ok && a.err != nil {
 				info.LastError = a.err
 			}
 			list = append(list, info)

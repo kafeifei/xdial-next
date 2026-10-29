@@ -21,6 +21,7 @@ import (
 	"github.com/kafeifei/xdial-next/internal/config"
 	"github.com/kafeifei/xdial-next/internal/engine"
 	"github.com/kafeifei/xdial-next/internal/resource"
+	"github.com/kafeifei/xdial-next/internal/subscription"
 )
 
 func main() {
@@ -46,6 +47,8 @@ func hidden(args []string) (int, bool) {
 		return resource.RunFetchChild(os.Stdin, os.Stdout), true
 	case resource.DecodeCommand:
 		return resource.RunDecodeChild(os.Stdin, os.Stdout, os.Stderr), true
+	case subscription.ParseCommand:
+		return subscription.RunParseChild(os.Stdin, os.Stdout, os.Stderr), true
 	}
 	return 0, false
 }

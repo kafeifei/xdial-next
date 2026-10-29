@@ -56,6 +56,11 @@ func specSchema(s *Spec) map[string]any {
 		plain.Class = Plain
 		return map[string]any{"anyOf": []any{specSchema(&plain), secretRefSchema()}}
 	}
+	if s.alt != nil {
+		plain := *s
+		plain.alt = nil
+		return map[string]any{"anyOf": []any{specSchema(&plain), specSchema(s.alt)}}
+	}
 	switch s.shape {
 	case shapeString:
 		out := map[string]any{"type": "string"}

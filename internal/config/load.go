@@ -33,12 +33,53 @@ type Object struct {
 // Label names the object the way problems do, as "line hk".
 func (o *Object) Label() string { return o.Kind + " " + o.ID }
 
-// ScenarioRule binds a rule set to a line.
+// ScenarioRule binds a rule set to a line, or the rules of a subscription,
+// in the subscription's own order, each to the line its policy maps to,
+// ARCHITECTURE.md 1.5. Rules whose policy is not in Policies go to Other,
+// or are left out when Other is empty.
 type ScenarioRule struct {
-	RuleSet string
-	Line    string
-	Invert  bool
-	Path    string
+	RuleSet      string
+	Line         string
+	Invert       bool
+	Subscription string
+	Policies     map[string]string
+	Other        string
+	Path         string
+	raw          *Value
+}
+
+// Member is one member of a group: an outbound id, or the nodes of a
+// subscription whose names Filter matches and Exclude does not.
+type Member struct {
+	ID           string
+	Subscription string
+	Filter       string
+	Exclude      string
+}
+
+// Members returns the members of group o.
+func Members(o *Object) []Member {
+	var out []Member
+	if members := o.Value.Get("outbounds"); members != nil {
+		for _, m := range members.Items {
+			if m.Kind == KindString {
+				out = append(out, Member{ID: m.String})
+				continue
+			}
+			member := Member{}
+			if v := m.Get("subscription"); v != nil {
+				member.Subscription = v.String
+			}
+			if v := m.Get("filter"); v != nil {
+				member.Filter = v.String
+			}
+			if v := m.Get("exclude"); v != nil {
+				member.Exclude = v.String
+			}
+			out = append(out, member)
+		}
+	}
+	return out
 }
 
 // Scenario is a checked scenario.
@@ -210,7 +251,7 @@ func (c *Config) add(o *Object) {
 		}
 		if rules := o.Value.Get("rules"); rules != nil {
 			for i, r := range rules.Items {
-				rule := ScenarioRule{Path: fmt.Sprintf("%s.rules[%d]", o.Path, i)}
+				rule := ScenarioRule{Path: fmt.Sprintf("%s.rules[%d]", o.Path, i), raw: r}
 				if v := r.Get("rule_set"); v != nil {
 					rule.RuleSet = v.String
 				}
@@ -219,6 +260,18 @@ func (c *Config) add(o *Object) {
 				}
 				if v := r.Get("invert"); v != nil {
 					rule.Invert = v.Bool
+				}
+				if v := r.Get("subscription"); v != nil {
+					rule.Subscription = v.String
+				}
+				if v := r.Get("policies"); v != nil {
+					rule.Policies = map[string]string{}
+					for _, f := range v.Fields {
+						rule.Policies[f.Key] = f.Value.String
+					}
+				}
+				if v := r.Get("other"); v != nil {
+					rule.Other = v.String
 				}
 				s.Rules = append(s.Rules, rule)
 			}
@@ -273,6 +326,10 @@ func (c *Config) checkObjects(w *walker) {
 	for _, o := range c.RuleSets {
 		ruleSets[o.ID] = o
 	}
+	subscriptions := map[string]*Object{}
+	for _, o := range c.Subscriptions {
+		subscriptions[o.ID] = o
+	}
 
 	// References. Detours, group members and download_via name an outbound;
 	// scenario rules and final may also name block.
@@ -298,9 +355,16 @@ func (c *Config) checkObjects(w *walker) {
 		}
 		if members := o.Value.Get("outbounds"); members != nil {
 			ids := map[string]bool{}
-			for i, m := range members.Items {
-				outboundRef(o, fmt.Sprintf("%s.outbounds[%d]", o.Path, i), m.String, false)
-				ids[m.String] = true
+			for i, m := range Members(o) {
+				path := fmt.Sprintf("%s.outbounds[%d]", o.Path, i)
+				if m.Subscription != "" {
+					if subscriptions[m.Subscription] == nil {
+						problem(o, cli.CodeConfigReference, path+".subscription", "先在 subscriptions 里定义它", "引用的订阅 %q 不存在", m.Subscription)
+					}
+					continue
+				}
+				outboundRef(o, path, m.ID, false)
+				ids[m.ID] = true
 			}
 			if len(members.Items) == 0 {
 				problem(o, cli.CodeConfigValue, o.Path+".outbounds", "", "线路组至少要有一个成员")
@@ -321,10 +385,44 @@ func (c *Config) checkObjects(w *walker) {
 	}
 	for _, s := range c.Scenarios {
 		for _, r := range s.Rules {
-			if ruleSets[r.RuleSet] == nil {
-				problem(&s.Object, cli.CodeConfigReference, r.Path+".rule_set", "先在 rule_sets 里定义它", "引用的规则集 %q 不存在", r.RuleSet)
+			has := func(key string) bool { return r.raw != nil && r.raw.Get(key) != nil }
+			switch {
+			case r.RuleSet != "" && r.Subscription != "":
+				problem(&s.Object, cli.CodeConfigValue, r.Path, "一条规则写 rule_set 或 subscription 之一", "rule_set 和 subscription 不能同时写")
+			case r.Subscription != "":
+				if subscriptions[r.Subscription] == nil {
+					problem(&s.Object, cli.CodeConfigReference, r.Path+".subscription", "先在 subscriptions 里定义它", "引用的订阅 %q 不存在", r.Subscription)
+				}
+				if has("line") || has("invert") {
+					problem(&s.Object, cli.CodeConfigValue, r.Path, "订阅的规则按 policies 选线路", "引用订阅规则时不能写 line 或 invert")
+				}
+				if r.Policies == nil {
+					problem(&s.Object, cli.CodeConfigValue, r.Path+".policies", "按订阅里的策略名写，例如 {\"🚀 节点选择\": \"proxy\"}", "引用订阅规则时要写 policies")
+				}
+				names := make([]string, 0, len(r.Policies))
+				for name := range r.Policies {
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				for _, name := range names {
+					outboundRef(&s.Object, joinKey(r.Path+".policies", name), r.Policies[name], true)
+				}
+				if r.Other != "" {
+					outboundRef(&s.Object, r.Path+".other", r.Other, true)
+				}
+			default:
+				if !has("rule_set") || !has("line") {
+					problem(&s.Object, cli.CodeConfigValue, r.Path, "写成 {\"rule_set\": \"<id>\", \"line\": \"<线路>\"}", "规则要写 rule_set 和 line，或者 subscription 和 policies")
+					continue
+				}
+				if ruleSets[r.RuleSet] == nil {
+					problem(&s.Object, cli.CodeConfigReference, r.Path+".rule_set", "先在 rule_sets 里定义它", "引用的规则集 %q 不存在", r.RuleSet)
+				}
+				if has("policies") || has("other") {
+					problem(&s.Object, cli.CodeConfigValue, r.Path, "policies 和 other 只用于引用订阅规则", "引用规则集时不能写 policies 或 other")
+				}
+				outboundRef(&s.Object, r.Path+".line", r.Line, true)
 			}
-			outboundRef(&s.Object, r.Path+".line", r.Line, true)
 		}
 		outboundRef(&s.Object, s.Path+".final", s.Final, true)
 	}
@@ -379,6 +477,9 @@ func (c *Config) checkObjects(w *walker) {
 		// direct named as download_via is checked against local and internal
 		// addresses; direct reached through a group would dial with sing-box's
 		// own direct outbound, which checks nothing.
+		if via.String != Direct && c.reachesSubscription(via.String, map[string]bool{}) {
+			problem(o, cli.CodeConfigReference, o.Path+".download_via", "下载线路选一条不含订阅节点的线路或组", "下载线路 %q 会走到订阅节点", via.String)
+		}
 		if via.String != Direct && c.reachesDirect(via.String, map[string]bool{}) {
 			problem(o, cli.CodeConfigReference, o.Path+".download_via", "直连下载写 direct；经组下载时组里不要有 direct", "下载线路 %q 经组会走到 direct，绕过对本机和内网地址的检查", via.String)
 		}
@@ -400,11 +501,33 @@ func (c *Config) reachesDirect(id string, seen map[string]bool) bool {
 	if o == nil {
 		return false
 	}
-	if members := o.Value.Get("outbounds"); members != nil {
-		for _, m := range members.Items {
-			if c.reachesDirect(m.String, seen) {
-				return true
-			}
+	for _, m := range Members(o) {
+		if m.Subscription == "" && c.reachesDirect(m.ID, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+// reachesSubscription reports whether a chain reaches subscription nodes:
+// a download child holds only the lines of the configuration, 3.4.
+func (c *Config) reachesSubscription(id string, seen map[string]bool) bool {
+	if seen[id] {
+		return false
+	}
+	seen[id] = true
+	o := c.Line(id)
+	if o == nil {
+		return false
+	}
+	for _, m := range Members(o) {
+		if m.Subscription != "" {
+			return true
+		}
+	}
+	for _, next := range outboundEdges(o) {
+		if c.reachesSubscription(next, seen) {
+			return true
 		}
 	}
 	return false
@@ -415,9 +538,9 @@ func outboundEdges(o *Object) []string {
 	if d := o.Value.Get("detour"); d != nil {
 		edges = append(edges, d.String)
 	}
-	if members := o.Value.Get("outbounds"); members != nil {
-		for _, m := range members.Items {
-			edges = append(edges, m.String)
+	for _, m := range Members(o) {
+		if m.Subscription == "" {
+			edges = append(edges, m.ID)
 		}
 	}
 	return edges
@@ -509,4 +632,25 @@ func indexOf(list []string, s string) int {
 		}
 	}
 	return 0
+}
+
+// CheckNode checks one subscription node, sing-box outbound options without
+// a tag, against the node allow list and the same classification as lines,
+// 1.5. Credential fields hold their values; a secret reference is refused,
+// or a hostile subscription could send a secret the user set to its own
+// server.
+func CheckNode(v *Value) []cli.Problem {
+	w := &walker{node: true, remote: true}
+	w.field(v, nodeSpec(), "", nil)
+	if !w.failed() {
+		o := &Object{Kind: "node", Value: v}
+		if t := v.Get("type"); t != nil {
+			o.Type = t.String
+		}
+		if o.Type == "shadowsocks" {
+			(&Config{}).checkPlugin(o, w)
+		}
+		checkCrossField(o, w)
+	}
+	return w.problems
 }

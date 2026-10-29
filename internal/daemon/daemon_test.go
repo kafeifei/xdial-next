@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/kafeifei/xdial-next/internal/paths"
 	"github.com/kafeifei/xdial-next/internal/resource"
 	"github.com/kafeifei/xdial-next/internal/store"
+	"github.com/kafeifei/xdial-next/internal/subscription"
 )
 
 // The test binary doubles as the check child and the engine child.
@@ -36,6 +38,8 @@ func TestMain(m *testing.M) {
 			os.Exit(resource.RunFetchChild(os.Stdin, os.Stdout))
 		case resource.DecodeCommand:
 			os.Exit(resource.RunDecodeChild(os.Stdin, os.Stdout, os.Stderr))
+		case subscription.ParseCommand:
+			os.Exit(subscription.RunParseChild(os.Stdin, os.Stdout, os.Stderr))
 		}
 	}
 	os.Exit(m.Run())
@@ -900,4 +904,88 @@ func TestRedownloadMarkSurvivesAFailedDownload(t *testing.T) {
 	if h.d.markedInvalid(path) {
 		t.Error("a valid cache kept the mark")
 	}
+}
+
+const subDoc = `{"version": 1,
+	"lines": [{"id": "jp", "type": "trojan", "server": "127.0.0.1", "server_port": 9, "password": {"secret": "jp"}}],
+	"groups": [{"id": "proxy", "type": "selector", "outbounds": [{"subscription": "air", "filter": "香港"}, "jp"]},
+	           {"id": "only-sub", "type": "selector", "outbounds": [{"subscription": "air", "filter": "美国"}]}],
+	"subscriptions": [{"id": "air", "url": {"secret": "air-url"}}],
+	"scenarios": [{"id": "s", "rules": [{"subscription": "air", "policies": {"Proxy": "proxy", "DIRECT": "direct"}}], "final": "direct"},
+	              {"id": "empty", "rules": [], "final": "only-sub"}]}`
+
+// seedSubscription writes downloaded content for subscription id into the
+// cache, as a download of url would have.
+func (h *harness) seedSubscription(id, url, content string) {
+	h.t.Helper()
+	fp := fingerprint(url, "subscription\n"+defaultUserAgent)
+	path := filepath.Join(h.layout.Resources(), "subscriptions", id+"."+fp[:16]+".json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		h.t.Fatal(err)
+	}
+	var c subscription.Content
+	if err := json.Unmarshal([]byte(content), &c); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := store.WriteJSON(path, cachedSubscription{Fingerprint: fp, FetchedAt: time.Now(), ChangedAt: time.Now(), Content: c}, 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+const airCache = `{"format": "clash",
+	"nodes": [
+		{"name": "香港 01", "outbound": {"type": "shadowsocks", "server": "127.0.0.1", "server_port": 9, "method": "aes-128-gcm", "password": "node-secret"}},
+		{"name": "日本 01", "outbound": {"type": "trojan", "server": "127.0.0.1", "server_port": 9, "password": "node-secret"}}],
+	"rules": [
+		{"policy": "Proxy", "rule": {"domain_suffix": ["google.com"]}},
+		{"policy": "DIRECT", "rule": {"domain": ["a.example"]}}],
+	"unsupported": {"rule:geoip": 2}}`
+
+func TestCachedSubscriptionConnects(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://sub.example/token"
+	h.ok("config.apply", map[string]any{"content": subDoc})
+	h.ok("secret.set", map[string]any{"name": "jp", "value": "a-password"})
+	h.ok("secret.set", map[string]any{"name": "air-url", "value": url})
+	h.seedSubscription("air", url, airCache)
+	if s := h.ok("connect", map[string]any{"scenario": "s"}); s["state"] != "connected" {
+		t.Fatalf("connect with a cached subscription: %v", s)
+	}
+	list := h.ok("subscription.list", nil)["subscriptions"].([]any)[0].(map[string]any)
+	if list["cached"] != true || list["nodes"] != float64(2) || list["rules"] != float64(2) ||
+		fmt.Sprint(list["policies"]) != "[map[name:Proxy rules:1] map[name:DIRECT rules:1]]" || fmt.Sprint(list["unsupported"]) != "map[rule:geoip:2]" {
+		t.Errorf("subscription list: %v", list)
+	}
+	show := h.call("subscription.show", map[string]any{"id": "air"})
+	if !show.OK || strings.Contains(string(show.Result), "node-secret") || !strings.Contains(string(show.Result), "香港 01") {
+		t.Errorf("subscription show: %s", show.Result)
+	}
+	// A group the filters leave empty refuses to connect, and says why.
+	h.fails("scenario.use", map[string]any{"id": "empty"}, cli.CodeResourceMissing)
+	if s := h.ok("status", nil); s["state"] != "connected" || s["scenario"] != "s" {
+		t.Errorf("a refused switch changed the connection: %v", s)
+	}
+}
+
+func TestSubscriptionCacheWithSecretReferenceIsNotConnectedFrom(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://sub.example/token"
+	h.ok("config.apply", map[string]any{"content": subDoc})
+	h.ok("secret.set", map[string]any{"name": "jp", "value": "a-password"})
+	h.ok("secret.set", map[string]any{"name": "air-url", "value": url})
+	h.seedSubscription("air", url, strings.Replace(airCache, `"password": "node-secret"}}],`, `"password": {"secret": "jp"}}}],`, 1))
+	// Compiling checks the cached content again: a node that references a
+	// secret is never compiled, so the scenario's subscription is missing.
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceDownload)
+}
+
+func TestMissingSubscriptionIsDownloadedFirst(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": subDoc})
+	h.ok("secret.set", map[string]any{"name": "jp", "value": "a-password"})
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeSecretMissing)
+	h.ok("secret.set", map[string]any{"name": "air-url", "value": "https://sub.example/token"})
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceDownload)
+	h.fails("subscription.show", map[string]any{"id": "air"}, cli.CodeResourceMissing)
+	h.fails("subscription.update", map[string]any{"ids": []string{"nope"}}, cli.CodeConfigConflict)
 }

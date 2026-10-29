@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -441,5 +442,227 @@ func TestCompileDownloadHoldsOnlyTheChain(t *testing.T) {
 	}
 	if _, err := CompileDownload(c, "corp", "en0", Options{}); err == nil {
 		t.Error("an endpoint was compiled into a download")
+	}
+}
+
+const subscriptionDoc = `{"version": 1,
+	"lines": [{"id": "jp", "type": "trojan", "server": "jp.example", "server_port": 443, "password": {"secret": "jp"}}],
+	"groups": [{"id": "proxy", "type": "urltest", "outbounds": [{"subscription": "air", "filter": "香港", "exclude": "剩余"}, "jp"]}],
+	"subscriptions": [{"id": "air", "url": {"secret": "air-url"}}],
+	"scenarios": [{"id": "s", "rules": [{"subscription": "air", "policies": {"Proxy": "proxy", "DIRECT": "direct", "REJECT": "block"}}], "final": "direct"},
+	              {"id": "o", "rules": [{"subscription": "air", "policies": {"Proxy": "proxy"}, "other": "direct"}], "final": "proxy"}]}`
+
+func airContent(t *testing.T) *Subscription {
+	t.Helper()
+	parse := func(s string) *config.Value {
+		v, err := config.Parse([]byte(s))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	node := func(server string) *config.Value {
+		return parse(`{"type": "shadowsocks", "server": "` + server + `", "server_port": 8388, "method": "aes-128-gcm", "password": "p"}`)
+	}
+	return &Subscription{
+		Nodes: []SubscriptionNode{
+			{Name: "香港 01", Outbound: node("hk1.example")}, {Name: "日本", Outbound: node("jp.example")},
+			{Name: "香港 02", Outbound: node("hk2.example")}, {Name: "香港 剩余流量", Outbound: node("info.example")},
+		},
+		Rules: []SubscriptionRule{
+			{Policy: "Proxy", Rule: parse(`{"domain_suffix": ["google.com"]}`)},
+			{Policy: "Proxy", Rule: parse(`{"domain_suffix": ["youtube.com"]}`)},
+			{Policy: "DIRECT", Rule: parse(`{"domain": ["a.example"]}`)},
+			{Policy: "REJECT", Rule: parse(`{"domain_keyword": ["ads"]}`)},
+			{Policy: "Elsewhere", Rule: parse(`{"ip_cidr": ["10.0.0.0/8"]}`)},
+		},
+	}
+}
+
+func TestCompileSubscription(t *testing.T) {
+	c := loadDoc(t, subscriptionDoc)
+	content := airContent(t)
+	r, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir(), TUN: true,
+		Subscription: func(*config.Object) (*Subscription, bool) { return content, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Outbounds []map[string]any `json:"outbounds"`
+		Route     struct {
+			Rules   []map[string]any `json:"rules"`
+			RuleSet []map[string]any `json:"rule_set"`
+		} `json:"route"`
+		DNS struct {
+			Rules []map[string]any `json:"rules"`
+		} `json:"dns"`
+	}
+	if err := json.Unmarshal(r.JSON, &doc); err != nil {
+		t.Fatal(err)
+	}
+	var tags []string
+	var group []any
+	for _, o := range doc.Outbounds {
+		tags = append(tags, o["tag"].(string))
+		if o["tag"] == "proxy" {
+			group = o["outbounds"].([]any)
+		}
+		if strings.HasPrefix(o["tag"].(string), "xdial:sub:") && o["domain_resolver"] != "xdial:dns-local" {
+			t.Errorf("node without the physical resolver: %v", o)
+		}
+	}
+	if got := fmt.Sprint(group); got != "[xdial:sub:air:香港 01 xdial:sub:air:香港 02 jp]" {
+		t.Errorf("group members: %s", got)
+	}
+	if strings.Contains(strings.Join(tags, ","), "日本") || strings.Contains(strings.Join(tags, ","), "剩余") {
+		t.Errorf("unselected nodes compiled: %v", tags)
+	}
+	var routes []string
+	for _, rule := range doc.Route.Rules {
+		if sets, ok := rule["rule_set"].([]any); ok {
+			routes = append(routes, fmt.Sprintf("%v→%v %v", sets[0], rule["outbound"], rule["action"]))
+		}
+	}
+	want := "[xdial:sub:air:rules-0→proxy route xdial:sub:air:rules-1→direct route xdial:sub:air:rules-2→<nil> reject]"
+	if fmt.Sprint(routes) != want {
+		t.Errorf("route rules: %v", routes)
+	}
+	var dnsSets []string
+	for _, rule := range doc.DNS.Rules {
+		if sets, ok := rule["rule_set"].([]any); ok {
+			dnsSets = append(dnsSets, fmt.Sprint(sets[0]))
+		}
+	}
+	if fmt.Sprint(dnsSets) != "[xdial:dns-rules-sub:air:rules-0 xdial:dns-rules-sub:air:rules-1]" {
+		t.Errorf("dns rules: %v", dnsSets)
+	}
+	if err := CheckInProcess(r.JSON); err != nil {
+		t.Errorf("sing-box rejects it: %v", err)
+	}
+
+	// other takes the rules of every unmapped policy.
+	r, err = Compile(c, Options{Scenario: "o", StateDirectory: t.TempDir(), TUN: true,
+		Subscription: func(*config.Object) (*Subscription, bool) { return content, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Proxy goes to proxy; DIRECT, REJECT and Elsewhere all fall to other
+	// and, consecutive, share one rule set.
+	var sets struct {
+		Route struct {
+			RuleSet []struct {
+				Tag   string `json:"tag"`
+				Rules []any  `json:"rules"`
+			} `json:"rule_set"`
+		} `json:"route"`
+	}
+	_ = json.Unmarshal(r.JSON, &sets)
+	var got []string
+	for _, s := range sets.Route.RuleSet {
+		got = append(got, fmt.Sprintf("%s:%d", s.Tag, len(s.Rules)))
+	}
+	if fmt.Sprint(got) != "[xdial:sub:air:rules-0:2 xdial:sub:air:rules-1:3 xdial:dns-rules-sub:air:rules-0:2 xdial:dns-rules-sub:air:rules-1:2]" {
+		t.Errorf("rule sets with other: %v", got)
+	}
+}
+
+func TestCompileSubscriptionMissingOrEmpty(t *testing.T) {
+	// Scenario o ends at the group, so the group and its placeholder node
+	// are compiled; its subscription rules, without content, add nothing.
+	c := loadDoc(t, subscriptionDoc)
+	r, err := Compile(c, Options{Scenario: "o", StateDirectory: t.TempDir(), TUN: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(r.MissingSubscriptions) != "[air]" || len(r.Pending) == 0 || !strings.Contains(string(r.JSON), "xdial:sub:air:placeholder") {
+		t.Errorf("missing: %v pending %v", r.MissingSubscriptions, r.Pending)
+	}
+	if err := CheckInProcess(r.JSON); err != nil {
+		t.Errorf("the placeholder configuration fails the check: %v", err)
+	}
+	empty := strings.Replace(subscriptionDoc, `"filter": "香港"`, `"filter": "nothing matches"`, 1)
+	empty = strings.Replace(empty, `, "jp"]`, `]`, 1)
+	r, err = Compile(loadDoc(t, empty), Options{Scenario: "s", StateDirectory: t.TempDir(), TUN: true,
+		Subscription: func(*config.Object) (*Subscription, bool) { return airContent(t), true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(r.EmptyGroups) != "[proxy]" {
+		t.Errorf("empty groups: %v", r.EmptyGroups)
+	}
+}
+
+func TestCompileSubscriptionBounds(t *testing.T) {
+	// Repeated references collapse; an unused mapping reaches nothing.
+	doc := strings.Replace(subscriptionDoc, `[{"subscription": "air", "filter": "香港", "exclude": "剩余"}, "jp"]`,
+		`[{"subscription": "air"}, {"subscription": "air"}, "jp", "jp"]`, 1)
+	doc = strings.Replace(doc, `"other": "direct"`, `"other": "proxy"`, 1)
+	c := loadDoc(t, doc)
+	content := airContent(t)
+	r, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir(), TUN: true,
+		Subscription: func(*config.Object) (*Subscription, bool) { return content, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	_ = json.Unmarshal(r.JSON, &out)
+	for _, o := range out.Outbounds {
+		if o["tag"] == "proxy" && len(o["outbounds"].([]any)) != 5 {
+			t.Errorf("members not deduplicated: %v", o["outbounds"])
+		}
+	}
+	// Scenario s maps Proxy, DIRECT and REJECT; a scenario whose rules all
+	// go elsewhere must not bring jp up through an unused mapping.
+	unused := loadDoc(t, strings.Replace(subscriptionDoc, `"policies": {"Proxy": "proxy", "DIRECT": "direct", "REJECT": "block"}`,
+		`"policies": {"Proxy": "direct", "DIRECT": "direct", "REJECT": "block", "Nobody": "jp"}`, 1))
+	r, err = Compile(unused, Options{Scenario: "s", StateDirectory: t.TempDir(), TUN: true,
+		Subscription: func(*config.Object) (*Subscription, bool) { return content, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(r.JSON), `"tag":"jp"`) {
+		t.Error("a mapping no rule uses compiled its line")
+	}
+	// Many groups naming a large subscription stop at the budget.
+	big := &Subscription{}
+	for i := range 2000 {
+		big.Nodes = append(big.Nodes, SubscriptionNode{Name: fmt.Sprint("n", i), Outbound: content.Nodes[0].Outbound})
+	}
+	var groups []string
+	for i := range 20 {
+		groups = append(groups, fmt.Sprintf(`{"id": "g%d", "type": "selector", "outbounds": [{"subscription": "air"}]}`, i))
+	}
+	var finals []string
+	for i := range 20 {
+		finals = append(finals, fmt.Sprintf(`{"id": "s%d", "rules": [], "final": "g%d"}`, i, i))
+	}
+	many := loadDoc(t, `{"version": 1, "groups": [`+strings.Join(groups, ",")+`],
+		"subscriptions": [{"id": "air", "url": {"secret": "u"}}], "scenarios": [`+strings.Join(finals, ",")+`]}`)
+	r, err = Compile(many, Options{StateDirectory: t.TempDir(),
+		Subscription: func(*config.Object) (*Subscription, bool) { return big, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.TooManyMembers {
+		t.Error("20 groups of 2000 nodes did not hit the member budget")
+	}
+}
+
+func TestPlainMembersDoNotCountAgainstTheBudget(t *testing.T) {
+	var lines, members, groups []string
+	for i := range 200 {
+		lines = append(lines, fmt.Sprintf(`{"id": "l%d", "type": "trojan", "server": "a.example", "server_port": 443, "password": {"secret": "p"}}`, i))
+		members = append(members, fmt.Sprintf(`"l%d"`, i))
+	}
+	for i := range 101 {
+		groups = append(groups, fmt.Sprintf(`{"id": "g%d", "type": "selector", "outbounds": [%s]}`, i, strings.Join(members, ",")))
+	}
+	c := loadDoc(t, `{"version": 1, "lines": [`+strings.Join(lines, ",")+`], "groups": [`+strings.Join(groups, ",")+`],
+		"scenarios": [{"id": "s", "final": "g0"}]}`)
+	r, err := Compile(c, Options{StateDirectory: t.TempDir()})
+	if err != nil || r.TooManyMembers {
+		t.Errorf("20,200 members written by hand hit the subscription budget: %v", err)
 	}
 }

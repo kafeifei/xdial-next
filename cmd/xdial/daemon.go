@@ -71,6 +71,12 @@ func daemonCommands() []*command {
 		{Path: []string{"rule-set", "update"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaRuleSetUpdate, run: runRuleSetUpdate,
 			Summary: "现在下载远程规则集，不写 id 就下载全部；新内容在下一次连接或切场景时生效（ARCHITECTURE.md 3.4）",
 			Options: []option{jsonOption}},
+		{Path: []string{"subscription", "list"}, Output: daemon.SchemaSubscriptionList, run: runSubscriptionList,
+			Summary: "列出订阅：有没有下载、节点数、规则数、规则用到的策略名、不支持而没收的条目和上次的错误", Options: []option{jsonOption}},
+		{Path: []string{"subscription", "show"}, Args: []string{"<id>"}, Output: daemon.SchemaSubscriptionShow, run: runSubscriptionShow,
+			Summary: "列出订阅的节点（名字、类型、服务器，不含凭据）和策略名，用来写组的 filter 和场景的 policies", Options: []option{jsonOption}},
+		{Path: []string{"subscription", "update"}, Args: []string{"[<id>...]"}, Output: daemon.SchemaSubscriptionUpdate, run: runSubscriptionUpdate,
+			Summary: "现在下载订阅，不写 id 就下载全部；新内容在下一次连接或切场景时生效（ARCHITECTURE.md 1.5）", Options: []option{jsonOption}},
 		{Path: []string{"logs"}, Output: "xdial.logs/v1", run: runLogs,
 			Summary: "显示 daemon 的事件日志",
 			Options: []option{jsonOption,
@@ -534,6 +540,79 @@ func runRuleSetUpdate(ctx *context_) int {
 				state = "已更新"
 			}
 			fmt.Fprintf(w, "%s：%s，%d 条规则\n", cli.Escape(u.ID), state, u.Rules)
+		}
+		if len(r.Updated) > 0 {
+			fmt.Fprintln(w, "新内容在下一次连接或切场景时生效")
+		}
+	})
+}
+
+func runSubscriptionList(ctx *context_) int {
+	return call(ctx, "subscription.list", nil, func(w io.Writer, raw json.RawMessage) {
+		var r struct {
+			Subscriptions []daemon.SubscriptionInfo `json:"subscriptions"`
+		}
+		_ = json.Unmarshal(raw, &r)
+		for _, s := range r.Subscriptions {
+			line := s.ID
+			if s.Cached {
+				line += fmt.Sprintf("  %s，%d 个节点，%d 条规则，%s 下载", s.Format, s.Nodes, s.Rules, s.FetchedAt.Local().Format("2006-01-02 15:04"))
+			} else {
+				line += "  还没下载"
+			}
+			fmt.Fprintln(w, cli.Escape(line))
+			for _, p := range s.Policies {
+				fmt.Fprintf(w, "  策略 %s：%d 条规则\n", cli.Escape(p.Name), p.Rules)
+			}
+			if len(s.Unsupported) > 0 {
+				fmt.Fprintln(w, "  没收的条目：", cli.Escape(fmt.Sprint(s.Unsupported)))
+			}
+			if s.LastError != nil {
+				fmt.Fprintln(w, "  上次下载失败：", cli.Escape(s.LastError.Message))
+			}
+		}
+	})
+}
+
+func runSubscriptionShow(ctx *context_) int {
+	return call(ctx, "subscription.show", map[string]any{"id": ctx.args[0]}, func(w io.Writer, raw json.RawMessage) {
+		var r struct {
+			Nodes    []daemon.NodeInfo   `json:"nodes"`
+			Policies []daemon.PolicyInfo `json:"policies"`
+		}
+		_ = json.Unmarshal(raw, &r)
+		fmt.Fprintln(w, "节点：")
+		for _, n := range r.Nodes {
+			fmt.Fprintln(w, " ", cli.Escape(fmt.Sprintf("%s  %s %s:%d", n.Name, n.Type, n.Server, n.ServerPort)))
+		}
+		fmt.Fprintln(w, "策略：")
+		for _, p := range r.Policies {
+			fmt.Fprintln(w, " ", cli.Escape(fmt.Sprintf("%s（%d 条规则）", p.Name, p.Rules)))
+		}
+	})
+}
+
+func runSubscriptionUpdate(ctx *context_) int {
+	return call(ctx, "subscription.update", map[string]any{"ids": ctx.args}, func(w io.Writer, raw json.RawMessage) {
+		var r struct {
+			Updated []struct {
+				ID          string         `json:"id"`
+				Changed     bool           `json:"changed"`
+				Nodes       int            `json:"nodes"`
+				Rules       int            `json:"rules"`
+				Unsupported map[string]int `json:"unsupported"`
+			} `json:"updated"`
+		}
+		_ = json.Unmarshal(raw, &r)
+		for _, u := range r.Updated {
+			state := "没有变化"
+			if u.Changed {
+				state = "已更新"
+			}
+			fmt.Fprintf(w, "%s：%s，%d 个节点，%d 条规则\n", cli.Escape(u.ID), state, u.Nodes, u.Rules)
+			if len(u.Unsupported) > 0 {
+				fmt.Fprintln(w, "  没收的条目：", cli.Escape(fmt.Sprint(u.Unsupported)))
+			}
 		}
 		if len(r.Updated) > 0 {
 			fmt.Fprintln(w, "新内容在下一次连接或切场景时生效")

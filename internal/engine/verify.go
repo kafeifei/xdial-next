@@ -39,6 +39,14 @@ func Verify(ctx context.Context, executable string, c *config.Config) (*Verifica
 	checked := map[string]error{}
 	for _, scenario := range targets {
 		result, err := Compile(c, Options{Scenario: scenario, StateDirectory: os.TempDir(), TUN: true, Stack: DefaultStack})
+		// A configuration the compiler could not complete is not checked
+		// as if it were whole.
+		if err == nil && result.TooManyMembers {
+			err = fmt.Errorf("线路组展开后的订阅成员合计超过 %d 个", MaxExpandedMembers)
+		}
+		if err == nil && len(result.EmptyGroups) > 0 {
+			err = fmt.Errorf("线路组 %v 没有任何成员", result.EmptyGroups)
+		}
 		if err == nil {
 			key := string(result.JSON)
 			cached, ok := checked[key]

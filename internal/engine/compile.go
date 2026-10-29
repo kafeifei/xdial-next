@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -64,6 +65,10 @@ type Options struct {
 	// TUN adds the TUN inbound, with Stack as its implementation.
 	TUN   bool
 	Stack string
+	// Subscription returns the downloaded nodes and rules of a
+	// subscription, or false when they are not at hand: checks then
+	// compile a placeholder node and no rules, 1.5.
+	Subscription func(*config.Object) (*Subscription, bool)
 	// LogLevel is the sing-box log level XDial sets explicitly, 4.3.
 	LogLevel string
 	// PhysicalDNS is the physical network's DNS server, read before the
@@ -90,6 +95,15 @@ type Result struct {
 	// MissingRuleSets are the remote rule sets compiled with a placeholder.
 	// A placeholder is for checks only; connecting refuses it.
 	MissingRuleSets []string
+	// MissingSubscriptions are the subscriptions compiled with a
+	// placeholder, refused for connecting likewise.
+	MissingSubscriptions []string
+	// EmptyGroups are groups none of whose members exist: every member
+	// came from subscriptions whose nodes the filters left out.
+	EmptyGroups []string
+	// TooManyMembers is set when groups expand to more than
+	// MaxExpandedMembers members; the configuration is then not complete.
+	TooManyMembers bool
 	// Secrets names the secrets the compiled objects use, sorted.
 	Secrets []string
 }
@@ -102,6 +116,61 @@ type compiler struct {
 	missing  []string
 	lines    map[string]bool // outbounds to compile
 	ruleSets map[string]bool
+	// Subscriptions: content by id, the ones missing, and the nodes the
+	// compiled groups use, in order.
+	subs        map[string]*Subscription
+	missingSubs []string
+	nodes       []any
+	nodeSeen    map[string]bool
+	empty       []string
+	members     int
+	tooMany     bool
+	// bindings are the scenario's rules as compiled: a rule set tag and
+	// the line it goes to, in order. generated holds the inline rule sets
+	// made from subscription rules.
+	bindings  []binding
+	generated []generatedSet
+}
+
+type binding struct {
+	tag    string
+	line   string
+	invert bool
+}
+
+type generatedSet struct {
+	tag   string
+	rules []*config.Value
+}
+
+// Subscription is the checked content of one subscription, 1.5.
+type Subscription struct {
+	Nodes []SubscriptionNode
+	Rules []SubscriptionRule
+}
+
+// SubscriptionNode is one node: its name and its sing-box outbound
+// options without a tag.
+type SubscriptionNode struct {
+	Name     string
+	Outbound *config.Value
+}
+
+// SubscriptionRule is one rule and the policy the subscription sends it to.
+type SubscriptionRule struct {
+	Policy string
+	Rule   *config.Value
+}
+
+// MaxExpandedMembers bounds the members subscription members expand to,
+// over all groups together: they multiply, a group may name a subscription
+// many times and many groups may name it, 1.5. Members written as ids are
+// bounded by the size of the document already.
+const MaxExpandedMembers = 20000
+
+// NodeTag is the tag a subscription node compiles to.
+func NodeTag(subscription, name string) string {
+	return tagPrefix + "sub:" + subscription + ":" + name
 }
 
 // Compile builds the sing-box configuration for one scenario, or for every
@@ -113,10 +182,7 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 	if opts.LogLevel == "" {
 		opts.LogLevel = "info"
 	}
-	k := &compiler{c: c, opts: opts, replace: map[*config.Value]string{}, lines: map[string]bool{}, ruleSets: map[string]bool{}}
-	for _, use := range c.Secrets {
-		k.replace[use.Value] = opts.Secret(use)
-	}
+	k := newCompiler(c, opts)
 
 	var scenario *config.Scenario
 	if opts.Scenario != "" {
@@ -129,8 +195,13 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 			return nil, fmt.Errorf("scenario %q does not exist", opts.Scenario)
 		}
 		for _, r := range scenario.Rules {
+			if r.Subscription != "" {
+				k.bindSubscription(r)
+				continue
+			}
 			k.reach(r.Line)
 			k.ruleSets[r.RuleSet] = true
+			k.bindings = append(k.bindings, binding{tag: r.RuleSet, line: r.Line, invert: r.Invert})
 		}
 		k.reach(scenario.Final)
 	} else {
@@ -162,6 +233,9 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 				// instead of resolving it here, ARCHITECTURE.md 3.3.
 				v = v.With("domain_resolver", config.String(tagDNSLocal))
 			}
+			if o.Kind == "group" {
+				v = v.With("outbounds", k.expandMembers(o))
+			}
 			if o.Type == "tailscale" {
 				v = v.With("state_directory", config.String(filepath.Join(opts.StateDirectory, o.ID)))
 			}
@@ -173,7 +247,7 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 			}
 		}
 	}
-	doc["outbounds"] = outbounds
+	doc["outbounds"] = append(outbounds, k.nodes...)
 	if len(endpoints) > 0 {
 		doc["endpoints"] = endpoints
 	}
@@ -198,7 +272,139 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 	}
 	sort.Strings(k.pending)
 	sort.Strings(k.missing)
-	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, Secrets: k.usedSecrets()}, nil
+	sort.Strings(k.missingSubs)
+	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty,
+		TooManyMembers: k.tooMany, Secrets: k.usedSecrets()}, nil
+}
+
+func newCompiler(c *config.Config, opts Options) *compiler {
+	k := &compiler{c: c, opts: opts, replace: map[*config.Value]string{}, lines: map[string]bool{}, ruleSets: map[string]bool{},
+		subs: map[string]*Subscription{}, nodeSeen: map[string]bool{}}
+	for _, use := range c.Secrets {
+		k.replace[use.Value] = opts.Secret(use)
+	}
+	return k
+}
+
+// subscription returns the content of subscription id, or nil when it is
+// not at hand, which is noted once.
+func (k *compiler) subscription(id string) *Subscription {
+	if content, ok := k.subs[id]; ok {
+		return content
+	}
+	var content *Subscription
+	for _, o := range k.c.Subscriptions {
+		if o.ID == id && k.opts.Subscription != nil {
+			if got, ok := k.opts.Subscription(o); ok {
+				content = got
+			}
+		}
+	}
+	if content == nil {
+		k.pending = append(k.pending, fmt.Sprintf("订阅 %s 还没下载，检查时用了占位节点", id))
+		k.missingSubs = append(k.missingSubs, id)
+	}
+	k.subs[id] = content
+	return content
+}
+
+// expandMembers turns the members of group o into outbound tags: ids as
+// they are, subscription members into the tags of the nodes their filters
+// select, each node compiled once, 1.5.
+func (k *compiler) expandMembers(o *config.Object) *config.Value {
+	list := &config.Value{Kind: config.KindArray}
+	seen := map[string]bool{}
+	add := func(tag string, fromSubscription bool) {
+		if seen[tag] || k.tooMany {
+			return
+		}
+		if fromSubscription {
+			if k.members++; k.members > MaxExpandedMembers {
+				k.tooMany = true
+				return
+			}
+		}
+		seen[tag] = true
+		list.Items = append(list.Items, config.String(tag))
+	}
+	for _, m := range config.Members(o) {
+		if m.Subscription == "" {
+			add(m.ID, false)
+			continue
+		}
+		content := k.subscription(m.Subscription)
+		if content == nil {
+			tag := NodeTag(m.Subscription, "placeholder")
+			k.addNode(tag, placeholderNode())
+			add(tag, true)
+			continue
+		}
+		filter, _ := regexp.Compile(m.Filter)
+		exclude, _ := regexp.Compile(m.Exclude)
+		for _, n := range content.Nodes {
+			if (m.Filter != "" && !filter.MatchString(n.Name)) || (m.Exclude != "" && exclude.MatchString(n.Name)) {
+				continue
+			}
+			tag := NodeTag(m.Subscription, n.Name)
+			if !seen[tag] && !k.tooMany {
+				k.addNode(tag, n.Outbound)
+			}
+			add(tag, true)
+		}
+	}
+	if len(list.Items) == 0 {
+		k.empty = append(k.empty, o.ID)
+		// sing-box refuses an empty group; the connection is refused
+		// before this configuration runs.
+		list.Items = append(list.Items, config.String(config.Direct))
+	}
+	return list
+}
+
+func (k *compiler) addNode(tag string, outbound *config.Value) {
+	if k.nodeSeen[tag] {
+		return
+	}
+	k.nodeSeen[tag] = true
+	v := outbound.Clone(nil).With("tag", config.String(tag)).With("domain_resolver", config.String(tagDNSLocal))
+	k.nodes = append(k.nodes, v)
+}
+
+func placeholderNode() *config.Value {
+	v, _ := config.Parse([]byte(`{"type": "shadowsocks", "server": "` + placeholderDomain + `", "server_port": 443, "method": "aes-128-gcm", "password": "xdial-placeholder"}`))
+	return v
+}
+
+// bindSubscription compiles a scenario rule that takes a subscription's
+// rules: in their order, each to the line its policy maps to, else to
+// Other, else left out. Consecutive rules going to the same line share one
+// generated rule set, 1.5.
+// Only the lines its kept rules go to are reached: a mapping no rule uses
+// must not bring a line up, an endpoint least of all.
+func (k *compiler) bindSubscription(r config.ScenarioRule) {
+	content := k.subscription(r.Subscription)
+	if content == nil {
+		return
+	}
+	var run *generatedSet
+	var runLine string
+	for _, rule := range content.Rules {
+		line, ok := r.Policies[rule.Policy]
+		if !ok {
+			line = r.Other
+		}
+		if line == "" {
+			continue
+		}
+		if run == nil || line != runLine {
+			k.reach(line)
+			k.generated = append(k.generated, generatedSet{tag: fmt.Sprintf("%ssub:%s:rules-%d", tagPrefix, r.Subscription, len(k.generated))})
+			run = &k.generated[len(k.generated)-1]
+			runLine = line
+			k.bindings = append(k.bindings, binding{tag: run.tag, line: line})
+		}
+		run.rules = append(run.rules, rule.Rule)
+	}
 }
 
 func isEndpoint(typ string) bool { return typ == "openconnect" || typ == "tailscale" }
@@ -248,9 +454,9 @@ func (k *compiler) reach(id string) {
 	if d := o.Value.Get("detour"); d != nil {
 		k.reach(d.String)
 	}
-	if members := o.Value.Get("outbounds"); members != nil {
-		for _, m := range members.Items {
-			k.reach(m.String)
+	for _, m := range config.Members(o) {
+		if m.Subscription == "" {
+			k.reach(m.ID)
 		}
 	}
 }
@@ -305,19 +511,27 @@ func (k *compiler) compileRuleSets() (route []any, dns map[string]dnsSet) {
 			k.pending = append(k.pending, fmt.Sprintf("规则集 %s 是远程的，检查时用了占位规则，内容在连接前下载", o.ID))
 			k.missing = append(k.missing, o.ID)
 		}
-		route = append(route, map[string]any{"type": "inline", "tag": o.ID, "rules": rules})
-
-		var domainRules []*config.Value
-		for _, r := range rules {
-			if domainOnly(r) {
-				domainRules = append(domainRules, r)
-			}
-		}
-		if len(domainRules) > 0 {
-			dns[o.ID] = dnsSet{tag: dnsRuleSet + o.ID, rules: domainRules, complete: len(domainRules) == len(rules)}
-		}
+		route = append(route, k.ruleSet(o.ID, rules, dns))
+	}
+	for _, g := range k.generated {
+		route = append(route, k.ruleSet(g.tag, g.rules, dns))
 	}
 	return route, dns
+}
+
+// ruleSet is one inline rule set for routing; its pure domain rules, if
+// any, become the candidate DNS rule set kept in dns under the same tag.
+func (k *compiler) ruleSet(tag string, rules []*config.Value, dns map[string]dnsSet) map[string]any {
+	var domainRules []*config.Value
+	for _, r := range rules {
+		if domainOnly(r) {
+			domainRules = append(domainRules, r)
+		}
+	}
+	if len(domainRules) > 0 {
+		dns[tag] = dnsSet{tag: dnsRuleSet + strings.TrimPrefix(tag, tagPrefix), rules: domainRules, complete: len(domainRules) == len(rules)}
+	}
+	return map[string]any{"type": "inline", "tag": tag, "rules": rules}
 }
 
 type dnsSet struct {
@@ -378,16 +592,16 @@ func (k *compiler) route(scenario *config.Scenario, endpointIDs []string, ruleSe
 	)
 	final := config.Direct
 	if scenario != nil {
-		for _, r := range scenario.Rules {
-			rule := map[string]any{"rule_set": []string{r.RuleSet}}
-			if r.Invert {
+		for _, r := range k.bindings {
+			rule := map[string]any{"rule_set": []string{r.tag}}
+			if r.invert {
 				rule["invert"] = true
 			}
-			if r.Line == config.Block {
+			if r.line == config.Block {
 				rule["action"] = "reject"
 			} else {
 				rule["action"] = "route"
-				rule["outbound"] = r.Line
+				rule["outbound"] = r.line
 			}
 			rules = append(rules, rule)
 		}
@@ -448,18 +662,18 @@ func (k *compiler) dns(scenario *config.Scenario, endpointIDs []string, sets map
 	rules = append(rules, map[string]any{"domain": localNXDOMAIN, "action": "predefined", "rcode": "NXDOMAIN"})
 	final := tagDNSLocal
 	if scenario != nil {
-		for _, r := range scenario.Rules {
-			set, ok := sets[r.RuleSet]
+		for _, r := range k.bindings {
+			set, ok := sets[r.tag]
 			// DNS rules never reject; blocking happens when routing.
-			if !ok || r.Line == config.Block || (r.Invert && !set.complete) {
+			if !ok || r.line == config.Block || (r.invert && !set.complete) {
 				continue
 			}
-			if !seen[r.RuleSet] {
-				seen[r.RuleSet] = true
-				used = append(used, r.RuleSet)
+			if !seen[r.tag] {
+				seen[r.tag] = true
+				used = append(used, r.tag)
 			}
-			rule := map[string]any{"rule_set": []string{set.tag}, "action": "route", "server": server(r.Line)}
-			if r.Invert {
+			rule := map[string]any{"rule_set": []string{set.tag}, "action": "route", "server": server(r.line)}
+			if r.invert {
 				rule["invert"] = true
 			}
 			rules = append(rules, rule)
@@ -487,10 +701,7 @@ func CompileDownload(c *config.Config, via, iface string, opts Options) ([]byte,
 	if opts.Secret == nil {
 		opts.Secret = Placeholder
 	}
-	k := &compiler{c: c, opts: opts, replace: map[*config.Value]string{}, lines: map[string]bool{}, ruleSets: map[string]bool{}}
-	for _, use := range c.Secrets {
-		k.replace[use.Value] = opts.Secret(use)
-	}
+	k := newCompiler(c, opts)
 	if c.Line(via) == nil {
 		return nil, fmt.Errorf("line %q does not exist", via)
 	}
