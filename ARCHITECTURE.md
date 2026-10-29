@@ -778,9 +778,9 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - `RunAtLoad`、`KeepAlive`，`ProcessType` 为 `Interactive`；
   - `AbandonProcessGroup` 为 false：daemon 退出时，launchd 杀掉它进程组里剩下的进程，引擎和 scutil 会话不会留下；
   - `ThrottleInterval` 5 秒；`ExitTimeOut` 20 秒，留够断开的时间。
-- **卸载**：`sudo xdial daemon uninstall [--purge]` 先 `launchctl bootout`（daemon 断开），同样等任务没了，再删 plist、二进制和 socket 目录；另一个身份没装时，连共享目录一起删；`--purge` 连数据目录一起删。
+- **卸载**：`sudo xdial daemon uninstall [--purge]` 先 `launchctl bootout`（daemon 断开），同样等任务没了，再删 plist、二进制和 socket 目录；另一个身份没装时，连共享目录一起删；`--purge` 连数据目录一起删。另一个身份算不算装着，看它的 plist 或 launchd 里有没有它的任务：App 注册的没有 plist。
 - **App 安装 daemon（M5，用户 2026-10-29 定）**：
-  - App 用 `SMAppService.daemon` 注册 daemon。App 包里带 `Contents/MacOS/xdial` 和 `Contents/Library/LaunchDaemons/<id>.plist`，plist 用 `BundleProgram` 指向包里的 `xdial`，其余键和上面命令行写的一样。用户在 系统设置 › 通用 › 登录项与扩展 里批准一次，之后 App 升级不用再批准。
+  - App 用 `SMAppService.daemon` 注册 daemon。App 包里带 `Contents/Helpers/xdial` 和 `Contents/Library/LaunchDaemons/<id>.plist`，plist 用 `BundleProgram` 指向包里的 `xdial`（不放在 `Contents/MacOS`：那里的 App 本体叫 `XDial`，在不区分大小写的磁盘上会互相覆盖），其余键和上面命令行写的一样。用户在 系统设置 › 通用 › 登录项与扩展 里批准一次，之后 App 升级不用再批准。
   - **代价（用户已接受）**：launchd 以 root 运行的是 App 包里的二进制，App 在 `/Applications` 时管理员用户不用 sudo 就能改它，不再满足上面"只有 root 能改"。也就是说，以管理员身份运行的任何进程都能借它拿到 root。签名构建（M6）后要实测：被改过、签名不对的二进制，launchd 还会不会运行。
   - 数据目录、socket、连接锁和命令行安装时一样（上表），daemon 每次启动自己建好、收紧权限。
   - **两种方式只能有一个**：它们用同一个 launchd label。`xdial daemon install` 和 `uninstall` 发现 launchd 里这个 label 跑的是 App 包里的程序（`launchctl print` 的 `program` 在某个 `.app/Contents/` 里），就报 `daemon.app_managed`，什么都不动；App 发现 `/Library/LaunchDaemons/<id>.plist` 在，就提示先运行 `sudo xdial daemon uninstall`，不注册。

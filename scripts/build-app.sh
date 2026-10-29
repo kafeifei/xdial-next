@@ -31,9 +31,10 @@ bin="$(cd "$root/macos" && swift build -c release --show-bin-path)"
 build="$("$out/xdial-$channel" version --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["build"])')"
 
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Library/LaunchDaemons"
+# xdial 放在 Helpers：和 App 本体 XDial 只差大小写，放在一起会在不区分大小写的磁盘上互相覆盖。
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Library/LaunchDaemons"
 cp "$bin/XDial" "$app/Contents/MacOS/XDial"
-cp "$out/xdial-$channel" "$app/Contents/MacOS/xdial"
+cp "$out/xdial-$channel" "$app/Contents/Helpers/xdial"
 
 cat > "$app/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -72,7 +73,7 @@ cat > "$app/Contents/Library/LaunchDaemons/$id.plist" << EOF
 	<key>Label</key>
 	<string>$id</string>
 	<key>BundleProgram</key>
-	<string>Contents/MacOS/xdial</string>
+	<string>Contents/Helpers/xdial</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>xdial</string>
@@ -99,7 +100,9 @@ cat > "$app/Contents/Library/LaunchDaemons/$id.plist" << EOF
 </plist>
 EOF
 
-codesign -f -s "$sign" --options runtime -i "$id.daemon" "$app/Contents/MacOS/xdial"
+codesign -f -s "$sign" --options runtime -i "$id.daemon" "$app/Contents/Helpers/xdial"
 codesign -f -s "$sign" --options runtime "$app"
 codesign --verify --strict --deep "$app"
+# 两个可执行文件必须是两个文件。
+[ "$(stat -f %i "$app/Contents/MacOS/XDial")" != "$(stat -f %i "$app/Contents/Helpers/xdial")" ]
 echo "$app（daemon 构建 $build，签名 $sign）"

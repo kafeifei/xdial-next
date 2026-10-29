@@ -542,7 +542,9 @@ func runDaemonUninstall(ctx *context_) int {
 	if l.ID == paths.Release {
 		other.ID = paths.Debug
 	}
-	if _, err := os.Lstat(other.Plist()); errors.Is(err, os.ErrNotExist) {
+	// The other identity may be the App's: no plist of ours, but a launchd
+	// job all the same, 6.1.
+	if _, err := os.Lstat(other.Plist()); errors.Is(err, os.ErrNotExist) && !jobLoaded(other.ID) {
 		targets = append(targets, l.SharedDir())
 	}
 	if purge {
@@ -907,6 +909,12 @@ func bootout(id string) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return nil
+}
+
+// jobLoaded reports whether launchd has a job for the daemon of id, however
+// it was installed.
+func jobLoaded(id string) bool {
+	return exec.Command("/bin/launchctl", "print", "system/"+id).Run() == nil
 }
 
 // appManaged reports whether launchd runs the daemon of id from inside an

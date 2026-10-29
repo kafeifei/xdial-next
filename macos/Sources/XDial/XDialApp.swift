@@ -5,17 +5,39 @@ import SwiftUI
 /// through the local API.
 @main
 struct XDialApp: App {
-    @StateObject private var daemon = DaemonService()
-    @StateObject private var model = PanelModel(api: APIClient(socket: Identity.current.socket))
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
         MenuBarExtra {
-            Panel(daemon: daemon, model: model)
+            Panel(daemon: delegate.daemon, model: delegate.model)
         } label: {
-            Image(systemName: model.connected ? "circle.circle.fill" : "circle.circle")
-                .accessibilityLabel(model.connected ? "XDial 已连接" : "XDial 未连接")
+            MenuIcon(model: delegate.model)
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+/// Owns what lives as long as the App, so the build check runs when the App
+/// starts, not when its panel first opens, ARCHITECTURE.md 6.1.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let daemon = DaemonService()
+    let model = PanelModel(api: APIClient(socket: Identity.current.socket))
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Task {
+            await daemon.ensureCurrentBuild(using: model.api)
+            await model.refresh()
+        }
+    }
+}
+
+struct MenuIcon: View {
+    @ObservedObject var model: PanelModel
+
+    var body: some View {
+        Image(systemName: model.connected ? "circle.circle.fill" : "circle.circle")
+            .accessibilityLabel(model.connected ? "XDial 已连接" : "XDial 未连接")
     }
 }
 
@@ -87,7 +109,6 @@ struct Panel: View {
         .frame(width: 340)
         .task {
             daemon.refresh()
-            await daemon.ensureCurrentBuild(using: model.api)
             await model.refresh()
         }
     }
