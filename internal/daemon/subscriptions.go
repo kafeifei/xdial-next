@@ -357,11 +357,18 @@ func (s *subscriptionSource) get(o *config.Object) (*engine.Subscription, bool) 
 		return nil, false
 	}
 	_, c, ok := s.d.cachedSubscription(o, url)
+	path := s.d.subscriptionPath(o.ID, subscriptionFingerprint(o, url))
 	if ok {
 		// A cache in use is not collected.
 		now := time.Now()
-		_ = os.Chtimes(s.d.subscriptionPath(o.ID, subscriptionFingerprint(o, url)), now, now)
+		_ = os.Chtimes(path, now, now)
 	} else {
+		// Content that no longer passes the checks is dropped, so it is
+		// downloaded again rather than trusted for its age.
+		s.d.dropInvalid(path, func() bool {
+			_, _, ok := s.d.cachedSubscription(o, url)
+			return ok
+		})
 		c = nil
 	}
 	s.content[o.ID] = c
