@@ -166,6 +166,17 @@ func (d *Daemon) apply(params json.RawMessage) reply {
 		return reply{err: &cli.Error{Code: cli.CodeConfigInvalid, Message: fmt.Sprintf("配置有 %d 处问题", len(verification.Problems)), Problems: verification.Problems}}
 	}
 
+	// Connected, the new configuration's scenario must come up: what it
+	// needs is downloaded first, outside the control sequence.
+	d.mu.Lock()
+	want, scenario := d.state.Connected, d.state.Scenario
+	d.mu.Unlock()
+	if want && !p.DryRun {
+		if err := d.fetchFor(c, scenario); err != nil {
+			return reply{err: err}
+		}
+	}
+
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
 	d.mu.Lock()
@@ -405,19 +416,27 @@ func (d *Daemon) connect(params json.RawMessage) reply {
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
 	}
-	d.ctl.Lock()
-	defer d.ctl.Unlock()
 	d.mu.Lock()
-	cfg, c, scenario := d.cfg, d.conn, p.Scenario
+	cfg, scenario := d.cfg, p.Scenario
 	if scenario == "" {
 		scenario = d.state.Scenario
 	}
+	d.mu.Unlock()
+	if err := d.fetchFor(cfg, scenario); err != nil {
+		return reply{err: err}
+	}
+	d.ctl.Lock()
+	defer d.ctl.Unlock()
+	d.mu.Lock()
+	cfg, c := d.cfg, d.conn
 	d.mu.Unlock()
 	next, err := d.prepare(cfg, scenario)
 	if err != nil {
 		return reply{err: err}
 	}
-	if c != nil && c.scenario == next.scenario && c.revision == next.revision && c.physical[0] == next.physical[0] {
+	// Nothing to do only if the engine would run exactly this: a rule set
+	// downloaded since, or a new physical DNS, makes it differ.
+	if c != nil && c.scenario == next.scenario && c.digest == next.digest {
 		return reply{schema: SchemaStatus, result: d.currentStatus()}
 	}
 	if err := d.switchLocked(next); err != nil {
@@ -456,10 +475,18 @@ func (d *Daemon) scenarioUse(params json.RawMessage) reply {
 	if err := decode(params, &p); err != nil {
 		return reply{err: err}
 	}
+	d.mu.Lock()
+	cfg, want := d.cfg, d.state.Connected
+	d.mu.Unlock()
+	if want {
+		if err := d.fetchFor(cfg, p.ID); err != nil {
+			return reply{err: err}
+		}
+	}
 	d.ctl.Lock()
 	defer d.ctl.Unlock()
 	d.mu.Lock()
-	cfg, want := d.cfg, d.state.Connected
+	cfg, want = d.cfg, d.state.Connected
 	d.mu.Unlock()
 	if cfg == nil {
 		return reply{err: cli.Errorf(cli.CodeConfigInvalid, "先用 xdial config apply 提交配置", "还没有配置")}

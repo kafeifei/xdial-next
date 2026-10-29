@@ -49,6 +49,7 @@ type cachedRuleSet struct {
 	// Fingerprint ties the content to the url and format it came from;
 	// change either and the cache no longer counts.
 	Fingerprint  string          `json:"fingerprint"`
+	Rules        int             `json:"rules"`
 	FetchedAt    time.Time       `json:"fetched_at"`
 	ChangedAt    time.Time       `json:"changed_at"`
 	ETag         string          `json:"etag,omitempty"`
@@ -107,43 +108,85 @@ func (d *Daemon) cachedRules(o *config.Object, url string) (*cachedRuleSet, []*c
 	return &c, rules, true
 }
 
-// ensureRuleSets returns the rules of every remote rule set scenario uses,
-// downloading those not in the cache. Without them there is no
-// connection: a rule set that never matches would quietly send its
-// traffic elsewhere, 3.4.
-func (d *Daemon) ensureRuleSets(cfg *config.Config, scenario string, secrets map[string]Secret) (map[string][]*config.Value, error) {
-	content := map[string][]*config.Value{}
+// remoteRuleSets are the remote rule sets scenario of cfg routes by.
+func remoteRuleSets(cfg *config.Config, scenario string) []*config.Object {
+	var out []*config.Object
+	seen := map[string]bool{}
 	for _, s := range cfg.Scenarios {
 		if s.ID != scenario {
 			continue
 		}
 		for _, r := range s.Rules {
 			o := cfg.RuleSet(r.RuleSet)
-			if o == nil || o.Type != "remote" || content[o.ID] != nil {
-				continue
+			if o != nil && o.Type == "remote" && !seen[o.ID] {
+				seen[o.ID] = true
+				out = append(out, o)
 			}
-			url, err := remoteURL(cfg, o, secrets)
-			if err != nil {
-				return nil, err
-			}
-			if _, rules, ok := d.cachedRules(o, url); ok {
-				// A cache in use is not collected, 3.4.
-				now := time.Now()
-				_ = os.Chtimes(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), now, now)
-				content[o.ID] = rules
-				continue
-			}
-			if _, err := d.downloadRuleSet(cfg, o, secrets); err != nil {
-				return nil, prefixed(err, fmt.Sprintf("场景 %s 用到的规则集 %s 还没下载，下载失败：", scenario, o.ID))
-			}
-			_, rules, ok := d.cachedRules(o, url)
-			if !ok {
-				return nil, cli.Errorf(cli.CodeResourceMissing, "", "规则集 %s 下载后读不出缓存", o.ID)
-			}
-			content[o.ID] = rules
 		}
 	}
+	return out
+}
+
+// fetchFor downloads what scenario of cfg needs and the cache lacks. A
+// request runs it before it takes d.ctl: a download can take minutes, and
+// the control sequence must stay free for what cannot wait, such as taking
+// the resolver down when the engine dies, 6.3. Failing here changes
+// nothing.
+func (d *Daemon) fetchFor(cfg *config.Config, scenario string) error {
+	if cfg == nil {
+		return nil
+	}
+	d.mu.Lock()
+	secrets := maps.Clone(d.secrets)
+	d.mu.Unlock()
+	for _, o := range remoteRuleSets(cfg, scenario) {
+		url, err := remoteURL(cfg, o, secrets)
+		if err != nil {
+			return err
+		}
+		if _, ok := d.ruleSetMeta(o, url); ok {
+			continue
+		}
+		if _, err := d.downloadRuleSet(cfg, o, secrets); err != nil {
+			return prefixed(err, fmt.Sprintf("场景 %s 用到的规则集 %s 还没下载，下载失败：", scenario, o.ID))
+		}
+	}
+	return nil
+}
+
+// cachedRuleSets returns the rules of every remote rule set scenario uses,
+// from the cache only; prepare runs it under d.ctl, where nothing is
+// downloaded. Without them there is no connection: a rule set that never
+// matches would quietly send its traffic elsewhere, 3.4.
+func (d *Daemon) cachedRuleSets(cfg *config.Config, scenario string, secrets map[string]Secret) (map[string][]*config.Value, error) {
+	content := map[string][]*config.Value{}
+	for _, o := range remoteRuleSets(cfg, scenario) {
+		url, err := remoteURL(cfg, o, secrets)
+		if err != nil {
+			return nil, err
+		}
+		_, rules, ok := d.cachedRules(o, url)
+		if !ok {
+			d.wakeResources()
+			return nil, cli.Errorf(cli.CodeResourceMissing, "用 xdial rule-set update "+o.ID+" 下载", "场景 %s 用到的规则集 %s 还没下载", scenario, o.ID)
+		}
+		// A cache in use is not collected, 3.4.
+		now := time.Now()
+		_ = os.Chtimes(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)), now, now)
+		content[o.ID] = rules
+	}
 	return content, nil
+}
+
+// ruleSetMeta reads what the cache says about a rule set without checking
+// its content again, for listing and for deciding whether to download.
+func (d *Daemon) ruleSetMeta(o *config.Object, url string) (*cachedRuleSet, bool) {
+	fp := fingerprint(url, o.Value.Get("format").String)
+	var c cachedRuleSet
+	if err := store.ReadJSON(d.ruleSetPath(o.ID, fp), &c); err != nil || c.Fingerprint != fp {
+		return nil, false
+	}
+	return &c, true
 }
 
 func prefixed(err error, prefix string) error {
@@ -176,7 +219,7 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 			return err
 		}
 		format := o.Value.Get("format").String
-		old, _, hasOld := d.cachedRules(o, url)
+		old, hasOld := d.ruleSetMeta(o, url)
 		req, err := d.fetchRequest(cfg, o, url, secrets)
 		if err != nil {
 			return err
@@ -196,17 +239,15 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 		now := time.Now()
 		if fetched.NotModified && hasOld {
 			old.FetchedAt = now
-			result.FetchedAt = now
-			rules, _ := config.CheckRuleSetSource(old.Source)
-			result.Rules = len(rules)
+			result.FetchedAt, result.Rules = now, old.Rules
 			return d.writeRuleSet(o.ID, old)
 		}
 		source := body
 		if format == "binary" {
+			// Limits on what is inside the content are resource.invalid;
+			// resource.too_large is for the size of a download or of the
+			// compiled configuration, 3.4.
 			if err := resource.Preflight(body); err != nil {
-				if resource.IsLimit(err) {
-					return cli.Errorf(cli.CodeResourceTooLarge, "", "%v", err)
-				}
 				return cli.Errorf(cli.CodeResourceInvalid, "", "%v", err)
 			}
 			if source, err = d.decode(body); err != nil {
@@ -231,7 +272,7 @@ func (d *Daemon) downloadRuleSet(cfg *config.Config, o *config.Object, secrets m
 			return err
 		}
 		entry := &cachedRuleSet{
-			Fingerprint: fingerprint(url, format), FetchedAt: now, ChangedAt: now,
+			Fingerprint: fingerprint(url, format), Rules: len(rules), FetchedAt: now, ChangedAt: now,
 			ETag: fetched.ETag, LastModified: fetched.LastModified, Source: source,
 		}
 		result.Changed = !hasOld || !bytes.Equal(old.Source, source)
@@ -446,7 +487,11 @@ func (d *Daemon) fetch(req resource.FetchRequest) (resource.FetchResult, []byte,
 	line, lineErr := r.ReadBytes('\n')
 	var result resource.FetchResult
 	var body []byte
-	if lineErr == nil && json.Unmarshal(line, &result) == nil && result.Code == "" && !result.NotModified {
+	if lineErr == nil && json.Unmarshal(line, &result) != nil {
+		lineErr = errors.New("unreadable result line")
+		result = resource.FetchResult{}
+	}
+	if lineErr == nil && result.Code == "" && !result.NotModified {
 		if result.Size < 0 || result.Size > req.MaxBytes {
 			lineErr = errors.New("size out of range")
 		} else {
@@ -486,11 +531,15 @@ func (d *Daemon) decode(binary []byte) ([]byte, error) {
 		return nil, err
 	}
 	cmd.Stdin = bytes.NewReader(binary)
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &limitedWriter{w: &stdout, n: config.RuleSetMaxSize}
+	cmd.Stderr = &limitedWriter{w: &stderr, n: 256}
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return nil, cli.Errorf(cli.CodeResourceTooLarge, "", "binary 规则集 %s 内没有转换完", decodeTimeout)
+			return nil, cli.Errorf(cli.CodeResourceInvalid, "", "binary 规则集 %s 内没有转换完", decodeTimeout)
+		}
+		if strings.Contains(stderr.String(), "too large") {
+			return nil, cli.Errorf(cli.CodeResourceInvalid, "", "binary 规则集转换成 source 后超过 %d 字节", config.RuleSetMaxSize)
 		}
 		return nil, cli.Errorf(cli.CodeResourceInvalid, "", "binary 规则集转换失败")
 	}
@@ -568,7 +617,7 @@ func (d *Daemon) refreshRuleSets() {
 		if err != nil {
 			continue
 		}
-		if c, _, ok := d.cachedRules(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) {
+		if c, ok := d.ruleSetMeta(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) {
 			continue
 		}
 		_, _ = d.downloadRuleSet(cfg, o, secrets)
@@ -615,9 +664,9 @@ func (d *Daemon) ruleSetList(json.RawMessage) reply {
 				info.DownloadVia = via.String
 			}
 			if url, err := remoteURL(cfg, o, secrets); err == nil {
-				if c, rules, ok := d.cachedRules(o, url); ok {
+				if c, ok := d.ruleSetMeta(o, url); ok {
 					next := c.FetchedAt.Add(updateInterval(o))
-					info.Cached, info.Rules = true, len(rules)
+					info.Cached, info.Rules = true, c.Rules
 					info.FetchedAt, info.ChangedAt, info.NextUpdate = &c.FetchedAt, &c.ChangedAt, &next
 				}
 			}

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
@@ -32,6 +33,7 @@ const (
 type connection struct {
 	scenario  string
 	revision  string
+	digest    [32]byte
 	physical  []netip.Addr
 	lock      *connectionLock
 	engine    *engineProc
@@ -47,6 +49,7 @@ type plan struct {
 	revision string
 	physical []netip.Addr
 	compiled []byte
+	digest   [32]byte // of compiled: what the engine would run
 	secrets  map[string]Secret
 }
 
@@ -81,7 +84,7 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if len(physical) == 0 {
 		return nil, cli.Errorf(cli.CodeEngineFailed, "连上网络后再试；已经连着时，网络就绪后会自动重连", "物理网络还没有 DNS 服务器")
 	}
-	ruleSets, err := d.ensureRuleSets(cfg, scenario, secrets)
+	ruleSets, err := d.cachedRuleSets(cfg, scenario, secrets)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +131,7 @@ func (d *Daemon) prepare(cfg *config.Config, scenario string) (*plan, error) {
 	if err := checkSecrets(cfg, secrets, result.Secrets); err != nil {
 		return nil, err
 	}
-	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, secrets: secrets}, nil
+	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON), secrets: secrets}, nil
 }
 
 // bringUp replaces the connection with p, 6.3: take the connection lock,
@@ -141,7 +144,7 @@ func (d *Daemon) bringUp(p *plan) error {
 	old := d.conn
 	d.conn = nil
 	d.mu.Unlock()
-	c := &connection{scenario: p.scenario, revision: p.revision, physical: p.physical}
+	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, physical: p.physical}
 	if old != nil {
 		// A reload keeps the lock it holds rather than letting it go and
 		// taking it again.
@@ -203,6 +206,8 @@ func (d *Daemon) establishLocked() error {
 	d.mu.Unlock()
 	p, err := d.prepare(cfg, scenario)
 	if err != nil {
+		// Content missing from the cache is downloaded in the background,
+		// outside the control sequence; a later retry picks it up.
 		d.setStatus("failed", err.Error())
 		return err
 	}

@@ -302,7 +302,7 @@ func (k *compiler) compileRuleSets() (route []any, dns map[string]dnsSet) {
 			rules = content
 		} else {
 			rules = []*config.Value{placeholderRule()}
-			k.pending = append(k.pending, fmt.Sprintf("规则集 %s 的内容还没下载，检查时用了占位规则", o.ID))
+			k.pending = append(k.pending, fmt.Sprintf("规则集 %s 是远程的，检查时用了占位规则，内容在连接前下载", o.ID))
 			k.missing = append(k.missing, o.ID)
 		}
 		route = append(route, map[string]any{"type": "inline", "tag": o.ID, "rules": rules})

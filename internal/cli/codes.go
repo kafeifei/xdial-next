@@ -110,11 +110,11 @@ func init() {
 	register(Code{Name: CodeSecretInUse, Exit: ExitConflict, Summary: "凭据仍被引用，不能删除", Hint: "先改掉引用它的配置"})
 	register(Code{Name: CodeSecretFormat, Exit: ExitNegative, Summary: "凭据的格式不符合引用它的字段", Hint: "按提示改正后重新设置"})
 	register(Code{Name: CodeEngineFailed, Exit: ExitNegative, Summary: "没能连上：引擎没能启动、启动后很快退出，或者 DNS 没能接管", Hint: "用 xdial status 看原因"})
-	register(Code{Name: CodeResourceMissing, Exit: ExitMissing, Summary: "场景用到的远程规则集或订阅还没下载", Hint: "等下载完成后再连接"})
+	register(Code{Name: CodeResourceMissing, Exit: ExitMissing, Summary: "缓存里缺场景用到的远程规则集或订阅", Hint: "用 xdial rule-set update 下载后再连接"})
 	register(Code{Name: CodeResourceDownload, Exit: ExitNegative, Summary: "下载失败：连不上、超时，或者服务器返回了错误", Hint: "检查网络和 download_via 指定的线路，再用 xdial rule-set update 重试"})
 	register(Code{Name: CodeResourceBlocked, Exit: ExitNegative, Summary: "下载地址不被允许：不是 https、重定向到了 http，或者解析到本机和内网的地址", Hint: "换一个公网上的 https 地址"})
-	register(Code{Name: CodeResourceTooLarge, Exit: ExitNegative, Summary: "下载的内容超过上限", Hint: "换一个更小的规则集，或者拆成几个"})
-	register(Code{Name: CodeResourceInvalid, Exit: ExitNegative, Summary: "下载的内容不是合法的规则集，或者含有不允许的条件，详情在 problems", Hint: "确认 url 和 format 写对"})
+	register(Code{Name: CodeResourceTooLarge, Exit: ExitNegative, Summary: "下载的大小超过上限，或者编译出的整份配置太大", Hint: "换一个更小的规则集，或者少用几个"})
+	register(Code{Name: CodeResourceInvalid, Exit: ExitNegative, Summary: "下载的内容不合法，或者条数、长度超过上限，详情在 problems", Hint: "确认 url 和 format 写对"})
 	register(Code{Name: CodeEngineBusy, Exit: ExitConflict, Summary: "另一个 XDial 身份（正式版或 Debug）正连着", Hint: "先在另一个身份里 xdial disconnect"})
 }
 

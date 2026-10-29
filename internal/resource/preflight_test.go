@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/kafeifei/xdial-next/internal/config"
 	"github.com/sagernet/sing-box/common/srs"
@@ -136,12 +137,17 @@ func TestPreflightRejectsAdGuard(t *testing.T) {
 }
 
 func TestPreflightBoundsLogicalDepth(t *testing.T) {
+	// Four levels of logical rules pass, as in a source rule set; five do not.
 	inner := `{"domain": ["x.example"]}`
 	for range maxLogicalDepth {
 		inner = `{"type": "logical", "mode": "or", "rules": [` + inner + `]}`
 	}
+	if err := Preflight(encode(t, 3, `{"version": 3, "rules": [`+inner+`]}`)); err != nil {
+		t.Errorf("four levels: %v", err)
+	}
+	inner = `{"type": "logical", "mode": "or", "rules": [` + inner + `]}`
 	if err := Preflight(encode(t, 3, `{"version": 3, "rules": [`+inner+`]}`)); !IsLimit(err) {
-		t.Errorf("want a limit error, got %v", err)
+		t.Errorf("five levels: want a limit error, got %v", err)
 	}
 }
 
@@ -279,5 +285,36 @@ func TestPreflightBoundsDeclaredCounts(t *testing.T) {
 	list = append(list, make([]byte, maxListItems+1)...)
 	if err := Preflight(raw(append(list, itemFinal, 0))); !IsLimit(err) {
 		t.Errorf("long list: want a limit error, got %v", err)
+	}
+}
+
+func TestPreflightRequiresUTF8Keys(t *testing.T) {
+	// "ab" is fine; a lone continuation byte, an overlong lead and a key
+	// cut in the middle of a character are not.
+	for name, labels := range map[string]string{
+		"continuation": "a\x80",
+		"overlong":     "\xC0\x80",
+		"cut":          "a\xE4",
+	} {
+		if err := Preflight(raw(trieBody([]uint64{0b100}, []uint64{0b11010}, labels))); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if err := Preflight(raw(trieBody([]uint64{0b100}, []uint64{0b11010}, "\xC3\xA9"))); err != nil {
+		t.Errorf("a valid two-byte character: %v", err)
+	}
+	for b := range 256 {
+		for _, prefix := range []string{"", "\xE0", "\xED", "\xF0", "\xF4", "\xC3"} {
+			seq := prefix + string([]byte{byte(b)})
+			got := int8(0)
+			for i := 0; i < len(seq) && got >= 0; i++ {
+				got = utf8Next(got, seq[i])
+			}
+			// A sequence the state machine ends between characters on must
+			// be valid, and a valid one must end there.
+			if (got == 0) != utf8.ValidString(seq) {
+				t.Errorf("%q: state %d, utf8.ValidString %v", seq, got, utf8.ValidString(seq))
+			}
+		}
 	}
 }

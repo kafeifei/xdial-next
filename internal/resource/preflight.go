@@ -16,9 +16,9 @@ import (
 const (
 	maxInflated      = 32 << 20 // the zlib stream, decompressed
 	maxExpanded      = 16 << 20 // every domain the tries expand to, in bytes
-	maxDomains       = 1 << 20  // leaves of every trie
+	maxDomains       = 600_000  // leaves of every trie: the values a source rule set may hold
 	maxDomainLength  = 512      // the longest key of a trie, also its depth
-	maxPrefixes      = 1 << 20  // CIDR prefixes the IP sets expand to
+	maxPrefixes      = 600_000  // CIDR prefixes the IP sets expand to, likewise
 	maxLogicalDepth  = 4        // as headless rules, internal/config
 	maxBinaryRules   = 20000    // top-level rules, as a rule set, internal/config
 	maxLogicalRules  = 64       // rules inside one logical rule, as internal/config
@@ -211,7 +211,9 @@ func (p *preflight) rule(depth int) {
 	case 0:
 		p.defaultRule()
 	case 1:
-		if depth+1 >= maxLogicalDepth {
+		// Logical rules may stand at depths 0 to 3, as in a source rule
+		// set: four levels.
+		if depth >= maxLogicalDepth {
 			p.limit("逻辑规则嵌套超过 %d 层", maxLogicalDepth)
 			return
 		}
@@ -419,19 +421,36 @@ func (p *preflight) trie() {
 	totalBits := 8 * len(bitmap)
 	nodes, edges := 1, 0
 	idx := 0
-	depth, levelEnd, nextLevel := 0, 1, 0
+	depth, levelStart, levelEnd, nextLevel := 0, 0, 1, 0
+	// Every key must be valid UTF-8: sing-box reverses keys rune by rune
+	// when expanding them and panics on an invalid byte. The state of the
+	// check along each path is kept for one level of nodes at a time.
+	cur, next := []int8{0}, []int8(nil)
 	for node := 0; node < nodes; node++ {
 		if node == levelEnd {
 			depth++
-			levelEnd += nextLevel
+			levelStart, levelEnd = levelEnd, levelEnd+nextLevel
 			nextLevel = 0
+			cur, next = next, nil
 			if depth > maxDomainLength {
 				p.limit("域名超过 %d 个字符", maxDomainLength)
 				return
 			}
 		}
+		state := cur[node-levelStart]
 		children := 0
 		for ; idx < totalBits && !bit(bitmap, idx); idx++ {
+			edge := edges + children
+			if edge >= len(labels) {
+				p.fail("域名树的标签比边少")
+				return
+			}
+			s := utf8Next(state, labels[edge])
+			if s < 0 {
+				p.fail("域名树含不合法的 UTF-8")
+				return
+			}
+			next = append(next, s)
 			children++
 		}
 		if idx >= totalBits {
@@ -450,6 +469,9 @@ func (p *preflight) trie() {
 		switch {
 		case leaf && node == 0:
 			p.fail("域名树含空域名")
+			return
+		case leaf && state != 0:
+			p.fail("域名树含不合法的 UTF-8")
 			return
 		case leaf:
 			p.domains++
@@ -498,4 +520,54 @@ func (p *preflight) trie() {
 func (p *preflight) words() []byte {
 	n := p.count(8)
 	return p.skip(8 * n)
+}
+
+// utf8Next advances the check of a UTF-8 byte sequence by one byte, by the
+// same rules as utf8.Valid: state 0 is between characters, 1 to 3 wait for
+// that many continuation bytes, 4 to 7 wait for the second byte of the
+// three- and four-byte leads whose range is narrower; -1 is invalid.
+func utf8Next(state int8, b byte) int8 {
+	in := func(lo, hi byte) bool { return b >= lo && b <= hi }
+	switch state {
+	case 0:
+		switch {
+		case b < 0x80:
+			return 0
+		case in(0xC2, 0xDF):
+			return 1
+		case b == 0xE0:
+			return 4
+		case in(0xE1, 0xEC), in(0xEE, 0xEF):
+			return 2
+		case b == 0xED:
+			return 5
+		case b == 0xF0:
+			return 6
+		case in(0xF1, 0xF3):
+			return 3
+		case b == 0xF4:
+			return 7
+		}
+	case 1, 2, 3:
+		if in(0x80, 0xBF) {
+			return state - 1
+		}
+	case 4:
+		if in(0xA0, 0xBF) {
+			return 1
+		}
+	case 5:
+		if in(0x80, 0x9F) {
+			return 1
+		}
+	case 6:
+		if in(0x90, 0xBF) {
+			return 2
+		}
+	case 7:
+		if in(0x80, 0x8F) {
+			return 2
+		}
+	}
+	return -1
 }

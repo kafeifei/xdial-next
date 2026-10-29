@@ -17,6 +17,7 @@ import (
 
 	"github.com/kafeifei/xdial-next/internal/api"
 	"github.com/kafeifei/xdial-next/internal/cli"
+	"github.com/kafeifei/xdial-next/internal/config"
 	"github.com/kafeifei/xdial-next/internal/engine"
 	"github.com/kafeifei/xdial-next/internal/paths"
 	"github.com/kafeifei/xdial-next/internal/resource"
@@ -756,7 +757,8 @@ func (h *harness) seedRuleSet(id, url, source string) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		h.t.Fatal(err)
 	}
-	entry := cachedRuleSet{Fingerprint: fp, FetchedAt: time.Now(), ChangedAt: time.Now(), Source: json.RawMessage(source)}
+	rules, _ := config.CheckRuleSetSource([]byte(source))
+	entry := cachedRuleSet{Fingerprint: fp, Rules: len(rules), FetchedAt: time.Now(), ChangedAt: time.Now(), Source: json.RawMessage(source)}
 	if err := store.WriteJSON(path, entry, 0o600); err != nil {
 		h.t.Fatal(err)
 	}
@@ -789,14 +791,15 @@ func TestCacheOfAnotherURLDoesNotCount(t *testing.T) {
 	}
 }
 
-func TestCorruptCacheDoesNotCount(t *testing.T) {
+func TestCorruptCacheIsNotConnectedFrom(t *testing.T) {
 	h := start(t, nil)
 	const url = "https://rules.example.com/r.json"
 	h.ok("config.apply", map[string]any{"content": remoteDoc(url)})
+	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
 	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"process_name": ["x"], "query_type": ["A"]}]}`)
-	if r := h.ok("rule_set.list", nil)["rule_sets"].([]any)[0].(map[string]any); r["cached"] != false {
-		t.Errorf("a cache that fails the checks counted: %v", r)
-	}
+	// Listing reads what the cache says; connecting checks the content
+	// again, and content that fails is not used.
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceMissing)
 }
 
 func TestRuleSetUpdateRefusesLoopback(t *testing.T) {
