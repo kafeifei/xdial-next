@@ -39,7 +39,7 @@ func endpointSchema() map[string]any {
 		"type":  map[string]any{"enum": []string{"openconnect", "tailscale"}},
 		"state": map[string]any{"enum": []string{"connecting", "connected", "auth_required", "failed"}},
 		"error": str(), "auth_message": str(), "browser_auth": map[string]any{"type": "boolean"},
-		"addresses": strList(), "dns": strList(), "full_tunnel": map[string]any{"type": "boolean"}, "since": str(),
+		"addresses": strList(), "dns": strList(), "default_route": map[string]any{"type": "boolean"}, "since": str(),
 		"auth_url": str(), "tailnet": str(), "dns_name": str(), "exit_node": str(),
 		"peers": map[string]any{"type": "integer"}, "online": map[string]any{"type": "integer"}, "self": strList(),
 	})

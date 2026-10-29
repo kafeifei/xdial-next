@@ -107,15 +107,18 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 		var r engine.Ready
 		_ = json.Unmarshal(line, &r)
 		ready <- r
-		// Then status lines, one per change, 6.3. A line too long to be
-		// one is skipped.
-		scanner := bufio.NewScanner(reader)
-		scanner.Buffer(make([]byte, 64<<10), 1<<20)
-		for scanner.Scan() {
+		// Then status lines, one per change, 6.3. A line longer than
+		// maxStatusLine is skipped to its end and reading goes on.
+		for {
+			line, err := readLine(reader, maxStatusLine)
+			if err != nil {
+				break
+			}
 			var status engine.StatusLine
-			if json.Unmarshal(scanner.Bytes(), &status) != nil {
+			if line == nil || json.Unmarshal(line, &status) != nil {
 				continue
 			}
+			scrubEndpoints(status.Endpoints, scrub)
 			p.mu.Lock()
 			previous := p.endpoints
 			p.endpoints = status.Endpoints
@@ -192,6 +195,46 @@ func (p *engineProc) stop() {
 	}
 }
 
+// scrubEndpoints scrubs what a VPN server says, which reaches status and
+// the event log, as the engine's log is, 4.3.
+func scrubEndpoints(endpoints map[string]engine.EndpointStatus, scrub *scrubber) {
+	for id, e := range endpoints {
+		e.Error = scrub.scrub(e.Error)
+		e.AuthMessage = scrub.scrub(e.AuthMessage)
+		endpoints[id] = e
+	}
+}
+
+// maxStatusLine bounds one status line from the engine.
+const maxStatusLine = 1 << 20
+
+// readLine reads one line of at most limit bytes. A longer line is read to
+// its end and returned as nil, so one bad line costs only itself.
+func readLine(r *bufio.Reader, limit int) ([]byte, error) {
+	var line []byte
+	tooLong := false
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if !tooLong {
+			if len(line)+len(chunk) > limit {
+				tooLong, line = true, nil
+			} else {
+				line = append(line, chunk...)
+			}
+		}
+		switch {
+		case err == bufio.ErrBufferFull:
+			continue
+		case err != nil:
+			return nil, err
+		case tooLong:
+			return nil, nil
+		default:
+			return line, nil
+		}
+	}
+}
+
 // endpointsChanged records an event for each endpoint whose state changed.
 // The tailscale login link stays out of the event log; status shows it.
 func (d *Daemon) endpointsChanged(previous, current map[string]engine.EndpointStatus) {
@@ -202,7 +245,7 @@ func (d *Daemon) endpointsChanged(previous, current map[string]engine.EndpointSt
 	sort.Strings(ids)
 	for _, id := range ids {
 		now, before := current[id], previous[id]
-		if now.State == before.State && now.Error == before.Error && now.FullTunnel == before.FullTunnel {
+		if now.State == before.State && now.Error == before.Error && now.DefaultRoute == before.DefaultRoute {
 			continue
 		}
 		fields := map[string]any{"line": id, "type": now.Type, "state": now.State}
@@ -212,8 +255,8 @@ func (d *Daemon) endpointsChanged(previous, current map[string]engine.EndpointSt
 		if now.AuthMessage != "" {
 			fields["auth_message"] = now.AuthMessage
 		}
-		if now.FullTunnel {
-			fields["full_tunnel"] = true
+		if now.DefaultRoute {
+			fields["default_route"] = true
 		}
 		d.events.add("endpoint_state", fields)
 	}
