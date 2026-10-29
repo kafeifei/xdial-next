@@ -1240,6 +1240,14 @@ func TestSelectionOutsideAFilterIsDropped(t *testing.T) {
 	if picked := h.d.selections(); len(picked) != 0 {
 		t.Errorf("a node the filter leaves out: %v", picked)
 	}
+	// A group the filters leave empty has no members, not the direct put
+	// in for sing-box.
+	h.ok("config.apply", map[string]any{"content": strings.Replace(subDoc, `"filter": "香港"}, "jp"]`, `"filter": "香港"}, "jp", "direct"]`, 1)})
+	h.ok("group.select", map[string]any{"group": "proxy", "member": "direct"})
+	h.ok("config.apply", map[string]any{"content": strings.Replace(subDoc, `"filter": "香港"}, "jp"]`, `"filter": "美国"}]`, 1)})
+	if picked := h.d.selections(); len(picked) != 0 {
+		t.Errorf("direct in a group left empty: %v", picked)
+	}
 }
 
 func TestSelectRightAfterConnectReachesTheEngine(t *testing.T) {
