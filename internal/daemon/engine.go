@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
+	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +29,17 @@ type engineProc struct {
 	pid   int
 	stdin io.WriteCloser // held open for the engine's life, 6.3
 	done  chan struct{}
+
+	mu        sync.Mutex
+	endpoints map[string]engine.EndpointStatus // the last status line
+}
+
+// endpointStatus returns the last status the engine reported for its
+// endpoint lines.
+func (p *engineProc) endpointStatus() map[string]engine.EndpointStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return maps.Clone(p.endpoints)
 }
 
 // startEngine starts the engine child with a compiled configuration on its
@@ -75,10 +89,26 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 	ready := make(chan engine.Ready, 1)
 	go func() {
 		defer outR.Close()
-		line, _ := bufio.NewReader(io.LimitReader(outR, 64<<10)).ReadBytes('\n')
+		reader := bufio.NewReaderSize(outR, 64<<10)
+		line, _ := reader.ReadSlice('\n')
 		var r engine.Ready
 		_ = json.Unmarshal(line, &r)
 		ready <- r
+		// Then status lines, one per change, 6.3. A line too long to be
+		// one is skipped.
+		scanner := bufio.NewScanner(reader)
+		scanner.Buffer(make([]byte, 64<<10), 1<<20)
+		for scanner.Scan() {
+			var status engine.StatusLine
+			if json.Unmarshal(scanner.Bytes(), &status) != nil {
+				continue
+			}
+			p.mu.Lock()
+			previous := p.endpoints
+			p.endpoints = status.Endpoints
+			p.mu.Unlock()
+			d.endpointsChanged(previous, status.Endpoints)
+		}
 		_, _ = io.Copy(io.Discard, outR)
 	}()
 	go func() {
@@ -146,5 +176,32 @@ func (p *engineProc) stop() {
 	case <-time.After(stopTimeout):
 		_ = p.cmd.Process.Kill()
 		<-p.done
+	}
+}
+
+// endpointsChanged records an event for each endpoint whose state changed.
+// The tailscale login link stays out of the event log; status shows it.
+func (d *Daemon) endpointsChanged(previous, current map[string]engine.EndpointStatus) {
+	ids := make([]string, 0, len(current))
+	for id := range current {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		now, before := current[id], previous[id]
+		if now.State == before.State && now.Error == before.Error && now.FullTunnel == before.FullTunnel {
+			continue
+		}
+		fields := map[string]any{"line": id, "type": now.Type, "state": now.State}
+		if now.Error != "" {
+			fields["error"] = now.Error
+		}
+		if now.AuthMessage != "" {
+			fields["auth_message"] = now.AuthMessage
+		}
+		if now.FullTunnel {
+			fields["full_tunnel"] = true
+		}
+		d.events.add("endpoint_state", fields)
 	}
 }

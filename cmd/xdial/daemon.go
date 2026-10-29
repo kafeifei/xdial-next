@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/kafeifei/xdial-next/internal/buildinfo"
 	"github.com/kafeifei/xdial-next/internal/cli"
 	"github.com/kafeifei/xdial-next/internal/daemon"
+	"github.com/kafeifei/xdial-next/internal/engine"
 	"github.com/kafeifei/xdial-next/internal/paths"
 	"github.com/kafeifei/xdial-next/internal/store"
 	"github.com/kafeifei/xdial-next/internal/sysdns"
@@ -126,6 +128,14 @@ func printStatusOrRaw(w io.Writer, raw json.RawMessage) {
 		fmt.Fprintln(w)
 		if s.LastError != "" {
 			fmt.Fprintln(w, "原因：", cli.Escape(s.LastError))
+		}
+		ids := make([]string, 0, len(s.Endpoints))
+		for id := range s.Endpoints {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			fmt.Fprintln(w, cli.Escape(endpointLine(id, s.Endpoints[id])))
 		}
 		return
 	}
@@ -614,4 +624,33 @@ func runSubscriptionUpdate(ctx *context_) int {
 			fmt.Fprintln(w, "新内容在下一次连接或切场景时生效")
 		}
 	})
+}
+
+var endpointStates = map[string]string{
+	"connecting": "正在连接", "connected": "已连上", "auth_required": "要登录", "failed": "失败",
+}
+
+// endpointLine is one AnyConnect or Tailscale line in the status text.
+func endpointLine(id string, e engine.EndpointStatus) string {
+	line := fmt.Sprintf("线路 %s（%s）：%s", id, e.Type, endpointStates[e.State])
+	switch {
+	case e.Error != "":
+		line += "，" + e.Error
+	case e.BrowserAuth:
+		line += "，服务器要求浏览器登录，现在不支持"
+	case e.AuthMessage != "":
+		line += "，" + e.AuthMessage
+	case e.AuthURL != "":
+		line += "，打开 " + e.AuthURL + " 登录"
+	}
+	if len(e.Addresses) > 0 {
+		line += "，地址 " + strings.Join(e.Addresses, " ")
+	}
+	if len(e.Self) > 0 {
+		line += "，地址 " + strings.Join(e.Self, " ")
+	}
+	if e.FullTunnel {
+		line += "；服务器推送了默认路由，原本走 final 的流量都会进这条 VPN"
+	}
+	return line
 }

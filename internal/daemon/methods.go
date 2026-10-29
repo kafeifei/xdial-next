@@ -66,6 +66,9 @@ type Status struct {
 	SystemDNS   bool      `json:"system_dns"`
 	PhysicalDNS []string  `json:"physical_dns"`
 	EnginePID   int       `json:"engine_pid"`
+	// Endpoints is what the engine last reported about the AnyConnect and
+	// Tailscale lines of the connection, by line id, 6.3.
+	Endpoints map[string]engine.EndpointStatus `json:"endpoints,omitempty"`
 }
 
 func (d *Daemon) statusLocked() Status {
@@ -86,6 +89,9 @@ func (d *Daemon) statusLocked() Status {
 	if c := d.conn; c != nil {
 		s.EnginePID = c.engine.pid
 		s.SystemDNS = c.first == resolverAddress.String()
+		if endpoints := c.engine.endpointStatus(); len(endpoints) > 0 {
+			s.Endpoints = endpoints
+		}
 	}
 	return s
 }

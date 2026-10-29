@@ -79,6 +79,8 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 		_ = instance.Close()
 		return 1
 	}
+	// After the ready line, stdout carries endpoint status, 6.3.
+	go reportEndpoints(ctx, instance, stdout)
 	select {
 	case <-signals:
 	case <-orphaned:

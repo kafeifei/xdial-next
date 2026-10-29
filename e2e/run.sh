@@ -297,6 +297,32 @@ code_apple="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://www.apple.co
 sleep 1
 c2="$(vless_count)"
 check m3-subscription-rules-route '[[ "$code_org" == 200 && "$code_apple" == 200 && "${c1:-0}" -gt "${c0:-0}" && "${c2:-0}" == "${c1:-0}" ]]' "example.org=$code_org apple=$code_apple vless connections: $c0 -> $c1 -> $c2"
+
+# --- M3：AnyConnect 线路的状态（#12）------------------------------------------
+# 虚拟机里没有 AnyConnect 服务器：线路指向一个不是 AnyConnect 的公网 https 服务。连接照常建立，
+# 走这条线路的流量不通、其余不受影响，status 里能看到这条 VPN 连不上，事件日志有记录。
+cat > "$work/m3vpn.jsonc" << 'EOF'
+{
+  "version": 1,
+  "lines": [{ "id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://example.com",
+              "username": "e2e", "password": { "secret": "corp" } }],
+  "rule_sets": [{ "id": "corp-domains", "type": "inline", "rules": [{ "domain_suffix": ["corp.example"] }] }],
+  "scenarios": [{ "id": "vpn", "rules": [{ "rule_set": "corp-domains", "line": "corp" }], "final": "direct" }]
+}
+EOF
+"$xdial" disconnect --json > /dev/null 2>&1
+printf 'not-a-real-password\n' | "$xdial" secret set corp --json > /dev/null 2>&1
+"$xdial" config apply "$work/m3vpn.jsonc" --json > /dev/null 2>&1
+out="$("$xdial" connect --scenario vpn --json 2>&1)"
+for _ in $(seq 1 40); do
+  sleep 1
+  st="$("$xdial" status --json 2> /dev/null)"
+  jq -e '.result.endpoints.corp.state == "failed" or .result.endpoints.corp.state == "auth_required"' <<< "$st" > /dev/null 2>&1 && break
+done
+http="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://www.apple.com 2>&1)"
+events="$("$xdial" logs --lines 100 --json 2>&1 | grep -c '"endpoint_state"')"
+text="$("$xdial" status 2>&1 | grep 'corp' | head -1)"
+check m3-anyconnect-status "jq -e '.ok and .result.state == \"connected\"' <<< '$out' > /dev/null && jq -e '.result.state == \"connected\" and .result.endpoints.corp.type == \"openconnect\" and .result.endpoints.corp.state != \"connected\"' <<< '$st' > /dev/null && [[ '$http' == 200 && '$events' -ge 1 ]]" "$(jq -c '.result.endpoints' <<< "$st") http=$http events=$events text=[$text]"
 "$xdial" disconnect --json > /dev/null 2>&1
 "$xdial" config apply "$work/m3.jsonc" --json > /dev/null 2>&1
 "$xdial" connect --scenario s --json > /dev/null 2>&1

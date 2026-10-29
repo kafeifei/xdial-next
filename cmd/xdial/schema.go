@@ -33,6 +33,18 @@ func envelope(name string, result map[string]any) map[string]any {
 	})
 }
 
+// endpointSchema is the status of one AnyConnect or Tailscale line.
+func endpointSchema() map[string]any {
+	return object([]string{"type", "state"}, map[string]any{
+		"type":  map[string]any{"enum": []string{"openconnect", "tailscale"}},
+		"state": map[string]any{"enum": []string{"connecting", "connected", "auth_required", "failed"}},
+		"error": str(), "auth_message": str(), "browser_auth": map[string]any{"type": "boolean"},
+		"addresses": strList(), "dns": strList(), "full_tunnel": map[string]any{"type": "boolean"}, "since": str(),
+		"auth_url": str(), "tailnet": str(), "dns_name": str(), "exit_node": str(),
+		"peers": map[string]any{"type": "integer"}, "online": map[string]any{"type": "integer"}, "self": strList(),
+	})
+}
+
 func policySchema() map[string]any {
 	return object([]string{"name", "rules"}, map[string]any{"name": str(), "rules": map[string]any{"type": "integer"}})
 }
@@ -90,6 +102,8 @@ func outputSchemas() map[string]any {
 				"state":     map[string]any{"enum": []string{"disconnected", "connecting", "connected", "failed"}},
 				"connected": map[string]any{"type": "boolean"}, "scenario": str(), "revision": str(), "since": str(),
 				"last_error": str(), "system_dns": map[string]any{"type": "boolean"}, "engine_pid": map[string]any{"type": "integer"},
+				"intent": map[string]any{"enum": []string{"connected", "disconnected"}}, "physical_dns": strList(),
+				"endpoints": map[string]any{"type": "object", "additionalProperties": endpointSchema()},
 			},
 		)),
 		"xdial.config.export/v1": envelope("xdial.config.export/v1", object(

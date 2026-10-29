@@ -989,3 +989,31 @@ func TestMissingSubscriptionIsDownloadedFirst(t *testing.T) {
 	h.fails("subscription.show", map[string]any{"id": "air"}, cli.CodeResourceMissing)
 	h.fails("subscription.update", map[string]any{"ids": []string{"nope"}}, cli.CodeConfigConflict)
 }
+
+func TestEndpointStatusIsReported(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": `{"version": 1,
+		"lines": [{"id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://127.0.0.1:9",
+		           "username": "u", "password": {"secret": "corp"}}],
+		"rule_sets": [{"id": "r", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]}],
+		"scenarios": [{"id": "s", "rules": [{"rule_set": "r", "line": "corp"}], "final": "direct"}]}`})
+	h.ok("secret.set", map[string]any{"name": "corp", "value": "a-password"})
+	// sing-box brings the endpoint up in the background: the connection
+	// is up while the VPN is not, and status says so.
+	if s := h.ok("connect", map[string]any{"scenario": "s"}); s["state"] != "connected" {
+		t.Fatalf("connect: %v", s)
+	}
+	s := h.waitFor("the endpoint's state", func(s map[string]any) bool {
+		e, _ := s["endpoints"].(map[string]any)
+		corp, _ := e["corp"].(map[string]any)
+		return corp != nil && corp["type"] == "openconnect" && (corp["state"] == "failed" || corp["state"] == "connecting")
+	})
+	corp := s["endpoints"].(map[string]any)["corp"].(map[string]any)
+	if corp["state"] == "failed" && corp["error"] == "" {
+		t.Errorf("a failed endpoint without a reason: %v", corp)
+	}
+	events, _ := os.ReadFile(h.layout.Events())
+	if !strings.Contains(string(events), "endpoint_state") {
+		t.Error("no event for the endpoint's state")
+	}
+}
