@@ -30,7 +30,11 @@ func probeAt(server netip.AddrPort, timeout time.Duration) error {
 	addr := server.String()
 	d := &net.Dialer{Timeout: timeout}
 	for _, network := range []string{"udp", "tcp"} {
-		if err := ask(d, network, addr, ProbeName, typeSVCB, rcodeNXDomain, timeout); err != nil {
+		r, err := ask(d, network, addr, ProbeName, typeSVCB, timeout)
+		if err == nil && r.rcode != rcodeNXDomain {
+			err = fmt.Errorf("回复是 %s，应是 NXDOMAIN", rcodeName(r.rcode))
+		}
+		if err != nil {
 			return fmt.Errorf("经 %s 问 %s：%w", network, addr, err)
 		}
 	}
@@ -40,10 +44,10 @@ func probeAt(server netip.AddrPort, timeout time.Duration) error {
 // UpstreamName is what Upstream asks: a name that always resolves.
 const UpstreamName = "apple.com"
 
-// Upstream asks server for UpstreamName over UDP from iface, outside TUN,
-// and expects an answer. Probe shows queries reach sing-box; this shows
-// the physical network's DNS, which sing-box asks, resolves, ARCHITECTURE.md
-// 7.
+// Upstream asks server for UpstreamName's addresses from iface, outside
+// TUN, and expects one: over UDP, and over TCP when the answer did not fit.
+// Probe shows queries reach sing-box; this shows the physical network's
+// DNS, which sing-box asks, resolves, ARCHITECTURE.md 7.
 func Upstream(server netip.Addr, iface string, timeout time.Duration) error {
 	return upstreamAt(netip.AddrPortFrom(server, 53), iface, timeout)
 }
@@ -53,7 +57,19 @@ func upstreamAt(server netip.AddrPort, iface string, timeout time.Duration) erro
 	if err != nil {
 		return err
 	}
-	return ask(d, "udp", server.String(), UpstreamName, typeA, rcodeNoError, timeout)
+	r, err := ask(d, "udp", server.String(), UpstreamName, typeA, timeout)
+	if err == nil && r.truncated {
+		r, err = ask(d, "tcp", server.String(), UpstreamName, typeA, timeout)
+	}
+	switch {
+	case err != nil:
+		return err
+	case r.rcode != rcodeNoError:
+		return fmt.Errorf("回复是 %s", rcodeName(r.rcode))
+	case r.addresses == 0:
+		return errors.New("回复里没有地址")
+	}
+	return nil
 }
 
 const (
@@ -66,11 +82,19 @@ const (
 
 var rcodeNames = map[byte]string{0: "NOERROR", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED"}
 
-// ask sends one query and expects the response code want.
-func ask(d *net.Dialer, network, addr, name string, qtype uint16, want byte, timeout time.Duration) error {
+// answer is what ask reads from a reply.
+type answer struct {
+	rcode     byte
+	truncated bool
+	// addresses counts the A records among the answers.
+	addresses int
+}
+
+// ask sends one query and reads the reply.
+func ask(d *net.Dialer, network, addr, name string, qtype uint16, timeout time.Duration) (answer, error) {
 	conn, err := d.Dial(network, addr)
 	if err != nil {
-		return err
+		return answer{}, err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -80,33 +104,75 @@ func ask(d *net.Dialer, network, addr, name string, qtype uint16, want byte, tim
 		query = append(binary.BigEndian.AppendUint16(nil, uint16(len(query))), query...)
 	}
 	if _, err := conn.Write(query); err != nil {
-		return err
+		return answer{}, err
 	}
 	reply := make([]byte, 4096)
 	var n int
 	if network == "tcp" {
 		var size [2]byte
 		if _, err := io.ReadFull(conn, size[:]); err != nil {
-			return err
+			return answer{}, err
 		}
 		length := int(binary.BigEndian.Uint16(size[:]))
 		if length > len(reply) {
-			return errors.New("回复太长")
+			return answer{}, errors.New("回复太长")
 		}
 		n, err = io.ReadFull(conn, reply[:length])
 	} else {
 		n, err = conn.Read(reply)
 	}
 	if err != nil {
-		return err
+		return answer{}, err
 	}
 	if n < 12 || binary.BigEndian.Uint16(reply) != id || reply[2]&0x80 == 0 {
-		return errors.New("回复不对")
+		return answer{}, errors.New("回复不对")
 	}
-	if rcode := reply[3] & 0x0f; rcode != want {
-		return fmt.Errorf("回复是 %s，应是 %s", rcodeName(rcode), rcodeName(want))
+	return answer{rcode: reply[3] & 0x0f, truncated: reply[2]&0x02 != 0, addresses: countA(reply[:n])}, nil
+}
+
+// countA counts the A records among the answers of msg; what it cannot
+// read counts as none.
+func countA(msg []byte) int {
+	questions := int(binary.BigEndian.Uint16(msg[4:]))
+	answers := int(binary.BigEndian.Uint16(msg[6:]))
+	at := 12
+	// skipName steps over a name: labels up to the root, or a pointer.
+	skipName := func() bool {
+		for at < len(msg) {
+			switch l := int(msg[at]); {
+			case l == 0:
+				at++
+				return true
+			case l&0xc0 == 0xc0:
+				at += 2
+				return at <= len(msg)
+			default:
+				at += 1 + l
+			}
+		}
+		return false
 	}
-	return nil
+	for range questions {
+		if !skipName() || at+4 > len(msg) {
+			return 0
+		}
+		at += 4
+	}
+	count := 0
+	for range answers {
+		if !skipName() || at+10 > len(msg) {
+			return count
+		}
+		typ, length := binary.BigEndian.Uint16(msg[at:]), int(binary.BigEndian.Uint16(msg[at+8:]))
+		at += 10 + length
+		if at > len(msg) {
+			return count
+		}
+		if typ == typeA && length == 4 {
+			count++
+		}
+	}
+	return count
 }
 
 func rcodeName(rcode byte) string {

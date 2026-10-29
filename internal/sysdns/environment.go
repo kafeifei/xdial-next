@@ -2,6 +2,7 @@ package sysdns
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -9,9 +10,11 @@ import (
 // names in its domain: another VPN's split DNS, a file in /etc/resolver.
 // Queries for those names do not reach XDial, ARCHITECTURE.md 6.4.
 type Supplemental struct {
-	Domain    string   `json:"domain"`
-	Servers   []string `json:"servers"`
-	Interface string   `json:"interface,omitempty"`
+	Domain  string   `json:"domain"`
+	Servers []string `json:"servers"`
+	// Port is the servers' port when it is not 53.
+	Port      int    `json:"port,omitempty"`
+	Interface string `json:"interface,omitempty"`
 }
 
 // Supplementals reads scutil --dns. mDNS resolvers, which answer on the
@@ -45,6 +48,10 @@ func parseSupplementals(out string) []Supplemental {
 			case key == "if_index":
 				if _, name, ok := strings.Cut(value, "("); ok {
 					s.Interface = strings.TrimSuffix(name, ")")
+				}
+			case key == "port":
+				if port, err := strconv.Atoi(value); err == nil && port != 53 {
+					s.Port = port
 				}
 			case key == "options":
 				mdns = strings.Contains(value, "mdns")

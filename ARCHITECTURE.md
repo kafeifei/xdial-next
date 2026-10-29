@@ -966,11 +966,11 @@ SupplementalMatchDomains : [""]
 
   | 名字 | 看什么 |
   |---|---|
-  | `connection` | 有没有配置、连接状态和失败原因 |
+  | `connection` | 有没有配置、连接状态和失败原因；按实际状态判断，第一次连接还在试或失败了也照实报 |
   | `system_dns` | 已连接时，系统的第一解析器是不是 XDial 的（6.4） |
   | `split_dns` | `scutil --dns` 里按域名指定的解析器（别的 VPN 的分割 DNS、`/etc/resolver` 下的文件），mDNS 的除外；这些域名的查询不经过 XDial |
   | `other_vpn` | `scutil --nc list` 里连着的 VPN 服务，主网络服务是不是在隧道接口上；只报系统给的名字，不识别产品 |
-  | `physical_dns` | 从物理接口直接问物理网络的第一个 DNS 服务器 `apple.com` 的 A 记录，不经过 TUN，要回 NOERROR。连接时的探测只证明查询进了 sing-box（第 7 节），这一项补上游 |
+  | `physical_dns` | 从物理接口直接问物理网络的第一个 DNS 服务器 `apple.com` 的 A 记录，不经过 TUN，要回 NOERROR 并且至少有一条 A 记录；UDP 的回复被截断时改用 TCP 再问。连接时的探测只证明查询进了 sing-box（第 7 节），这一项补上游 |
   | `endpoints` | AnyConnect、Tailscale 线路的状态，以及登录或排错该做什么 |
   | `groups` | 每个组在用的成员和测通的成员数；urltest 组一个都没测通时提示 |
   | `resources` | 远程规则集和订阅：上次下载的错误，还没下载的 |

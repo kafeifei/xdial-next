@@ -475,6 +475,10 @@ func TestOneIdentityConnectedAtATime(t *testing.T) {
 	b.ok("config.apply", map[string]any{"content": doc})
 	b.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
 	b.fails("connect", map[string]any{"scenario": "s"}, cli.CodeEngineBusy)
+	// A first connect that failed is reported as failed, not as never made.
+	if c := b.doctorChecks()["connection"]; c["status"] != "fail" || c["detail"] == nil {
+		t.Errorf("doctor after a failed first connect: %v", c)
+	}
 	a.ok("disconnect", nil)
 	b.ok("connect", map[string]any{"scenario": "s"})
 }

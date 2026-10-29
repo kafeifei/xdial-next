@@ -69,18 +69,20 @@ func (d *Daemon) doctor(json.RawMessage) reply {
 
 func checkConnection(s Status, configured bool) Check {
 	c := Check{Name: "connection"}
+	// By the state first: the intent is stored only once a connection
+	// came up, so a first connect still trying or failed has none yet.
 	switch {
 	case !configured:
 		c.Status, c.Summary, c.Hint = checkFail, "还没有配置", "用 xdial config apply 提交配置"
 	case s.State == "connected":
 		c.Status, c.Summary = checkOK, fmt.Sprintf("已连接，场景 %s", s.Scenario)
-	case s.Intent == "disconnected":
-		c.Status, c.Summary, c.Hint = checkWarn, "没有连接", "用 xdial connect 连接"
 	case s.State == "connecting":
 		c.Status, c.Summary, c.Hint = checkWarn, "正在连接", "等一会儿再看；一直这样就看 xdial logs"
+	case s.State == "failed":
+		c.Status, c.Summary = checkFail, "连接失败了"
+		c.Hint = "看原因和 xdial logs；要求连着时，网络变化或手动 xdial connect 会再试"
 	default:
-		c.Status, c.Summary = checkFail, "要求连接，但连接失败了"
-		c.Hint = "看 xdial logs；网络变化或手动 xdial connect 时会再试"
+		c.Status, c.Summary, c.Hint = checkWarn, "没有连接", "用 xdial connect 连接"
 	}
 	if s.LastError != "" && s.State != "connected" {
 		c.Detail = []string{s.LastError}
@@ -123,6 +125,9 @@ func (d *Daemon) checkSupplementals() Check {
 		c.Summary = fmt.Sprintf("%d 个域名有自己的解析器，这些域名的查询不经过 XDial", len(list))
 		for _, s := range list {
 			line := fmt.Sprintf("%s → %s", s.Domain, strings.Join(s.Servers, ", "))
+			if s.Port != 0 {
+				line += fmt.Sprintf(" 端口 %d", s.Port)
+			}
 			if s.Interface != "" {
 				line += "（" + s.Interface + "）"
 			}

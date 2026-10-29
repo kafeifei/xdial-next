@@ -69,12 +69,28 @@ func TestKeyIsChecked(t *testing.T) {
 // serveDNS answers every query with rcode over UDP and TCP on one port.
 func serveDNS(t *testing.T, rcode byte) netip.AddrPort {
 	t.Helper()
-	answer := func(q []byte) []byte {
-		r := append([]byte(nil), q...)
-		r[2] |= 0x80
-		r[3] = r[3]&0xf0 | rcode
-		return r
+	return serveDNSWith(t, func(q []byte, _ bool) []byte { return reply(q, rcode, 0, false) })
+}
+
+// reply answers q with rcode and as many A records for its name.
+func reply(q []byte, rcode byte, records int, truncated bool) []byte {
+	r := append([]byte(nil), q...)
+	r[2] |= 0x80
+	if truncated {
+		r[2] |= 0x02
 	}
+	r[3] = r[3]&0xf0 | rcode
+	binary.BigEndian.PutUint16(r[6:], uint16(records))
+	for range records {
+		// The question's name by pointer, A, IN, a TTL, 192.0.2.1.
+		r = append(r, 0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1)
+	}
+	return r
+}
+
+// serveDNSWith answers queries over UDP and TCP on loopback with answer.
+func serveDNSWith(t *testing.T, answer func(q []byte, tcp bool) []byte) netip.AddrPort {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +108,7 @@ func serveDNS(t *testing.T, rcode byte) netip.AddrPort {
 			if err != nil {
 				return
 			}
-			_, _ = pc.WriteTo(answer(buf[:n]), from)
+			_, _ = pc.WriteTo(answer(buf[:n], false), from)
 		}
 	}()
 	go func() {
@@ -105,7 +121,7 @@ func serveDNS(t *testing.T, rcode byte) netip.AddrPort {
 			if _, err := io.ReadFull(c, size[:]); err == nil {
 				q := make([]byte, binary.BigEndian.Uint16(size[:]))
 				if _, err := io.ReadFull(c, q); err == nil {
-					r := answer(q)
+					r := answer(q, true)
 					_, _ = c.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(r))), r...))
 				}
 			}
@@ -146,13 +162,20 @@ func TestUpstream(t *testing.T) {
 			lo = i.Name
 		}
 	}
-	for _, tc := range []struct {
-		rcode byte
-		ok    bool
-	}{{0, true}, {2, false}, {3, false}, {5, false}} {
-		err := upstreamAt(serveDNS(t, tc.rcode), lo, time.Second)
+	for name, tc := range map[string]struct {
+		answer func(q []byte, tcp bool) []byte
+		ok     bool
+	}{
+		"an address":   {func(q []byte, _ bool) []byte { return reply(q, 0, 1, false) }, true},
+		"no address":   {func(q []byte, _ bool) []byte { return reply(q, 0, 0, false) }, false},
+		"SERVFAIL":     {func(q []byte, _ bool) []byte { return reply(q, 2, 0, false) }, false},
+		"NXDOMAIN":     {func(q []byte, _ bool) []byte { return reply(q, 3, 0, false) }, false},
+		"over TCP":     {func(q []byte, tcp bool) []byte { return reply(q, 0, map[bool]int{true: 1}[tcp], !tcp) }, true},
+		"cut, no more": {func(q []byte, tcp bool) []byte { return reply(q, 0, 0, !tcp) }, false},
+	} {
+		err := upstreamAt(serveDNSWith(t, tc.answer), lo, time.Second)
 		if (err == nil) != tc.ok {
-			t.Errorf("rcode %d: %v", tc.rcode, err)
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 	if err := upstreamAt(netip.MustParseAddrPort("127.0.0.1:1"), "", time.Second); err == nil {
@@ -286,7 +309,7 @@ resolver #1
 	got := parseSupplementals(out)
 	want := []Supplemental{
 		{Domain: "corp.example", Servers: []string{"10.0.0.53", "fe80::1%utun4"}, Interface: "utun4"},
-		{Domain: "test", Servers: []string{"127.0.0.1"}},
+		{Domain: "test", Servers: []string{"127.0.0.1"}, Port: 5353},
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("got %v", got)
