@@ -66,6 +66,9 @@ type Status struct {
 	SystemDNS   bool      `json:"system_dns"`
 	PhysicalDNS []string  `json:"physical_dns"`
 	EnginePID   int       `json:"engine_pid"`
+	// Endpoints is what the engine last reported about the AnyConnect and
+	// Tailscale lines of the connection, by line id, 6.3.
+	Endpoints map[string]engine.EndpointStatus `json:"endpoints,omitempty"`
 }
 
 func (d *Daemon) statusLocked() Status {
@@ -86,6 +89,9 @@ func (d *Daemon) statusLocked() Status {
 	if c := d.conn; c != nil {
 		s.EnginePID = c.engine.pid
 		s.SystemDNS = c.first == resolverAddress.String()
+		if endpoints := c.engine.endpointStatus(); len(endpoints) > 0 {
+			s.Endpoints = endpoints
+		}
 	}
 	return s
 }
@@ -342,6 +348,9 @@ func (d *Daemon) secretSet(params json.RawMessage) reply {
 	if p.Value == "" {
 		return reply{err: cli.Errorf(cli.CodeSecretFormat, "", "凭据的值不能为空")}
 	}
+	if len(p.Value) > MaxSecretLength {
+		return reply{err: cli.Errorf(cli.CodeSecretFormat, "", "凭据最长 %d 字节", MaxSecretLength)}
+	}
 	// Secrets are what connections are built from: change them in the
 	// control sequence, never in the middle of an apply or a reload.
 	d.ctl.Lock()
@@ -538,7 +547,16 @@ func checkFormats(c *config.Config, secrets map[string]Secret) error {
 	var problems []cli.Problem
 	for _, use := range c.Secrets {
 		s, ok := secrets[use.Name]
-		if !ok || use.Spec.Format == nil {
+		if !ok {
+			continue
+		}
+		// secret.set refuses longer values; this catches ones stored before.
+		if len(s.Value) > MaxSecretLength {
+			problems = append(problems, cli.Problem{Code: cli.CodeConfigValue, Path: use.Path, Object: use.Object,
+				Message: fmt.Sprintf("凭据 %s 超过 %d 字节，用 xdial secret set 重新设置", use.Name, MaxSecretLength)})
+			continue
+		}
+		if use.Spec.Format == nil {
 			continue
 		}
 		if msg := use.Spec.Format(s.Value, use.Parent); msg != "" {

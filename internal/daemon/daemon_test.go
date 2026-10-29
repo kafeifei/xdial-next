@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -280,6 +281,7 @@ func TestConnectDisconnect(t *testing.T) {
 
 	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeSecretMissing)
 	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	h.fails("secret.set", map[string]any{"name": "big", "value": strings.Repeat("x", MaxSecretLength+1)}, cli.CodeSecretFormat)
 	status := h.ok("connect", map[string]any{"scenario": "s"})
 	if status["state"] != "connected" || status["system_dns"] != true || status["engine_pid"].(float64) == 0 {
 		t.Fatalf("connect: %v", status)
@@ -988,4 +990,174 @@ func TestMissingSubscriptionIsDownloadedFirst(t *testing.T) {
 	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeResourceDownload)
 	h.fails("subscription.show", map[string]any{"id": "air"}, cli.CodeResourceMissing)
 	h.fails("subscription.update", map[string]any{"ids": []string{"nope"}}, cli.CodeConfigConflict)
+}
+
+func TestEndpointStatusIsReported(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": `{"version": 1,
+		"lines": [{"id": "corp", "type": "openconnect", "flavor": "anyconnect", "server": "https://127.0.0.1:9",
+		           "username": "u", "password": {"secret": "corp"}}],
+		"rule_sets": [{"id": "r", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]}],
+		"scenarios": [{"id": "s", "rules": [{"rule_set": "r", "line": "corp"}], "final": "direct"}]}`})
+	h.ok("secret.set", map[string]any{"name": "corp", "value": "a-password"})
+	// sing-box brings the endpoint up in the background: the connection
+	// is up while the VPN is not, and status says so.
+	if s := h.ok("connect", map[string]any{"scenario": "s"}); s["state"] != "connected" {
+		t.Fatalf("connect: %v", s)
+	}
+	s := h.waitFor("the endpoint's state", func(s map[string]any) bool {
+		e, _ := s["endpoints"].(map[string]any)
+		corp, _ := e["corp"].(map[string]any)
+		return corp != nil && corp["type"] == "openconnect" && (corp["state"] == "failed" || corp["state"] == "connecting")
+	})
+	corp := s["endpoints"].(map[string]any)["corp"].(map[string]any)
+	if corp["state"] == "failed" && corp["error"] == "" {
+		t.Errorf("a failed endpoint without a reason: %v", corp)
+	}
+	events, _ := os.ReadFile(h.layout.Events())
+	if !strings.Contains(string(events), "endpoint_state") {
+		t.Error("no event for the endpoint's state")
+	}
+}
+
+func TestReadLineSkipsOnlyTheOverlongLine(t *testing.T) {
+	input := "short\n" + strings.Repeat("x", 300) + "\nnext\n"
+	r := bufio.NewReaderSize(strings.NewReader(input), 16)
+	var got []string
+	for {
+		line, err := readLine(r, 100)
+		if err != nil {
+			break
+		}
+		got = append(got, fmt.Sprintf("%q", line))
+	}
+	if strings.Join(got, ",") != `"short\n","","next\n"` {
+		t.Errorf("lines: %v", got)
+	}
+}
+
+func TestEndpointTextIsScrubbed(t *testing.T) {
+	endpoints := map[string]engine.EndpointStatus{"corp": {Type: "openconnect", State: "auth_required",
+		Error: "login failed for hunter2-secret", AuthMessage: "retry hunter2-secret", AuthURL: "https://login.example/a/1"}}
+	scrubEndpoints(endpoints, newScrubber(map[string]Secret{"corp": {Value: "hunter2-secret"}}))
+	e := endpoints["corp"]
+	if strings.Contains(e.Error+e.AuthMessage, "hunter2") || e.AuthURL == "" {
+		t.Errorf("scrubbed status: %+v", e)
+	}
+	// The cases review found: a secret the engine's 64 KiB cut split,
+	// behind copies scrubbing shortens; a short secret inside a long one,
+	// whose placeholder is longer than it; a short text that is all secret.
+	cookie := strings.Repeat("c", 2048)
+	corp := "PRIVATE_PREFIX_" + strings.Repeat("X", 1000) + strings.Repeat("abcd", 258) + "Z"
+	for name, c := range map[string]struct {
+		text    string
+		secrets map[string]Secret
+		leak    string
+	}{
+		"split cookie": {strings.ToValidUTF8(("login failed: " + strings.Repeat(cookie+" ", 32))[:64<<10], ""),
+			map[string]Secret{"corp": {Value: cookie}}, "cccc"},
+		"nested secret": {strings.ToValidUTF8(("login failed: " + strings.Repeat(corp+" ", 32))[:64<<10], ""),
+			map[string]Secret{"corp": {Value: corp}, "pin": {Value: "abcd"}}, "PRIVATE"},
+		"all secret": {"PRIVATE_PREFIX_" + strings.Repeat("abcd", 16) + "…[engine-cut]",
+			map[string]Secret{"corp": {Value: "PRIVATE_PREFIX_" + strings.Repeat("abcd", 16) + "…[engine-cut]"}, "pin": {Value: "abcd"}}, "PRIVATE"},
+	} {
+		got := scrubText(c.text, newScrubber(c.secrets))
+		if strings.Contains(got, c.leak) || len(got) > maxEndpointText+len("…") {
+			t.Errorf("%s: %q", name, got)
+		}
+	}
+	// A secret straddling the cut is scrubbed before it is cut.
+	long := map[string]engine.EndpointStatus{"corp": {Error: strings.Repeat("x", maxEndpointText-5) + "hunter2-secret"}}
+	scrubEndpoints(long, newScrubber(map[string]Secret{"corp": {Value: "hunter2-secret"}}))
+	if strings.Contains(long["corp"].Error, "hunt") {
+		t.Errorf("part of a secret survived the cut: %s", long["corp"].Error[maxEndpointText-10:])
+	}
+}
+
+func TestScrubberMasksOverlaps(t *testing.T) {
+	for name, c := range map[string]struct {
+		secrets    map[string]Secret
+		text, want string
+	}{
+		"two secrets overlap":      {map[string]Secret{"a": {Value: "abcd"}, "b": {Value: "cdefgh"}}, "x abcdefgh y", "x <secret:a> y"},
+		"a secret overlaps itself": {map[string]Secret{"s": {Value: "ababa"}}, "x abababa y", "x <secret:s> y"},
+		"json escapes":             {map[string]Secret{"s": {Value: "a<b>\x01cd"}}, `msg "a\u003cb\u003e\u0001cd"`, `msg "<secret:s>"`},
+		"quoted":                   {map[string]Secret{"s": {Value: "a<b>\x01cd"}}, `msg "a<b>\x01cd"`, `msg "<secret:s>"`},
+		"JSON.stringify":           {map[string]Secret{"s": {Value: "pass\u2028\"word\n"}}, "msg \"pass\u2028\\\"word\\n\"", `msg "<secret:s>"`},
+		"quotes escaped only":      {map[string]Secret{"s": {Value: "a\"b\x01cd"}}, "msg \"a\\\"b\x01cd\"", `msg "<secret:s>"`},
+	} {
+		if got := newScrubber(c.secrets).scrub(c.text); got != c.want {
+			t.Errorf("%s: %q, want %q", name, got, c.want)
+		}
+	}
+}
+
+func TestScrubberRunsInBoundedSpace(t *testing.T) {
+	// Many names for one value, and a value that overlaps itself, over
+	// text that is nothing but that value: one span each time, found a
+	// period at a time.
+	secrets := map[string]Secret{}
+	for i := range 100 {
+		secrets[fmt.Sprintf("s%03d", i)] = Secret{Value: "aaaa"}
+	}
+	secrets["long"] = Secret{Value: strings.Repeat("a", MaxSecretLength)}
+	s := newScrubber(secrets)
+	if len(s.forms) > 20 {
+		t.Errorf("%d forms for two values", len(s.forms))
+	}
+	text := strings.Repeat("a", 1<<20)
+	if spans := s.spans(text); len(spans) != 1 || spans[0] != (span{0, len(text), "long"}) && spans[0] != (span{0, len(text), "s000"}) {
+		t.Errorf("spans: %v", spans)
+	}
+	if got := s.scrub("x" + strings.Repeat("ab", 1000) + "aaaa y"); got != "x"+strings.Repeat("ab", 1000)+"<secret:long> y" && got != "x"+strings.Repeat("ab", 1000)+"<secret:s000> y" {
+		t.Errorf("scrub: %q", got)
+	}
+}
+
+func TestStoredLongSecretIsRefused(t *testing.T) {
+	h := start(t, nil)
+	h.ok("config.apply", map[string]any{"content": doc})
+	h.d.mu.Lock()
+	h.d.secrets["hk"] = Secret{Value: strings.Repeat("x", MaxSecretLength+1)}
+	h.d.mu.Unlock()
+	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeSecretFormat)
+}
+
+func TestEndpointTextStaysBounded(t *testing.T) {
+	// The longest secret in its longest form, JSON escapes, starting early
+	// in text the engine cut at 64 KiB: it ends before that cut.
+	value := strings.Repeat("<", MaxSecretLength)
+	form := strings.Repeat(`\u003c`, MaxSecretLength)
+	text := ("err: " + form + " " + strings.Repeat("y", 64<<10))[:64<<10]
+	if got := scrubText(text, newScrubber(map[string]Secret{"s": {Value: value}})); got != "err: …" {
+		t.Errorf("long secret: %q", got)
+	}
+	// Masks longer than what they hide do not push it past the bound.
+	name := strings.Repeat("n", 63)
+	got := scrubText(strings.Repeat("abcd ", 100), newScrubber(map[string]Secret{name: {Value: "abcd"}}))
+	if len(got) > maxEndpointText+len("…") || strings.Contains(got, "abcd") || !strings.HasSuffix(got, "…") {
+		t.Errorf("masked text: %d bytes, %q", len(got), got)
+	}
+	if got := scrubText("short", newScrubber(nil)); got != "short" {
+		t.Errorf("short text: %q", got)
+	}
+}
+
+func TestSafeCutNeverSplitsASecret(t *testing.T) {
+	s := newScrubber(map[string]Secret{"a": {Value: "secret-value"}, "b": {Value: "中文密码"}})
+	text := strings.Repeat("x", 505) + "secret-value" + strings.Repeat("y", 100)
+	if cut := s.safeCut(text, 512); cut != 505 {
+		t.Errorf("cut at %d, want 505", cut)
+	}
+	text = strings.Repeat("x", 509) + "中文密码" + strings.Repeat("y", 100)
+	if cut := s.safeCut(text, 512); cut != 509 {
+		t.Errorf("cut at %d, want 509", cut)
+	}
+	text = strings.Repeat("x", 510) + "中" + strings.Repeat("y", 100)
+	if cut := s.safeCut(text, 512); cut != 510 {
+		t.Errorf("cut inside a character: %d", cut)
+	}
+	if cut := s.safeCut("short", 512); cut != 5 {
+		t.Errorf("short text cut at %d", cut)
+	}
 }

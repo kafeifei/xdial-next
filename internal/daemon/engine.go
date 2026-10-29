@@ -6,8 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +31,17 @@ type engineProc struct {
 	pid   int
 	stdin io.WriteCloser // held open for the engine's life, 6.3
 	done  chan struct{}
+
+	mu        sync.Mutex
+	endpoints map[string]engine.EndpointStatus // the last status line
+}
+
+// endpointStatus returns the last status the engine reported for its
+// endpoint lines.
+func (p *engineProc) endpointStatus() map[string]engine.EndpointStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return maps.Clone(p.endpoints)
 }
 
 // startEngine starts the engine child with a compiled configuration on its
@@ -75,10 +91,29 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 	ready := make(chan engine.Ready, 1)
 	go func() {
 		defer outR.Close()
-		line, _ := bufio.NewReader(io.LimitReader(outR, 64<<10)).ReadBytes('\n')
+		reader := bufio.NewReaderSize(outR, 64<<10)
+		line, _ := reader.ReadSlice('\n')
 		var r engine.Ready
 		_ = json.Unmarshal(line, &r)
 		ready <- r
+		// Then status lines, one per change, 6.3. A line longer than
+		// maxStatusLine is skipped to its end and reading goes on.
+		for {
+			line, err := readLine(reader, maxStatusLine)
+			if err != nil {
+				break
+			}
+			var status engine.StatusLine
+			if line == nil || json.Unmarshal(line, &status) != nil {
+				continue
+			}
+			scrubEndpoints(status.Endpoints, scrub)
+			p.mu.Lock()
+			previous := p.endpoints
+			p.endpoints = status.Endpoints
+			p.mu.Unlock()
+			d.endpointsChanged(previous, status.Endpoints)
+		}
 		_, _ = io.Copy(io.Discard, outR)
 	}()
 	go func() {
@@ -146,5 +181,94 @@ func (p *engineProc) stop() {
 	case <-time.After(stopTimeout):
 		_ = p.cmd.Process.Kill()
 		<-p.done
+	}
+}
+
+// scrubEndpoints bounds and scrubs what a VPN server says, which reaches
+// status and the event log, as the engine's log is, 4.3.
+func scrubEndpoints(endpoints map[string]engine.EndpointStatus, scrub *scrubber) {
+	for id, e := range endpoints {
+		e.Error = scrubText(e.Error, scrub)
+		e.AuthMessage = scrubText(e.AuthMessage, scrub)
+		endpoints[id] = e
+	}
+}
+
+// scrubText keeps at most maxEndpointText bytes of a VPN server's text.
+// It cuts the original first, where no secret is split, then masks: every
+// secret in what is kept is whole and masked whole. Masking first and
+// cutting after would not do, since masking changes the length before the
+// cut. Masks can be longer than what they hide, so the masked text is cut
+// once more, which can only shorten a mask.
+func scrubText(s string, scrub *scrubber) string {
+	cut := scrub.safeCut(s, maxEndpointText)
+	kept := scrub.scrub(s[:cut])
+	long := len(kept) > maxEndpointText
+	if long {
+		kept = strings.ToValidUTF8(kept[:maxEndpointText], "")
+	}
+	if cut < len(s) || long {
+		kept += "…"
+	}
+	return kept
+}
+
+// maxEndpointText bounds a VPN server's text in status and events.
+const maxEndpointText = 512
+
+// maxStatusLine bounds one status line from the engine.
+const maxStatusLine = 1 << 20
+
+// readLine reads one line of at most limit bytes. A longer line is read to
+// its end and returned as nil, so one bad line costs only itself.
+func readLine(r *bufio.Reader, limit int) ([]byte, error) {
+	var line []byte
+	tooLong := false
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if !tooLong {
+			if len(line)+len(chunk) > limit {
+				tooLong, line = true, nil
+			} else {
+				line = append(line, chunk...)
+			}
+		}
+		switch {
+		case err == bufio.ErrBufferFull:
+			continue
+		case err != nil:
+			return nil, err
+		case tooLong:
+			return nil, nil
+		default:
+			return line, nil
+		}
+	}
+}
+
+// endpointsChanged records an event for each endpoint whose state changed.
+// The tailscale login link stays out of the event log; status shows it.
+func (d *Daemon) endpointsChanged(previous, current map[string]engine.EndpointStatus) {
+	ids := make([]string, 0, len(current))
+	for id := range current {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		now, before := current[id], previous[id]
+		if now.State == before.State && now.Error == before.Error && slices.Equal(now.DefaultRoute, before.DefaultRoute) {
+			continue
+		}
+		fields := map[string]any{"line": id, "type": now.Type, "state": now.State}
+		if now.Error != "" {
+			fields["error"] = now.Error
+		}
+		if now.AuthMessage != "" {
+			fields["auth_message"] = now.AuthMessage
+		}
+		if len(now.DefaultRoute) > 0 {
+			fields["default_route"] = now.DefaultRoute
+		}
+		d.events.add("endpoint_state", fields)
 	}
 }

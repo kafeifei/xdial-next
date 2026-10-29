@@ -462,6 +462,27 @@ M3 的实现（#10）：
   - `xdial rule-set update [<id>...]`：现在下载，不写 id 就下载全部远程规则集。有失败时整体报第一个失败的错误码，说明里列出每个失败的规则集和成功的个数。
 - **事件**：`rule_set_updated`（是否变化、条数）、`rule_set_update_failed`（错误码和说明）。
 
+### 3.5 AnyConnect 和 Tailscale 线路的状态（M3）
+
+sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了，VPN 本身可能还在连、要登录，或者连不上。所以引擎就绪之后接着报 endpoint 的状态（6.3），daemon 把最近一次的放在 `status` 的 `endpoints` 里，状态变了记 `endpoint_state` 事件。
+
+- **字段**（`endpoints.<线路 id>`）：
+  - `type`：`openconnect` 或 `tailscale`；`state`：`connecting`、`connected`、`auth_required`、`failed`。程序判断看这两个，说明文字给人看。
+  - AnyConnect：`error`、`auth_message`（服务器要求再输入什么）、`browser_auth`、`addresses`（分到的地址）、`dns`（下发的 DNS）、`since`、`default_route`。
+  - Tailscale：`auth_url`（要登录时的链接）、`tailnet`、`dns_name`、`self`（本机在 tailnet 里的地址）、`exit_node`、`peers`、`online`。
+  - 登录链接只在 `status` 里，不进事件日志。服务器给的文字（`error`、`auth_message`）最多留 512 字节，并像引擎日志一样脱敏。截断点取在原文上、不落在任何凭据（及其各种编码形式）中间的位置，先截再脱敏，留下的部分里每个凭据都是完整的、整个被替换。不能先脱敏再截：替换会改变截断点之前的长度，半截凭据就可能挪进来。替换后的占位符可能比原文长，所以替换完再按 512 字节截一次，这一刀只会截短占位符。引擎那边另按 64 KiB 截，免得一条超长提示让每一行状态都超过上限；凭据最长 8 KiB，编码后最长不到 48 KiB，从前 512 字节开始的凭据都在这一刀之前结束。
+  - 引擎写的状态行超过 1 MiB 的跳过这一行，之后的照常读。
+- **整个连接和 VPN 分开**：VPN 连不上不算连接失败。连接照常建立，场景里走这条线路的流量连不通，其余不受影响；`status` 和事件说明 VPN 的情况。
+- **AnyConnect 的认证**：
+  - 用户名、密码（凭据引用），可选 TOTP（`token.mode: totp`，种子是凭据引用）。旧版的公司线路就是用户名加密码。
+  - 服务器要浏览器登录（SAML 等）时，状态是 `auth_required`、`browser_auth: true`。第一版不支持：要在本机开浏览器，取回 cookie 交给引擎，留到 M5 和 App 一起做。
+  - 密码错时，服务器会再要一次表单，状态是 `auth_required`，`auth_message` 是服务器的提示。
+  - 引擎不自己重试认证；线路断了之后由 sing-box 按 `reconnect_timeout` 重连，超时就是 `failed`。`failed` 之后要切一次场景（重载）才会再试，第一版不自动重载：重载会断掉所有连接。
+- **VPN 推送的网段和域名**（3.2 的信任假设）：
+  - sing-box 不把推送的内容交给外面（只有地址、DNS 和 MTU），XDial 读不到，也就无法过滤或限额，除非给 sing-box 打补丁，这和"只用上游"冲突。3.2 的做法不变：推送规则排在用户规则之后，只能接管原本走 `final` 的流量。
+  - 能看到的是结果：引擎问 endpoint 两个文档用的地址（198.51.100.1、2001:db8::1）是不是由它接管。只有默认路由或者差不多一样宽的路由才会盖住它们，`default_route` 按地址族列出被接管的（`["ipv4"]`、`["ipv4", "ipv6"]`），`xdial status` 提示"原本走 final 的这些流量都会进这条 VPN"，并记进事件。不用公网地址探测：sing-box 给 VPN 下发的每个 DNS 服务器加一条主机路由，下发 1.1.1.1 就会误判。
+  - 用户在公司网络上实测之后，再决定要不要做更多（第 7 节）。
+
 ## 4. 存放与修改
 
 ### 4.1 配置
@@ -510,9 +531,12 @@ M3 的实现（#10）：
   - 订阅节点自带的凭据，见 1.5。
 - **值不出现在别处**：
   - 带真值编译或连接时，sing-box 和依赖库给出的错误原文不透传给调用方，调用方只拿到字段路径和错误码。原文只写进 root 专属的诊断日志。
-  - 子进程的日志经管道交给 daemon。daemon 先替换掉其中的凭据值（包括转义、URL 编码、base64 等形式），并拦下已知的敏感消息，再分发给 `xdial logs` 等出口。
+  - 子进程的日志经管道交给 daemon。daemon 先替换掉其中的凭据值（包括 Go、JSON 和 JavaScript 的转义、URL 编码、base64 等形式），并拦下已知的敏感消息，再分发给 `xdial logs` 等出口。
     - 已知的敏感消息例如 tailscale 的登录链接，它走结构化通道，只交给发起登录的调用方。
     - 已知的泄露点都做成回归用例。
+    - 替换按区间做：找出每个凭据每种形式的所有出现位置（包括互相重叠的），把它们的并集整段换成一个占位符。逐个替换会漏掉重叠部分，例如两个凭据首尾相接、或者一个凭据和自己重叠。
+    - 替换的开销随文本长度增长，不随出现次数增长：互相重叠的一串出现按凭据自身的周期顺着走，不逐个重找。
+    - 凭据的值最长 8 KiB：`secret set` 拒绝更长的值，之前存下的在连接和 apply 时按 `secret.format` 拒绝。
     - 值的替换只是兜底：有些错误只带出值的一部分，不一定都替换得到。
   - 子进程的日志级别由 XDial 显式设定。
   - 带凭据的编译结果不写盘；调试用的编译输出把凭据换成占位符。
@@ -568,7 +592,7 @@ M3 的实现（#10）：
 | 凭据 | 处理 |
 |---|---|
 | 代理线路的密码、uuid 等 | 凭据引用 |
-| AnyConnect 的密码、cookie、TOTP 种子 | 凭据引用。需要浏览器登录的方式，在 M3 定 |
+| AnyConnect 的密码、cookie、TOTP 种子 | 凭据引用。浏览器登录第一版不支持（3.5） |
 | 订阅 URL | 凭据引用。拉下来的节点进订阅缓存，不进配置 |
 | Tailscale auth key | 只在 `xdial tailscale login` 时从 stdin 读一次，用完不保存。登录要重载一次 sing-box，现有连接会断一次 |
 | Tailscale 登录状态（节点密钥） | sing-box 写在 root 专属子目录里，不复制，也不导出 |
@@ -758,6 +782,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - `system_dns`：系统的第一解析器是不是 XDial 的（6.4）。
   - `physical_dns`：物理网络的 DNS（3.3）。
   - 另有 `scenario`、`revision`、`since`、`last_error`、`engine_pid`。
+  - `endpoints`：AnyConnect 和 Tailscale 线路各自的状态，见 3.5（M3）。
 - **新增的错误码**（退出码按 5.3）：
 
   | 错误码 | 退出码 | 说明 |
@@ -807,11 +832,12 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
 - **引擎的管道协议**：
   - 启动：`xdial __engine <tailscale 目录>`。环境变量只有 PATH；继承连接锁的描述符。
   - stdin：daemon 先写一个 JSON 值，即编译好的配置，之后一直开着、不再写。引擎读到 EOF 就说明 daemon 没了，自己退出，不会留下占着 TUN 的孤儿进程。launchd 杀进程组是另一道保险（6.1）。
-  - stdout：引擎只写一行 JSON，`{"ready": true, "pid": …, "version": …}` 或 `{"ready": false, "version": …, "error": …}`。
+  - stdout：引擎先写一行 JSON，`{"ready": true, "pid": …, "version": …}` 或 `{"ready": false, "version": …, "error": …}`。
     - `version` 是构建标识（版本加 revision）。和 daemon 不一致就不用这个引擎，例如二进制被换掉了。
     - `error` 经脱敏（4.3）后才写进 `last_error`。
+    - 就绪之后，每当 AnyConnect 或 Tailscale 线路的状态变了，再写一行 `{"endpoints": {"<线路 id>": {…}}}`，最多半秒一行，见 3.5。超过 1 MiB 的行丢掉。
   - stderr：sing-box 的日志，脱敏后写进引擎日志。
-  - 以后要加的运行中交互（selector 手选、urltest 状态、tailscale 登录链接），也加在 stdin 和 stdout 上，仍是一行一个 JSON。
+  - 以后要加的运行中交互（selector 手选、urltest 状态），也加在 stdin 和 stdout 上，仍是一行一个 JSON。
 - **TUN**：
   - stack 显式写 `mixed`，不依赖上游的默认值，它随构建 tag 变；不开 `strict_route`；地址 `172.19.0.1/30` 和 `fdfe:dcba:9876::1/126`，`auto_route`。
   - 实测 `gvisor`、`system`、`mixed` 三种 stack 和打开 `strict_route` 都能正常上网；`mixed` 下经 UDP 和 TCP 问 `172.19.0.2` 都能得到回答。
@@ -907,8 +933,9 @@ SupplementalMatchDomains : [""]
 - **M3**：
   - 远程规则集的下载（3.4）和订阅（1.5）已实现。
   - Surge 格式的订阅；Clash 的 `GEOIP`、`RULE-SET` 等规则类型。
-  - VPN 推送内容的形态，以及要不要由 XDial 过滤、限额后改写成普通规则；
-  - AnyConnect 需要浏览器登录时怎么办；
+  - VPN 推送的内容 XDial 读不到（3.5），只能看到是不是全隧道；用户在公司网络实测后再定要不要做更多；
+  - AnyConnect 的浏览器登录（SAML 等），和 App 一起在 M5 做；
+  - AnyConnect 线路 `failed` 之后不自动重载；
   - `ts_omit_*` tag 加上之后运行是否正常；
   - `exit_node` 算配置还是运行状态；
   - 当前场景用不到的 tailscale 线路怎么登录；
