@@ -431,7 +431,7 @@ func ownedInfo(path string, info os.FileInfo, owners []uint32, dir bool) error {
 	if !ok || !slices.Contains(owners, st.Uid) {
 		return cli.Errorf(cli.CodeInputPermission, "把 xdial 放到自己或 root 的目录里再装", "%s 的属主不是 root 也不是运行 sudo 的用户", path)
 	}
-	if info.Mode().Perm()&0o022 != 0 && !(dir && info.Mode()&os.ModeSticky != 0) {
+	if info.Mode().Perm()&0o022 != 0 && (!dir || info.Mode()&os.ModeSticky == 0) {
 		return cli.Errorf(cli.CodeInputPermission, "chmod go-w 之后再装", "%s 属主以外的人能改", path)
 	}
 	acl, err := hasACL(path)

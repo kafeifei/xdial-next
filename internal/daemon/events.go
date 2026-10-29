@@ -23,14 +23,18 @@ type Event struct {
 	Fields map[string]any `json:"fields,omitempty"`
 }
 
+// eventLog writes events to the file and keeps the latest in memory, so
+// reading them never touches the disk while events are being added.
 type eventLog struct {
-	path string
-	mu   sync.Mutex
-	subs map[chan Event]struct{}
+	path    string
+	writeMu sync.Mutex // orders the file writes; held only by add
+	mu      sync.Mutex // guards latest and subs; never held across disk I/O
+	latest  []Event
+	subs    map[chan Event]struct{}
 }
 
 func newEventLog(path string) *eventLog {
-	return &eventLog{path: path, subs: map[chan Event]struct{}{}}
+	return &eventLog{path: path, subs: map[chan Event]struct{}{}, latest: readTail(path, recentLines)}
 }
 
 func (l *eventLog) add(typ string, fields map[string]any) {
@@ -39,22 +43,56 @@ func (l *eventLog) add(typ string, fields map[string]any) {
 	if err != nil {
 		return
 	}
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	appendRotating(l.path, append(line, '\n'))
+	l.latest = append(l.latest, e)
+	if len(l.latest) > 2*recentLines {
+		l.latest = append([]Event(nil), l.latest[len(l.latest)-recentLines:]...)
+	}
 	for ch := range l.subs {
 		select {
 		case ch <- e:
 		default: // a slow reader misses events rather than stall the daemon
 		}
 	}
+	l.mu.Unlock()
+	appendRotating(l.path, append(line, '\n'))
 }
 
 // recent returns up to n of the latest events.
 func (l *eventLog) recent(n int) []Event {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	f, err := os.Open(l.path)
+	return l.tail(n)
+}
+
+func (l *eventLog) tail(n int) []Event {
+	if len(l.latest) > n {
+		return append([]Event(nil), l.latest[len(l.latest)-n:]...)
+	}
+	return append([]Event(nil), l.latest...)
+}
+
+// follow subscribes and returns the latest n events in one step, so no
+// event is both in the snapshot and on the channel, or in neither.
+func (l *eventLog) follow(n int) (chan Event, []Event) {
+	ch := make(chan Event, 64)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.subs[ch] = struct{}{}
+	return ch, l.tail(n)
+}
+
+func (l *eventLog) unsubscribe(ch chan Event) {
+	l.mu.Lock()
+	delete(l.subs, ch)
+	l.mu.Unlock()
+}
+
+// readTail reads the last n events of the file, once, at start.
+func readTail(path string, n int) []Event {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
@@ -75,20 +113,6 @@ func (l *eventLog) recent(n int) []Event {
 		all = all[len(all)-n:]
 	}
 	return all
-}
-
-func (l *eventLog) subscribe() chan Event {
-	ch := make(chan Event, 64)
-	l.mu.Lock()
-	l.subs[ch] = struct{}{}
-	l.mu.Unlock()
-	return ch
-}
-
-func (l *eventLog) unsubscribe(ch chan Event) {
-	l.mu.Lock()
-	delete(l.subs, ch)
-	l.mu.Unlock()
 }
 
 // appendRotating appends to path, rotating path to path.1 … path.N first

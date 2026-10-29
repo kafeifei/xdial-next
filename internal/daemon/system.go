@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"fmt"
 	"net/netip"
 	"os"
 	"time"
@@ -90,11 +89,4 @@ func sameServers(a, b []netip.Addr) bool {
 		}
 	}
 	return true
-}
-
-func describeServers(servers []netip.Addr) string {
-	if len(servers) == 0 {
-		return "无"
-	}
-	return fmt.Sprint(servers)
 }

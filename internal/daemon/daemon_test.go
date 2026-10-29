@@ -583,7 +583,7 @@ func TestDisconnectThatCannotBeStoredChangesNothing(t *testing.T) {
 	if err := os.Chmod(data, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chmod(data, 0o755)
+	defer func() { _ = os.Chmod(data, 0o755) }()
 	h.fails("disconnect", nil, cli.CodeInternal)
 	if s := h.ok("status", nil); s["state"] != "connected" || int(s["engine_pid"].(float64)) != pid || s["intent"] != "connected" {
 		t.Errorf("a failed disconnect changed the connection: %v", s)
@@ -600,7 +600,7 @@ func TestApplyThatCannotBeStoredRestoresTheOldConfiguration(t *testing.T) {
 	}
 	changed := strings.Replace(doc, `"final": "direct"},`, `"final": "hk"},`, 1)
 	r := h.call("config.apply", map[string]any{"content": changed})
-	os.Chmod(data, 0o755)
+	_ = os.Chmod(data, 0o755)
 	if r.OK {
 		t.Fatal("apply succeeded without storing")
 	}
@@ -675,7 +675,7 @@ func TestFailedRollbackLeavesNothingUncommitted(t *testing.T) {
 	if err := os.Chmod(data, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chmod(data, 0o755)
+	defer func() { _ = os.Chmod(data, 0o755) }()
 	// The new configuration comes up, cannot be stored, and the old one
 	// cannot be prepared again because the physical DNS just went.
 	h.sys.mu.Lock()
@@ -695,4 +695,28 @@ func TestFailedRollbackLeavesNothingUncommitted(t *testing.T) {
 	h.waitFor("the stored configuration back", func(s map[string]any) bool {
 		return s["state"] == "connected" && s["revision"] == before
 	})
+}
+
+func TestFollowSendsEachEventOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	l := newEventLog(path)
+	l.add("before", nil)
+	ch, past := l.follow(10)
+	defer l.unsubscribe(ch)
+	l.add("after", nil)
+	if len(past) != 1 || past[0].Type != "before" {
+		t.Fatalf("snapshot %v", past)
+	}
+	if e := <-ch; e.Type != "after" {
+		t.Fatalf("followed %v", e)
+	}
+	select {
+	case e := <-ch:
+		t.Fatalf("an event came twice: %v", e)
+	default:
+	}
+	// A restarted daemon reads the latest events back from the file.
+	if again := newEventLog(path).recent(10); len(again) != 2 || again[1].Type != "after" {
+		t.Errorf("after restart %v", again)
+	}
 }

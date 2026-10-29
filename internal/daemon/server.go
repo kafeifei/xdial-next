@@ -212,11 +212,14 @@ func (d *Daemon) logs(conn *net.UnixConn, req api.Request, uid uint32) bool {
 		return writeResponse(conn, api.Response{ID: req.ID, Schema: "xdial.logs/v1", OK: true, Result: b})
 	}
 	var sub chan Event
+	var past []Event
 	if params.Follow {
-		sub = d.events.subscribe()
+		sub, past = d.events.follow(params.Lines)
 		defer d.events.unsubscribe(sub)
+	} else {
+		past = d.events.recent(params.Lines)
 	}
-	for _, e := range d.events.recent(params.Lines) {
+	for _, e := range past {
 		if !send(e) {
 			return false
 		}
