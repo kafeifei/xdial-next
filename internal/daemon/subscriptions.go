@@ -238,7 +238,12 @@ func (d *Daemon) writeSubscription(id string, c *cachedSubscription) error {
 	if err := enc.Encode(c); err != nil {
 		return err
 	}
-	return store.WriteFile(d.subscriptionPath(id, c.Fingerprint), data.Bytes(), 0o600)
+	path := d.subscriptionPath(id, c.Fingerprint)
+	if err := store.WriteFile(path, data.Bytes(), 0o600); err != nil {
+		return err
+	}
+	d.unmark(path)
+	return nil
 }
 
 // parseSubscription runs one parse child: the downloaded body in, Content
