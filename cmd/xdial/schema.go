@@ -72,8 +72,8 @@ func outputSchemas() map[string]any {
 	})
 	return map[string]any{
 		versionSchema: envelope(versionSchema, object(
-			[]string{"version", "revision", "go_version", "os", "arch", "sing_box"},
-			map[string]any{"version": str(), "revision": str(), "go_version": str(), "os": str(), "arch": str(), "sing_box": str()},
+			[]string{"version", "revision", "build", "go_version", "os", "arch", "sing_box"},
+			map[string]any{"version": str(), "revision": str(), "build": str(), "go_version": str(), "os": str(), "arch": str(), "sing_box": str()},
 		)),
 		checkSchema: envelope(checkSchema, object(
 			[]string{"revision", "version", "scenarios", "secrets", "pending"},

@@ -961,7 +961,7 @@ SupplementalMatchDomains : [""]
   - 配置 apply 与 revision；凭据的设置与删除，只记名字。
   - VPN 推送内容的变化在 M3 加（3.2）。
 - **怎么读**：`xdial logs [--follow]`（M2）经本地 API 读；`xdial doctor` 汇总诊断（6.6）。返回前一样要脱敏（4.3）。
-- **其他日志**：引擎日志同样 10 MB 轮转，再留 3 份；引擎退出时，管道里剩下的日志也读到最后一行。launchd 接的 stdout 和 stderr 只有 panic 会写，daemon 每次启动时发现超过 1 MiB，就挪到 `.1` 重新开始。
+- **其他日志**：引擎日志同样 10 MB 轮转，再留 3 份；引擎退出时，管道里剩下的日志也读到最后一行。daemon 的 stdout 和 stderr 只有 panic 会写，daemon 启动后自己把它们接到 `private/daemon.log`（App 注册的 launchd 任务不写日志路径：launchd 会在 daemon 建好目录之前去打开它）；每次启动时发现超过 1 MiB，就挪到 `.1` 重新开始。
 
 ### 6.6 诊断（M4）
 

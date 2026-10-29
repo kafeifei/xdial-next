@@ -307,6 +307,12 @@ func runDaemon(ctx *context_) int {
 	if err != nil {
 		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "daemon 准备失败：%v", err))
 	}
+	// The App's launchd job names no log files: launchd would open them
+	// before the daemon has made their directory. So the daemon points its
+	// own stdout and stderr, where only panics write, at the log, 6.5.
+	if err := logTo(layout().DaemonLog()); err != nil {
+		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "打不开 daemon 的日志：%v", err))
+	}
 	if err := d.Run(run); err != nil {
 		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "daemon 退出：%v", err))
 	}
@@ -924,4 +930,19 @@ func bundleProgram(printed string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// logTo points stdout and stderr at path, appending.
+func logTo(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, fd := range []int{1, 2} {
+		if err := syscall.Dup2(int(f.Fd()), fd); err != nil {
+			return err
+		}
+	}
+	return nil
 }

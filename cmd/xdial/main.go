@@ -218,8 +218,11 @@ func equal(a, b []string) bool {
 }
 
 type versionInfo struct {
-	Version   string `json:"version"`
-	Revision  string `json:"revision"`
+	Version  string `json:"version"`
+	Revision string `json:"revision"`
+	// Build is what the daemon reports as its own, 6.3: the App compares
+	// the two, 6.1.
+	Build     string `json:"build"`
 	GoVersion string `json:"go_version"`
 	OS        string `json:"os"`
 	Arch      string `json:"arch"`
@@ -230,6 +233,7 @@ func runVersion(ctx *context_) int {
 	info := versionInfo{
 		Version:   buildinfo.Version,
 		Revision:  buildinfo.Revision(),
+		Build:     buildinfo.Build(),
 		GoVersion: runtime.Version(),
 		OS:        runtime.GOOS,
 		Arch:      runtime.GOARCH,

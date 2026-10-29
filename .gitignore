@@ -1,3 +1,4 @@
 /build/
 /.review/
 .DS_Store
+/macos/.build/
