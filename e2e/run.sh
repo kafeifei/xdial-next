@@ -428,13 +428,14 @@ for _ in $(seq 1 30); do
 done
 
 # 连接中重装：先断开，换掉二进制，新 daemon 恢复连接。
+pre="$("$xdial" status --json 2>&1 | jq -c '.result | {state, last_error, physical_dns}' 2>&1)"
 out="$(sudo "$xdial" daemon install --json 2>&1)"
 for _ in $(seq 1 40); do
   sleep 0.5
   st="$("$xdial" status --json 2> /dev/null)"
   jq -e '.result.state == "connected"' <<< "$st" > /dev/null 2>&1 && break
 done
-check m2-reinstall-resumes "jq -e .ok <<< '$out' > /dev/null && jq -e '.result.state == \"connected\" and .result.system_dns' <<< '$st' > /dev/null" "$(jq -c '.ok' <<< "$out") $(jq -c '.result | {state, system_dns}' <<< "$st")"
+check m2-reinstall-resumes "jq -e .ok <<< '$out' > /dev/null && jq -e '.result.state == \"connected\" and .result.system_dns' <<< '$st' > /dev/null" "$(head -c 800 <<< "$out" | tr '\n' ' ') | $(head -c 400 <<< "$st" | tr '\n' ' ') | before=$(head -c 300 <<< "$pre" | tr '\n' ' ')"
 
 out="$(sudo "$xdial" daemon uninstall --purge --json 2>&1)"
 sleep 2
