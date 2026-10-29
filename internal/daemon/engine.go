@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"sync"
 	"syscall"
@@ -96,7 +97,7 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 		scanner := bufio.NewScanner(errR)
 		scanner.Buffer(make([]byte, 64<<10), 1<<20)
 		for scanner.Scan() {
-			appendRotating(logPath, []byte(scrub.scrub(scanner.Text())+"\n"))
+			appendRotating(logPath, []byte(withoutLoginLinks(scrub.scrub(scanner.Text()))+"\n"))
 		}
 	}()
 	ready := make(chan engine.Ready, 1)
@@ -193,6 +194,15 @@ func (p *engineProc) stop() {
 		_ = p.cmd.Process.Kill()
 		<-p.done
 	}
+}
+
+// loginLink is sing-box's log line for a tailscale line waiting to log
+// in. The link logs whoever opens it into the account they choose, so it
+// stays out of the log; status has it, 3.5.
+var loginLink = regexp.MustCompile(`(Waiting for authentication: )\S+`)
+
+func withoutLoginLinks(line string) string {
+	return loginLink.ReplaceAllString(line, "${1}<登录链接见 xdial status>")
 }
 
 // scrubEndpoints scrubs what a VPN server says, which reaches status and

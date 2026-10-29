@@ -487,7 +487,9 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
   - 只能登录当前连接里用到的线路：登录和登出都作用在运行中的引擎上，当前场景用不到的线路没有上线，也就没有可登录的。要先切到用到它的场景。
   - `xdial tailscale login <线路>`：线路在等登录时，返回登录链接（`auth_url`），在浏览器里打开即可；`status` 里也有。
   - `xdial tailscale login <线路> --auth-key`：从 stdin 读 auth key，只编进这一次重载的配置（现有连接断一次），之后不保存；脱敏时和凭据同样对待。登录成功后，状态留在上面的目录里，以后的重载不再需要它。
-  - `xdial tailscale logout <线路>`：经引擎的 stdin 发登出命令（6.3），线路随后等新的登录。
+  - `xdial tailscale logout <线路>`：经引擎的 stdin 发登出命令（6.3），线路随后等新的登录。引擎在单独的工作协程里一次执行一条命令，不挡住它对退出信号和 stdin 结束的处理。
+  - 登录链接：sing-box 会把它写进日志；daemon 写引擎日志时把它换成"登录链接见 xdial status"。谁打开这个链接，就能把这台设备登进自己选的账户。
+  - 等待登录或登出的结果只针对发起时的那个连接：期间连接断开或换掉，返回 `config.conflict`。带 auth key 的重载失败时，按用户要的状态走正常的重连，重连不再带 key。
   - `exit_node` 写在配置里（线路的字段），和旧版一样随场景生效；不另设运行时切换。
   - 构建去掉了 peerapi、C2N、SSH、Taildrop 等能力（2.6）。XDial 不提供设置 serve 的途径，serve 不会开启。
 

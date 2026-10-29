@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"slices"
 	"time"
 
 	"github.com/kafeifei/xdial-next/internal/cli"
@@ -35,28 +36,30 @@ func (d *Daemon) tailscaleLine(line string) (*connection, error) {
 	if c == nil {
 		return nil, cli.Errorf(cli.CodeConfigConflict, "先 xdial connect 到用到这条线路的场景", "还没有连接")
 	}
-	if _, ok := c.engine.endpointStatus()[line]; !ok {
+	if !slices.Contains(c.endpoints, line) {
 		return nil, cli.Errorf(cli.CodeConfigConflict, "先切到用到这条线路的场景", "当前场景 %s 用不到线路 %s", c.scenario, line)
 	}
 	return c, nil
 }
 
-// waitLine waits until line's state satisfies done or loginWait runs out,
-// and returns the last state seen.
-func (d *Daemon) waitLine(line string, done func(engine.EndpointStatus) bool) TailscaleResult {
+// waitLine waits until line's state on connection c satisfies done or
+// loginWait runs out, and returns the last state seen. It answers for c
+// only: if c is disconnected or replaced meanwhile, it says so.
+func (d *Daemon) waitLine(c *connection, line string, done func(engine.EndpointStatus) bool) (TailscaleResult, error) {
 	deadline := time.Now().Add(loginWait)
 	for {
 		d.mu.Lock()
-		c := d.conn
+		current := d.conn
 		d.mu.Unlock()
+		if current != c {
+			return TailscaleResult{}, cli.Errorf(cli.CodeConfigConflict, "用 xdial status 查看", "等待期间连接断开或换掉了")
+		}
 		s := engine.EndpointStatus{Type: "tailscale", State: "connecting"}
-		if c != nil {
-			if reported, ok := c.engine.endpointStatus()[line]; ok {
-				s = reported
-			}
+		if reported, ok := c.engine.endpointStatus()[line]; ok {
+			s = reported
 		}
 		if done(s) || time.Now().After(deadline) {
-			return TailscaleResult{Line: line, EndpointStatus: s}
+			return TailscaleResult{Line: line, EndpointStatus: s}, nil
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -75,10 +78,14 @@ func (d *Daemon) tailscaleLogin(params json.RawMessage) reply {
 		return reply{err: err}
 	}
 	if p.AuthKey == "" {
-		if _, err := d.tailscaleLine(p.Line); err != nil {
+		c, err := d.tailscaleLine(p.Line)
+		if err != nil {
 			return reply{err: err}
 		}
-		r := d.waitLine(p.Line, func(s engine.EndpointStatus) bool { return s.State == "connected" || s.AuthURL != "" })
+		r, err := d.waitLine(c, p.Line, func(s engine.EndpointStatus) bool { return s.State == "connected" || s.AuthURL != "" })
+		if err != nil {
+			return reply{err: err}
+		}
 		return reply{schema: SchemaTailscale, result: r}
 	}
 	d.ctl.Lock()
@@ -91,16 +98,27 @@ func (d *Daemon) tailscaleLogin(params json.RawMessage) reply {
 	cfg := d.cfg
 	d.mu.Unlock()
 	next, err := d.prepareLogin(cfg, c.scenario, map[string]string{p.Line: p.AuthKey})
-	if err == nil {
-		d.gen++
-		err = d.bringUp(next)
+	if err != nil {
+		d.ctl.Unlock()
+		return reply{err: err}
 	}
+	d.gen++
+	if err := d.bringUp(next); err != nil {
+		// The old connection is gone; come back as the user wants it,
+		// through the usual retries, which compile without the key.
+		d.retryLocked(err.Error())
+		d.ctl.Unlock()
+		return reply{err: err}
+	}
+	d.mu.Lock()
+	c = d.conn
+	d.mu.Unlock()
 	d.ctl.Unlock()
+	d.events.add("tailscale_login", map[string]any{"line": p.Line})
+	r, err := d.waitLine(c, p.Line, func(s engine.EndpointStatus) bool { return s.State == "connected" || s.State == "failed" })
 	if err != nil {
 		return reply{err: err}
 	}
-	d.events.add("tailscale_login", map[string]any{"line": p.Line})
-	r := d.waitLine(p.Line, func(s engine.EndpointStatus) bool { return s.State == "connected" || s.State == "failed" })
 	return reply{schema: SchemaTailscale, result: r}
 }
 
@@ -121,6 +139,9 @@ func (d *Daemon) tailscaleLogout(params json.RawMessage) reply {
 		return reply{err: cli.Errorf(cli.CodeEngineFailed, "", "引擎没有收到登出命令：%v", err)}
 	}
 	d.events.add("tailscale_logout", map[string]any{"line": p.Line})
-	r := d.waitLine(p.Line, func(s engine.EndpointStatus) bool { return s.State == "auth_required" })
+	r, err := d.waitLine(c, p.Line, func(s engine.EndpointStatus) bool { return s.State == "auth_required" })
+	if err != nil {
+		return reply{err: err}
+	}
 	return reply{schema: SchemaTailscale, result: r}
 }

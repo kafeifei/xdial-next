@@ -27,6 +27,7 @@ cp "${XDIAL_E2E_CASES:-e2e/run.sh}" "$out_dir/share/run.sh"
 
 # 远端脚本自己负责清理和释放锁；这里只再兜一次底，删掉虚拟机和文件，不碰锁。
 cleanup() {
+  [[ -n "${key_file:-}" ]] && rm -f "$key_file"
   ssh "${ssh_opts[@]}" "$host" bash -s -- "$vm" "$remote_dir" > /dev/null 2>&1 << 'EOF' || true
 L=~/.local/bin/lume
 "$L" stop "$1" --force
@@ -44,7 +45,13 @@ scp -q "${ssh_opts[@]}" "$out_dir"/share/* "$host:$remote_dir/"
 if key="$(security find-generic-password -s xdial-e2e-tailscale-authkey -w 2> /dev/null)" && [[ -n "$key" ]]; then
   key_file="$(mktemp)"
   printf '%s' "$key" > "$key_file"
-  scp -q "${ssh_opts[@]}" "$key_file" "$host:$remote_dir/ts-authkey"
+  unset key
+  # The local copy goes whatever scp does, before set -e can stop the script.
+  if ! scp -q "${ssh_opts[@]}" "$key_file" "$host:$remote_dir/ts-authkey"; then
+    rm -f "$key_file"
+    echo "e2e: 传不过去 Tailscale 的 auth key" >&2
+    exit 1
+  fi
   rm -f "$key_file"
 fi
 unset key

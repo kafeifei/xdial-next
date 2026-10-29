@@ -1025,6 +1025,7 @@ func TestTailscaleLoginNeedsALineOfTheConnection(t *testing.T) {
 	h.fails("tailscale.login", map[string]any{"line": "hk"}, cli.CodeConfigConflict)
 	h.fails("tailscale.login", map[string]any{"line": "nope", "auth_key": "k"}, cli.CodeConfigConflict)
 	h.fails("tailscale.logout", map[string]any{"line": "hk"}, cli.CodeConfigConflict)
+}
 
 func TestReadLineSkipsOnlyTheOverlongLine(t *testing.T) {
 	input := "short\n" + strings.Repeat("x", 300) + "\nnext\n"
@@ -1049,5 +1050,24 @@ func TestEndpointTextIsScrubbed(t *testing.T) {
 	e := endpoints["corp"]
 	if strings.Contains(e.Error+e.AuthMessage, "hunter2") || e.AuthURL == "" {
 		t.Errorf("scrubbed status: %+v", e)
+	}
+}
+
+func TestLoginLinksStayOutOfTheLog(t *testing.T) {
+	line := "INFO endpoint/tailscale[tailnet]: Waiting for authentication: https://login.tailscale.com/a/abc123"
+	if got := withoutLoginLinks(line); strings.Contains(got, "abc123") || !strings.Contains(got, "Waiting for authentication") {
+		t.Errorf("log line: %s", got)
+	}
+}
+
+func TestWaitAnswersForItsConnectionOnly(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
+	h.d.mu.Lock()
+	c := h.d.conn
+	h.d.mu.Unlock()
+	h.ok("disconnect", nil)
+	if _, err := h.d.waitLine(c, "tailnet", func(engine.EndpointStatus) bool { return false }); !cli.Is(err, cli.CodeConfigConflict) {
+		t.Errorf("waiting on a connection that is gone: %v", err)
 	}
 }

@@ -104,6 +104,8 @@ type Result struct {
 	// EmptyGroups are groups none of whose members exist: every member
 	// came from subscriptions whose nodes the filters left out.
 	EmptyGroups []string
+	// Endpoints are the AnyConnect and Tailscale lines compiled in, by id.
+	Endpoints []string
 	// TooManyMembers is set when groups expand to more than
 	// MaxExpandedMembers members; the configuration is then not complete.
 	TooManyMembers bool
@@ -280,7 +282,7 @@ func Compile(c *config.Config, opts Options) (*Result, error) {
 	sort.Strings(k.missing)
 	sort.Strings(k.missingSubs)
 	return &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty,
-		TooManyMembers: k.tooMany, Secrets: k.usedSecrets()}, nil
+		TooManyMembers: k.tooMany, Endpoints: endpointIDs, Secrets: k.usedSecrets()}, nil
 }
 
 func newCompiler(c *config.Config, opts Options) *compiler {

@@ -124,17 +124,26 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	}
 	// After the ready line, stdout carries endpoint status, 6.3.
 	go reportEndpoints(ctx, instance, stdout)
-	for running := true; running; {
-		select {
-		case <-signals:
-			running = false
-		case <-orphaned:
-			fmt.Fprintln(stderr, "engine: daemon went away, shutting down")
-			running = false
-		case c := <-commands:
-			runCommand(ctx, instance, c, stderr)
+	// Commands run one at a time in a worker of their own: a logout can
+	// wait on the control server, and the loop below must stay free for
+	// the signals and the daemon going away. Leaving cancels the command.
+	commandCtx, stopCommands := context.WithCancel(ctx)
+	go func() {
+		for {
+			select {
+			case <-commandCtx.Done():
+				return
+			case c := <-commands:
+				runCommand(commandCtx, instance, c, stderr)
+			}
 		}
+	}()
+	select {
+	case <-signals:
+	case <-orphaned:
+		fmt.Fprintln(stderr, "engine: daemon went away, shutting down")
 	}
+	stopCommands()
 	if err := instance.Close(); err != nil {
 		fmt.Fprintln(stderr, "engine: close:", err)
 		return 1
