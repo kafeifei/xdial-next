@@ -55,14 +55,26 @@ func (d *Daemon) dropSelections(groups []string) {
 }
 
 // staleSelections are the groups in selections cfg leaves without their
-// member: gone, no longer selectors, or no longer naming it. A node of a
-// subscription the group still names stays: whether the node is still
-// there shows when the group is compiled.
-func staleSelections(cfg *config.Config, selections map[string]string) []string {
+// member: gone, no longer selectors, or no longer having it with the
+// subscription content in the cache. A node of a subscription not in the
+// cache stays: whether the group still has it shows when it is compiled.
+func (d *Daemon) staleSelections(cfg *config.Config, selections map[string]string) []string {
+	d.mu.Lock()
+	secrets := maps.Clone(d.secrets)
+	d.mu.Unlock()
+	source := &subscriptionSource{d: d, cfg: cfg, secrets: secrets, content: map[string]*engine.Subscription{}}
 	var stale []string
 	for id, member := range selections {
 		g := cfg.Line(id)
-		if g == nil || g.Kind != "group" || g.Type != "selector" || !memberOf(g, member, nil) {
+		if g == nil || g.Kind != "group" || g.Type != "selector" {
+			stale = append(stale, id)
+			continue
+		}
+		members, unknown := engine.GroupMembers(cfg, g, source.get)
+		kept := slices.Contains(members, member) || slices.ContainsFunc(unknown, func(sub string) bool {
+			return strings.HasPrefix(member, engine.NodeTag(sub, ""))
+		})
+		if !kept {
 			stale = append(stale, id)
 		}
 	}

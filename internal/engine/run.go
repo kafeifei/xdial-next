@@ -129,9 +129,11 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	orphaned := make(chan struct{})
 	commands := make(chan Command, 8)
 	// Tests take up to a minute; they have a queue of their own, so a
-	// switch or a logout never waits behind one. A test that finds the
-	// queue full is answered at once.
-	tests := make(chan *URLTestCommand, 4)
+	// switch or a logout never waits behind one. A test's minute counts
+	// from when it arrived, waiting included, so its answer comes within
+	// what the daemon waits for. One that finds the queue full is answered
+	// at once.
+	tests := make(chan queuedTest, 2)
 	rejected := make(chan int, 64)
 	go func() {
 		defer close(orphaned)
@@ -144,7 +146,7 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 			}
 			if c.URLTest != nil {
 				select {
-				case tests <- c.URLTest:
+				case tests <- queuedTest{c.URLTest, time.Now().Add(TestDeadline)}:
 				default:
 					select {
 					case rejected <- c.URLTest.ID:
@@ -208,8 +210,16 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 				return
 			case id := <-rejected:
 				_ = reports.write(StatusLine{Test: &TestResult{ID: id, Error: "测速太多，等前面的测完再试"}})
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-commandCtx.Done():
+				return
 			case t := <-tests:
-				_ = reports.write(StatusLine{Test: &TestResult{ID: t.ID, Results: urlTest(commandCtx, instance, reports, t.Tags)}})
+				_ = reports.write(StatusLine{Test: &TestResult{ID: t.ID, Results: urlTest(commandCtx, t.deadline, instance, reports, t.Tags)}})
 				reports.poke()
 			}
 		}
@@ -227,11 +237,17 @@ func RunEngineChild(stdin io.Reader, stdout, stderr io.Writer, allowed []string)
 	return 0
 }
 
+// queuedTest is a test waiting its turn, and when it must be done.
+type queuedTest struct {
+	*URLTestCommand
+	deadline time.Time
+}
+
 // urlTest measures each tag: every line a group leads to, however deep,
-// or the line itself, testWorkers at a time, within TestDeadline. Lines
-// the deadline or maxTested leaves out say so. Every result also goes into
-// the history groups read, 3.6.
-func urlTest(ctx context.Context, instance *box.Box, r *reporter, tags []string) map[string]TestOutcome {
+// or the line itself, testWorkers at a time, until deadline. Lines the
+// deadline or maxTested leaves out say so. Every result also goes into the
+// history groups read, 3.6.
+func urlTest(ctx context.Context, deadline time.Time, instance *box.Box, r *reporter, tags []string) map[string]TestOutcome {
 	results := map[string]TestOutcome{}
 	var lines []adapter.Outbound
 	seen := map[string]bool{}
@@ -258,7 +274,7 @@ func urlTest(ctx context.Context, instance *box.Box, r *reporter, tags []string)
 	for _, tag := range tags {
 		expand(tag)
 	}
-	ctx, cancel := context.WithTimeout(ctx, TestDeadline)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	var mu sync.Mutex
 	work := make(chan adapter.Outbound)
