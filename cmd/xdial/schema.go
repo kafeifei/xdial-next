@@ -105,7 +105,8 @@ func outputSchemas() map[string]any {
 			[]string{"identity", "removed", "purged"},
 			map[string]any{"identity": str(), "removed": strList(), "purged": map[string]any{"type": "boolean"}},
 		)),
-		"xdial.daemon.run/v1": envelope("xdial.daemon.run/v1", object([]string{"stopped"}, map[string]any{"stopped": map[string]any{"type": "boolean"}})),
+		"xdial.daemon.restart/v1": envelope("xdial.daemon.restart/v1", object([]string{"restarting"}, map[string]any{"restarting": map[string]any{"type": "boolean"}})),
+		"xdial.daemon.run/v1":     envelope("xdial.daemon.run/v1", object([]string{"stopped"}, map[string]any{"stopped": map[string]any{"type": "boolean"}})),
 		"xdial.status/v1": envelope("xdial.status/v1", object(
 			[]string{"state", "connected", "scenario", "revision", "since", "last_error", "system_dns", "engine_pid"},
 			map[string]any{

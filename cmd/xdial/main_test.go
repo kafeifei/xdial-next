@@ -541,3 +541,14 @@ func TestDoctorContract(t *testing.T) {
 		t.Errorf("text: %s", out.String())
 	}
 }
+
+func TestBundleProgram(t *testing.T) {
+	app := "system/com.kafeifei.xdial = {\n\tactive count = 1\n\tpath = /Applications/XDial.app/Contents/Library/LaunchDaemons/com.kafeifei.xdial.plist\n\tprogram = /Applications/XDial.app/Contents/Resources/xdial\n}\n"
+	if program, managed := bundleProgram(app); !managed || program != "/Applications/XDial.app/Contents/Resources/xdial" {
+		t.Errorf("app: %q %v", program, managed)
+	}
+	cli := "system/com.kafeifei.xdial = {\n\tprogram = /Library/Application Support/com.kafeifei.xdial/bin/xdial\n}\n"
+	if _, managed := bundleProgram(cli); managed {
+		t.Error("the command line's daemon counted as the App's")
+	}
+}

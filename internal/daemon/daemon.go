@@ -33,6 +33,9 @@ type Options struct {
 	ExcludeFromBackup func(dir string) error
 	// NoTUN leaves the TUN inbound out, so tests run the engine unprivileged.
 	NoTUN bool
+	// Restart ends Run so launchd starts the daemon again, from the binary
+	// now at its path, 6.1; nil when the daemon cannot be restarted.
+	Restart func()
 }
 
 // consoleOrRoot allows root and the user logged in at the console: the

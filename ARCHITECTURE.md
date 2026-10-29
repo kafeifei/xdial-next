@@ -779,9 +779,13 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - `AbandonProcessGroup` 为 false：daemon 退出时，launchd 杀掉它进程组里剩下的进程，引擎和 scutil 会话不会留下；
   - `ThrottleInterval` 5 秒；`ExitTimeOut` 20 秒，留够断开的时间。
 - **卸载**：`sudo xdial daemon uninstall [--purge]` 先 `launchctl bootout`（daemon 断开），同样等任务没了，再删 plist、二进制和 socket 目录；另一个身份没装时，连共享目录一起删；`--purge` 连数据目录一起删。
-- **和 App 的衔接**：
-  - `SMAppService.daemon` 运行的是 App 包里的二进制。App 装在 `/Applications` 时 admin 用户就能改它，不满足上面"只有 root 能改"。两种注册方式也不能共用同一个 launchd label。
-  - M2 只交付 CLI 安装。App 怎么安装和升级 daemon（例如调用同一个 install 流程），在 M5 定。
+- **App 安装 daemon（M5，用户 2026-10-29 定）**：
+  - App 用 `SMAppService.daemon` 注册 daemon。App 包里带 `Contents/MacOS/xdial` 和 `Contents/Library/LaunchDaemons/<id>.plist`，plist 用 `BundleProgram` 指向包里的 `xdial`，其余键和上面命令行写的一样。用户在 系统设置 › 通用 › 登录项与扩展 里批准一次，之后 App 升级不用再批准。
+  - **代价（用户已接受）**：launchd 以 root 运行的是 App 包里的二进制，App 在 `/Applications` 时管理员用户不用 sudo 就能改它，不再满足上面"只有 root 能改"。也就是说，以管理员身份运行的任何进程都能借它拿到 root。签名构建（M6）后要实测：被改过、签名不对的二进制，launchd 还会不会运行。
+  - 数据目录、socket、连接锁和命令行安装时一样（上表），daemon 每次启动自己建好、收紧权限。
+  - **两种方式只能有一个**：它们用同一个 launchd label。`xdial daemon install` 和 `uninstall` 发现 launchd 里这个 label 跑的是 App 包里的程序（`launchctl print` 的 `program` 在某个 `.app/Contents/` 里），就报 `daemon.app_managed`，什么都不动；App 发现 `/Library/LaunchDaemons/<id>.plist` 在，就提示先运行 `sudo xdial daemon uninstall`，不注册。
+  - **升级**：App 被换成新版本后，正在跑的还是旧的 daemon 进程。App 启动时比较 daemon `version` 报的构建和自己包里的；不一样就调 `daemon.restart`：daemon 答复之后照常断开、退出，launchd（`KeepAlive`）从同一路径起新的二进制，按 `state.json` 恢复连接。
+  - 命令行安装（上面）留给没有 App 的场合：开发、测试虚拟机、只用 CLI 的用户。
 
 ### 6.2 本地 API
 
@@ -819,12 +823,14 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - 另有 `scenario`、`revision`、`since`、`last_error`、`engine_pid`。
   - `endpoints`：AnyConnect 和 Tailscale 线路各自的状态，见 3.5（M3）。
 - **M3 加的方法**：`tailscale.login`（`line`、`auth_key`）、`tailscale.logout`（`line`），见 3.5。
-- **M4 加的方法**：`group.select`（`group`、`member`）、`line.test`（`ids`），见 3.6；`explain`（`target`、`scenario`），见 3.7；`status` 加 `groups`。
+- **M4 加的方法**：`group.select`（`group`、`member`）、`line.test`（`ids`），见 3.6；`explain`（`target`、`scenario`），见 3.7；`doctor`，见 6.6；`status` 加 `groups`。
+- **M5 加的方法**：`daemon.restart`，见 6.1。
 - **新增的错误码**（退出码按 5.3）：
 
   | 错误码 | 退出码 | 说明 |
   |---|---|---|
   | `daemon.unreachable` | 3 | daemon 没在运行，或者连不上 socket |
+  | `daemon.app_managed` | 5 | 这个身份的 daemon 由 App 注册，命令行不能装或卸（6.1） |
   | `daemon.untrusted` | 3 | socket 上监听的不是 root 的进程，请求没有发出 |
   | `daemon.busy` | 5 | daemon 的连接数已满 |
   | `api.permission` | 4 | 调用方不是 root，也不是控制台用户 |
