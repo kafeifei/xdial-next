@@ -651,14 +651,15 @@ func (c *converter) convertScenarios() {
 				bad = true
 				break
 			}
+			// Off rule sets and lines skip the binding, as in the old App,
+			// before the line it names matters.
+			if cond.id == "" || line == "" {
+				continue
+			}
 			if line == unusable {
 				c.problem(label, "绑定的线路旧版也用不了，这个场景旧版也连不上")
 				bad = true
 				break
-			}
-			// Off rule sets and lines skip the binding, as in the old App.
-			if cond.id == "" || line == "" {
-				continue
 			}
 			rule := map[string]any{"rule_set": cond.id, "line": line}
 			if cond.rule.Invert {

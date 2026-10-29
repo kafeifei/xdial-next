@@ -204,6 +204,13 @@ func TestConvertRefusesWhatItCannotCarry(t *testing.T) {
 			t.Errorf("%s: no problem reported", name)
 		}
 	}
+	// An off rule set bound to a line the old App could not use is skipped
+	// there before the line matters: it does not stop the import.
+	off := strings.Replace(strings.Replace(library, `"rule_set_id": "corp", "line_id": "vpn1"`, `"rule_set_id": "corp", "line_id": "n3"`, 1),
+		`"name": "Corp", "type": "manual"`, `"name": "Corp", "type": "manual", "enabled": false`, 1)
+	if r, err := Convert([]byte(off)); err != nil || len(r.Report.Problems) != 0 {
+		t.Errorf("an off rule set on an unusable line: %v %+v", err, r.Report.Problems)
+	}
 	if _, err := Convert([]byte(`{"schemaVersion": 2, "profiles": []}`)); err == nil {
 		t.Error("an old schema passed")
 	}
