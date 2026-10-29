@@ -377,7 +377,12 @@ func (k *compiler) subscription(id string) *Subscription {
 // nodes cannot be known, 3.6.
 func GroupMembers(c *config.Config, group *config.Object, subscription func(*config.Object) (*Subscription, bool)) (members, unknown []string) {
 	k := newCompiler(c, Options{Secret: Placeholder, Subscription: subscription})
-	for _, m := range k.expandMembers(group).Items {
+	expanded := k.expandMembers(group)
+	if len(k.empty) > 0 {
+		// The direct put in for sing-box's sake is not a member.
+		return nil, k.missingSubs
+	}
+	for _, m := range expanded.Items {
 		members = append(members, m.String)
 	}
 	return members, k.missingSubs
