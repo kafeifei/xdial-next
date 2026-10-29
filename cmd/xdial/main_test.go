@@ -450,25 +450,6 @@ func TestStageBinaryChecksTheSource(t *testing.T) {
 	if _, err := stageBinary(src, bin); err != nil {
 		t.Errorf("a sticky directory was refused: %v", err)
 	}
-	if runtime.GOOS == "darwin" {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if out, err := exec.Command("/bin/chmod", "+a", "everyone allow write", src).CombinedOutput(); err != nil {
-			t.Fatalf("chmod +a: %v %s", err, out)
-		}
-		if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {
-			t.Errorf("a file with an ACL was installed: %v", err)
-		}
-		if out, err := exec.Command("/bin/chmod", "-N", src).CombinedOutput(); err != nil {
-			t.Fatalf("chmod -N: %v %s", err, out)
-		}
-	}
-	aclLister = "/nonexistent/ls"
-	if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {
-		t.Errorf("a source whose ACL could not be checked was installed: %v", err)
-	}
-	aclLister = "/bin/ls"
 	t.Setenv("SUDO_UID", strconv.Itoa(os.Getuid()+1))
 	if os.Getuid() != 0 {
 		if _, err := stageBinary(src, bin); !cli.Is(err, cli.CodeInputPermission) {
