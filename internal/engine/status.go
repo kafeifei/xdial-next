@@ -1,9 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"maps"
 	"net/netip"
 	"sort"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common/observable"
 )
 
@@ -42,8 +46,9 @@ type EndpointStatus struct {
 }
 
 // StatusLine is one line the engine writes to stdout after its ready
-// line. A snapshot carries the status of every endpoint and group, by id;
-// a line answering a url_test command carries only Test.
+// line: the status of one endpoint or one group, by id, whenever it
+// changes, which the daemon merges into what it has; or the answer to a
+// url_test command.
 type StatusLine struct {
 	Endpoints map[string]EndpointStatus `json:"endpoints,omitempty"`
 	Groups    map[string]GroupStatus    `json:"groups,omitempty"`
@@ -69,6 +74,8 @@ type MemberStatus struct {
 type TestResult struct {
 	ID      int                    `json:"id"`
 	Results map[string]TestOutcome `json:"results"`
+	// Error says why nothing was tested.
+	Error string `json:"error,omitempty"`
 }
 
 // TestOutcome is one line's test: a delay, or why there is none.
@@ -87,21 +94,39 @@ var probeAddresses = map[string]netip.Addr{"ipv4": netip.MustParseAddr("198.51.1
 // statusInterval bounds how often the engine writes a status line.
 const statusInterval = 500 * time.Millisecond
 
+// MaxStatusLine bounds one status line, which the daemon skips when
+// longer. Each line carries one endpoint, one group or one test result,
+// and the largest the configuration's bounds allow fits: a group of 1024
+// lines and the 20 000 nodes subscriptions expand to, or a test of them
+// all, with tags of at most about 600 bytes.
+const MaxStatusLine = 16 << 20
+
 // reporter writes status lines to the daemon, 6.3.
 type reporter struct {
 	instance *box.Box
 	history  *urltest.HistoryStorage
+	stderr   io.Writer
 	writeMu  sync.Mutex
-	encoder  *json.Encoder
+	w        io.Writer
 
 	mu        sync.Mutex
 	endpoints map[string]EndpointStatus
 	changed   chan struct{}
 }
 
-func newReporter(instance *box.Box, history *urltest.HistoryStorage, w io.Writer) *reporter {
-	return &reporter{instance: instance, history: history, encoder: json.NewEncoder(w),
+func newReporter(instance *box.Box, history *urltest.HistoryStorage, w, stderr io.Writer) *reporter {
+	return &reporter{instance: instance, history: history, w: w, stderr: stderr,
 		endpoints: map[string]EndpointStatus{}, changed: make(chan struct{}, 1)}
+}
+
+// encode writes line as JSON without escaping HTML, which would make
+// names up to six times longer.
+func encode(line StatusLine) ([]byte, error) {
+	var b bytes.Buffer
+	encoder := json.NewEncoder(&b)
+	encoder.SetEscapeHTML(false)
+	err := encoder.Encode(line)
+	return b.Bytes(), err
 }
 
 // poke asks for a new snapshot.
@@ -112,10 +137,24 @@ func (r *reporter) poke() {
 	}
 }
 
+// write writes one status line; one the daemon would skip is not sent.
 func (r *reporter) write(line StatusLine) error {
+	data, err := encode(line)
+	if err != nil {
+		return err
+	}
+	return r.writeRaw(data)
+}
+
+func (r *reporter) writeRaw(data []byte) error {
+	if len(data) > MaxStatusLine {
+		fmt.Fprintln(r.stderr, "engine: status line too long, not sent:", len(data), "bytes")
+		return nil
+	}
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
-	return r.encoder.Encode(line)
+	_, err := r.w.Write(data)
+	return err
 }
 
 // run writes a snapshot whenever an endpoint's or a group's status
@@ -156,6 +195,17 @@ func (r *reporter) run(ctx context.Context) {
 		}
 	}()
 	r.poke()
+	// What was last sent of each endpoint and group: only what changed
+	// goes out again, one line each, which the daemon merges.
+	sent := map[string][]byte{}
+	send := func(key string, line StatusLine) error {
+		data, err := encode(line)
+		if err != nil || bytes.Equal(sent[key], data) {
+			return nil
+		}
+		sent[key] = data
+		return r.writeRaw(data)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -164,13 +214,17 @@ func (r *reporter) run(ctx context.Context) {
 		case <-time.After(groupInterval):
 		}
 		r.mu.Lock()
-		line := StatusLine{Endpoints: make(map[string]EndpointStatus, len(r.endpoints)), Groups: r.groups()}
-		for tag, s := range r.endpoints {
-			line.Endpoints[tag] = s
-		}
+		endpoints := maps.Clone(r.endpoints)
 		r.mu.Unlock()
-		if r.write(line) != nil {
-			return
+		for tag, s := range endpoints {
+			if send("endpoint:"+tag, StatusLine{Endpoints: map[string]EndpointStatus{tag: s}}) != nil {
+				return
+			}
+		}
+		for tag, g := range r.groups() {
+			if send("group:"+tag, StatusLine{Groups: map[string]GroupStatus{tag: g}}) != nil {
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -194,7 +248,13 @@ func (r *reporter) groups() map[string]GroupStatus {
 		status := GroupStatus{Type: o.Type(), Now: g.Now(), Members: []MemberStatus{}}
 		for _, tag := range g.All() {
 			m := MemberStatus{Tag: tag}
-			if h := r.history.LoadURLTestHistory(tag); h != nil {
+			// Groups keep a member's result under the tag it leads to, a
+			// group member's under the member in use.
+			key := tag
+			if member, ok := r.instance.Outbound().Outbound(tag); ok {
+				key = group.RealTag(member)
+			}
+			if h := r.history.LoadURLTestHistory(key); h != nil {
 				t := h.Time
 				m.DelayMS, m.TestedAt = int(h.Delay), &t
 			}
@@ -237,11 +297,16 @@ func openConnectStatus(ep adapter.OpenConnectEndpoint) EndpointStatus {
 		s.BrowserAuth = c.Browser != nil
 	}
 	if t := st.TunnelInfo; t != nil {
+		// The server decides how many; a status line has room for some.
 		for _, p := range append(append([]netip.Prefix{}, t.IPv4...), t.IPv6...) {
-			s.Addresses = append(s.Addresses, p.String())
+			if len(s.Addresses) < maxListed {
+				s.Addresses = append(s.Addresses, p.String())
+			}
 		}
 		for _, a := range t.DNS {
-			s.DNS = append(s.DNS, a.String())
+			if len(s.DNS) < maxListed {
+				s.DNS = append(s.DNS, a.String())
+			}
 		}
 		since := t.ConnectedSince
 		s.Since = &since
@@ -285,6 +350,9 @@ func tailscaleStatus(st *adapter.TailscaleEndpointStatus) EndpointStatus {
 	sort.Strings(s.Self)
 	return s
 }
+
+// maxListed bounds the addresses and DNS servers listed for an endpoint.
+const maxListed = 64
 
 // maxText bounds a VPN server's text in a status line, so one endpoint
 // cannot push every line past the daemon's limit. The daemon keeps only

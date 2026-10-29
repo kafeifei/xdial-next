@@ -152,9 +152,9 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 		_ = json.Unmarshal(line, &r)
 		ready <- r
 		// Then status lines, one per change, 6.3. A line longer than
-		// maxStatusLine is skipped to its end and reading goes on.
+		// engine.MaxStatusLine is skipped to its end and reading goes on.
 		for {
-			line, err := readLine(reader, maxStatusLine)
+			line, err := readLine(reader, engine.MaxStatusLine)
 			if err != nil {
 				break
 			}
@@ -171,10 +171,12 @@ func (d *Daemon) startEngine(compiled []byte, lock *os.File, scrub *scrubber) (*
 				}
 				continue
 			}
+			// Each line carries what changed; the rest stands.
 			scrubEndpoints(status.Endpoints, scrub)
 			p.mu.Lock()
-			previous := p.endpoints
-			p.endpoints, p.groups = status.Endpoints, status.Groups
+			previous := maps.Clone(p.endpoints)
+			p.endpoints = merged(p.endpoints, status.Endpoints)
+			p.groups = merged(p.groups, status.Groups)
 			p.mu.Unlock()
 			d.endpointsChanged(previous, status.Endpoints)
 		}
@@ -289,8 +291,14 @@ func scrubText(s string, scrub *scrubber) string {
 // maxEndpointText bounds a VPN server's text in status and events.
 const maxEndpointText = 512
 
-// maxStatusLine bounds one status line from the engine.
-const maxStatusLine = 1 << 20
+// merged returns into with what update has added or replaced.
+func merged[V any](into, update map[string]V) map[string]V {
+	if into == nil {
+		into = map[string]V{}
+	}
+	maps.Copy(into, update)
+	return into
+}
 
 // readLine reads one line of at most limit bytes. A longer line is read to
 // its end and returned as nil, so one bad line costs only itself.

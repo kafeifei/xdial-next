@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -15,7 +16,10 @@ import (
 	"time"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/service"
 
 	"github.com/kafeifei/xdial-next/internal/config"
 )
@@ -816,5 +820,57 @@ func TestParseTarget(t *testing.T) {
 		if _, err := ParseTarget(bad); err == nil {
 			t.Errorf("ParseTarget(%q) accepted", bad)
 		}
+	}
+}
+
+// TestGroupsReportAndTestThroughNesting runs groups inside groups: a
+// member that is a group shows the result its group keeps under the line
+// it leads to, and a test reaches every line however deep.
+func TestGroupsReportAndTestThroughNesting(t *testing.T) {
+	c := loadDoc(t, `{"version": 1,
+		"lines": [
+			{"id": "a", "type": "trojan", "server": "127.0.0.1", "server_port": 9, "password": {"secret": "a"}},
+			{"id": "b", "type": "trojan", "server": "127.0.0.1", "server_port": 9, "password": {"secret": "a"}}
+		],
+		"groups": [
+			{"id": "outer", "type": "urltest", "outbounds": ["inner", "a"]},
+			{"id": "inner", "type": "selector", "outbounds": ["b"]},
+			{"id": "g0", "type": "selector", "outbounds": ["g1"]},
+			{"id": "g1", "type": "selector", "outbounds": ["g2"]},
+			{"id": "g2", "type": "selector", "outbounds": ["g3"]},
+			{"id": "g3", "type": "selector", "outbounds": ["g4"]},
+			{"id": "g4", "type": "selector", "outbounds": ["a", "b"]}
+		],
+		"rule_sets": [{"id": "x", "type": "inline", "rules": [{"domain": ["x.example"]}]}],
+		"scenarios": [{"id": "s", "rules": [{"rule_set": "x", "line": "g0"}], "final": "outer"}]}`)
+	r, err := Compile(c, Options{Scenario: "s", StateDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := urltest.NewHistoryStorage()
+	ctx, cancel := context.WithCancel(service.ContextWithPtr(Context(context.Background()), history))
+	defer cancel()
+	var opts option.Options
+	if err := opts.UnmarshalJSONContext(ctx, r.JSON); err != nil {
+		t.Fatal(err)
+	}
+	instance, err := box.New(box.Options{Context: ctx, Options: opts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Close()
+	rep := newReporter(instance, history, io.Discard, io.Discard)
+	history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 42})
+	for _, m := range rep.groups()["outer"].Members {
+		if m.Tag == "inner" && m.DelayMS != 42 {
+			t.Errorf("inner in outer: %+v", m)
+		}
+	}
+	results := urlTest(ctx, instance, rep, []string{"g0"})
+	if len(results) != 2 || results["a"].Error == "" || results["b"].Error == "" {
+		t.Errorf("test of g0: %v", results)
 	}
 }

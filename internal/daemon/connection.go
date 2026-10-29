@@ -35,6 +35,10 @@ type connection struct {
 	revision  string
 	digest    [32]byte
 	endpoints []string
+	// groups and outbounds are what the engine runs: each group's
+	// members, and every line, group and node, 3.6.
+	groups    map[string][]string
+	outbounds []string
 	physical  []netip.Addr
 	lock      *connectionLock
 	engine    *engineProc
@@ -52,6 +56,9 @@ type plan struct {
 	compiled  []byte
 	digest    [32]byte // of compiled: what the engine would run
 	endpoints []string // AnyConnect and Tailscale lines compiled in
+	groups    map[string][]string
+	outbounds []string
+	stale     []string // groups whose member picked by hand is gone
 	secrets   map[string]Secret
 }
 
@@ -208,7 +215,8 @@ func (d *Daemon) prepareLogin(cfg *config.Config, scenario string, authKeys map[
 	if err := checkSecrets(cfg, secrets, result.Secrets); err != nil {
 		return nil, err
 	}
-	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON), endpoints: result.Endpoints, secrets: scrubbed}, nil
+	return &plan{scenario: scenario, revision: cfg.Root.Revision(), physical: physical, compiled: result.JSON, digest: sha256.Sum256(result.JSON),
+		endpoints: result.Endpoints, groups: result.Groups, outbounds: result.Outbounds, stale: result.StaleSelections, secrets: scrubbed}, nil
 }
 
 // bringUp replaces the connection with p, 6.3: take the connection lock,
@@ -221,7 +229,8 @@ func (d *Daemon) bringUp(p *plan) error {
 	old := d.conn
 	d.conn = nil
 	d.mu.Unlock()
-	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, endpoints: p.endpoints, physical: p.physical}
+	c := &connection{scenario: p.scenario, revision: p.revision, digest: p.digest, endpoints: p.endpoints,
+		groups: p.groups, outbounds: p.outbounds, physical: p.physical}
 	if old != nil {
 		// A reload keeps the lock it holds rather than letting it go and
 		// taking it again.
@@ -272,6 +281,7 @@ func (d *Daemon) bringUp(p *plan) error {
 	d.wakeMonitor()
 	d.setStatus("connected", notFirst(first))
 	go d.watch(c.engine)
+	d.dropSelections(p.stale)
 	return nil
 }
 

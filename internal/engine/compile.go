@@ -6,9 +6,11 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/netip"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -114,6 +116,13 @@ type Result struct {
 	TooManyMembers bool
 	// Secrets names the secrets the compiled objects use, sorted.
 	Secrets []string
+	// Groups are the members each compiled group runs with, by id.
+	Groups map[string][]string
+	// Outbounds are the tags of every line, group and node compiled in.
+	Outbounds []string
+	// StaleSelections are the groups whose member picked by hand is no
+	// longer one of theirs, or that are no longer selectors, 3.6.
+	StaleSelections []string
 }
 
 type compiler struct {
@@ -243,6 +252,13 @@ func compileScenario(c *config.Config, opts Options) (*compiler, *Result, error)
 		"log": map[string]any{"level": opts.LogLevel},
 	}
 	outbounds := []any{map[string]any{"type": "direct", "tag": config.Direct}}
+	groups := map[string][]string{}
+	var stale []string
+	for id := range opts.Selections {
+		if o := c.Line(id); o == nil || o.Kind != "group" {
+			stale = append(stale, id)
+		}
+	}
 	var endpoints []any
 	var endpointIDs []string
 	for _, list := range [][]*config.Object{c.Lines, c.Groups} {
@@ -259,11 +275,16 @@ func compileScenario(c *config.Config, opts Options) (*compiler, *Result, error)
 			if o.Kind == "group" {
 				members := k.expandMembers(o)
 				v = v.With("outbounds", members)
-				if picked, ok := opts.Selections[o.ID]; ok && o.Type == "selector" {
-					for _, m := range members.Items {
-						if m.String == picked {
-							v = v.With("default", config.String(picked))
-						}
+				tags := make([]string, 0, len(members.Items))
+				for _, m := range members.Items {
+					tags = append(tags, m.String)
+				}
+				groups[o.ID] = tags
+				if picked, ok := opts.Selections[o.ID]; ok {
+					if o.Type == "selector" && slices.Contains(tags, picked) {
+						v = v.With("default", config.String(picked))
+					} else {
+						stale = append(stale, o.ID)
 					}
 				}
 			}
@@ -307,8 +328,16 @@ func compileScenario(c *config.Config, opts Options) (*compiler, *Result, error)
 	sort.Strings(k.pending)
 	sort.Strings(k.missing)
 	sort.Strings(k.missingSubs)
+	sort.Strings(stale)
+	var tags []string
+	for id := range k.lines {
+		tags = append(tags, id)
+	}
+	tags = append(tags, slices.Collect(maps.Keys(k.nodeSeen))...)
+	sort.Strings(tags)
 	return k, &Result{JSON: out, Pending: k.pending, MissingRuleSets: k.missing, MissingSubscriptions: k.missingSubs, EmptyGroups: k.empty,
-		TooManyMembers: k.tooMany, Endpoints: endpointIDs, Secrets: k.usedSecrets()}, nil
+		TooManyMembers: k.tooMany, Endpoints: endpointIDs, Secrets: k.usedSecrets(),
+		Groups: groups, Outbounds: tags, StaleSelections: stale}, nil
 }
 
 func newCompiler(c *config.Config, opts Options) *compiler {
