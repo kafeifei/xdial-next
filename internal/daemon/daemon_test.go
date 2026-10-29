@@ -869,6 +869,12 @@ func TestConnectionResumesWhenTheCacheIsFilled(t *testing.T) {
 	h.d.mu.Lock()
 	h.d.awaitingCache = true
 	h.d.mu.Unlock()
+	// A download for something else while the rule set is still missing
+	// leaves the stopped retries alone.
+	h.d.resumeAfterFetch()
+	if s := h.ok("status", nil); s["state"] != "failed" {
+		t.Errorf("an unrelated download lifted the stopped retries: %v", s)
+	}
 	h.seedRuleSet("r", url, `{"version": 1, "rules": [{"domain": ["b.example"]}]}`)
 	// A download that brings content in is what calls this.
 	h.d.resumeAfterFetch()

@@ -102,6 +102,9 @@ type Daemon struct {
 	// awaitingCache, under mu: the last attempt to connect failed because
 	// the cache lacked what the scenario needs.
 	awaitingCache bool
+	// invalid, under mu: cached files compiling found refused while a
+	// download held d.res; the background loop downloads them again.
+	invalid map[string]bool
 }
 
 // New prepares a daemon: directories, permissions, stored files. It does

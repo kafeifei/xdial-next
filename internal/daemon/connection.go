@@ -76,9 +76,21 @@ func (d *Daemon) resumeAfterFetch() {
 	if !waiting {
 		return
 	}
+	// Only when the cache now holds everything: a download for another
+	// scenario must not lift the stopped retries.
+	d.mu.Lock()
+	cfg, scenario := d.cfg, d.state.Scenario
+	d.mu.Unlock()
+	p, err := d.prepare(cfg, scenario)
+	if err != nil {
+		return
+	}
 	d.failures = nil
 	d.gen++
-	if err := d.establishLocked(); err != nil {
+	d.mu.Lock()
+	d.awaitingCache = false
+	d.mu.Unlock()
+	if err := d.bringUp(p); err != nil {
 		d.retryLocked(err.Error())
 	}
 }

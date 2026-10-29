@@ -195,6 +195,15 @@ func (d *Daemon) cachedRuleSets(cfg *config.Config, scenario string, secrets map
 // leaves the file to that download.
 func (d *Daemon) dropInvalid(path string, valid func() bool) {
 	if !d.res.TryLock() {
+		// Left to the background loop, which downloads it again however
+		// fresh the file looks.
+		d.mu.Lock()
+		if d.invalid == nil {
+			d.invalid = map[string]bool{}
+		}
+		d.invalid[path] = true
+		d.mu.Unlock()
+		d.wakeResources()
 		return
 	}
 	defer d.res.Unlock()
@@ -202,6 +211,16 @@ func (d *Daemon) dropInvalid(path string, valid func() bool) {
 		_ = os.Remove(path)
 		d.events.add("cache_dropped", map[string]any{"file": filepath.Base(path)})
 	}
+}
+
+// markedInvalid reports and clears whether compiling found path's content
+// refused while a download held d.res.
+func (d *Daemon) markedInvalid(path string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	marked := d.invalid[path]
+	delete(d.invalid, path)
+	return marked
 }
 
 // ruleSetMeta reads what the cache says about a rule set without checking
@@ -648,7 +667,8 @@ func (d *Daemon) refreshRuleSets() {
 		if err != nil {
 			continue
 		}
-		if c, ok := d.ruleSetMeta(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) {
+		marked := d.markedInvalid(d.ruleSetPath(o.ID, fingerprint(url, o.Value.Get("format").String)))
+		if c, ok := d.ruleSetMeta(o, url); ok && now.Sub(c.FetchedAt) < updateInterval(o) && !marked {
 			continue
 		}
 		_, _ = d.downloadRuleSet(cfg, o, secrets)
