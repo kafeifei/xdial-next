@@ -404,6 +404,29 @@ e3="$("$xdial" explain https://example.com --json 2>&1)"
 e4="$("$xdial" explain https://www.apple.com --config "$work/m3.jsonc" --json 2>&1)"
 check m4-explain "jq -e '.result.rule.rule_set == \"apple\" and .result.line == \"direct\" and .result.dns.server == \"physical\"' <<< '$e1' > /dev/null && jq -e '.result.rule.rule_set == \"cn-ip\"' <<< '$e2' > /dev/null && jq -e '.result.rule == null and .result.line == \"direct\"' <<< '$e3' > /dev/null && jq -e '.result.rule == null and (.result.notes | length) > 0' <<< '$e4' > /dev/null" "$(jq -c '.result | {rule, line, dns: .dns.server}' <<< "$e1") $(jq -c '.result.rule' <<< "$e2") $(jq -c '.result.rule' <<< "$e3") offline=$(jq -c '.result.rule' <<< "$e4")"
 
+# --- M4：doctor（#18）--------------------------------------------------------
+# 连着场景 s。前面杀过引擎，规则集 local 下载被拒：doctor 都要指出来，其余几项正常。
+"$xdial" rule-set update local --json > /dev/null 2>&1
+d1="$("$xdial" doctor --json 2>&1)"
+check m4-doctor-faults "jq -e '[.result.checks[] | {(.name): .status}] | add | .connection == \"ok\" and .system_dns == \"ok\" and .physical_dns == \"ok\" and .engine == \"warn\" and .resources == \"fail\"' <<< '$d1' > /dev/null && jq -e '[.result.checks[] | select(.name == \"engine\") | .detail[] | select(startswith(\"engine_exited\"))] | length == 1' <<< '$d1' > /dev/null && jq -e '[.result.checks[] | select(.name == \"resources\") | .detail[] | select(contains(\"local\"))] | length == 1' <<< '$d1' > /dev/null" "$(jq -c '[.result.checks[] | {name, status, summary}]' <<< "$d1")"
+# 物理网络的 DNS 换成不通的地址：连接还在（探测只到 sing-box），doctor 的上游检查指出来。
+sudo networksetup -setdnsservers "$service" 192.0.2.1
+for _ in $(seq 1 30); do
+  sleep 1
+  st="$("$xdial" status --json 2> /dev/null)"
+  jq -e '.result.state == "connected" and .result.physical_dns == ["192.0.2.1"]' <<< "$st" > /dev/null 2>&1 && break
+done
+d2="$("$xdial" doctor --json 2>&1)"
+t2="$("$xdial" doctor 2>&1)"
+code=$?
+check m4-doctor-physical-dns "jq -e '.result.checks[] | select(.name == \"physical_dns\") | .status == \"fail\" and (.summary | contains(\"192.0.2.1\"))' <<< '$d2' > /dev/null && [[ '$code' == 0 && \"\$(grep -c '^\[有问题\] physical_dns' <<< '$t2')\" == 1 ]]" "$(jq -c '.result.checks[] | select(.name == "physical_dns")' <<< "$d2") exit=$code"
+sudo networksetup -setdnsservers "$service" empty
+for _ in $(seq 1 30); do
+  sleep 1
+  st="$("$xdial" status --json 2> /dev/null)"
+  jq -e '.result.state == "connected" and .result.physical_dns != ["192.0.2.1"] and .result.system_dns' <<< "$st" > /dev/null 2>&1 && break
+done
+
 # 连接中重装：先断开，换掉二进制，新 daemon 恢复连接。
 out="$(sudo "$xdial" daemon install --json 2>&1)"
 for _ in $(seq 1 40); do

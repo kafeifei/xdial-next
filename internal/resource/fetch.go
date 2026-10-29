@@ -19,6 +19,7 @@ import (
 
 	"github.com/kafeifei/xdial-next/internal/cli"
 	"github.com/kafeifei/xdial-next/internal/engine"
+	"github.com/kafeifei/xdial-next/internal/netbind"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
@@ -300,16 +301,7 @@ func directDialer(iface, dns string) (dialFunc, error) {
 }
 
 func boundDialer(iface string) (*net.Dialer, error) {
-	d := &net.Dialer{Timeout: 15 * time.Second}
-	if iface == "" {
-		return nil, errors.New("没有物理网络的接口")
-	}
-	ifi, err := net.InterfaceByName(iface)
-	if err != nil {
-		return nil, fmt.Errorf("找不到物理网络的接口 %s", iface)
-	}
-	d.Control = bindControl(ifi.Index)
-	return d, nil
+	return netbind.Dialer(iface, 15*time.Second)
 }
 
 // Seams for tests, which serve on loopback with their own certificate.

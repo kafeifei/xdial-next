@@ -793,6 +793,10 @@ type RuleSetInfo struct {
 }
 
 func (d *Daemon) ruleSetList(json.RawMessage) reply {
+	return reply{schema: SchemaRuleSetList, result: map[string]any{"rule_sets": d.ruleSetInfos()}}
+}
+
+func (d *Daemon) ruleSetInfos() []RuleSetInfo {
 	d.mu.Lock()
 	cfg := d.cfg
 	secrets := maps.Clone(d.secrets)
@@ -826,7 +830,7 @@ func (d *Daemon) ruleSetList(json.RawMessage) reply {
 			list = append(list, info)
 		}
 	}
-	return reply{schema: SchemaRuleSetList, result: map[string]any{"rule_sets": list}}
+	return list
 }
 
 // ruleSetUpdate downloads the named remote rule sets now, or all of them.

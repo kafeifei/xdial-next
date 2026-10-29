@@ -18,6 +18,7 @@ import (
 
 	"github.com/kafeifei/xdial-next/internal/cli"
 	"github.com/kafeifei/xdial-next/internal/config"
+	"github.com/kafeifei/xdial-next/internal/daemon"
 	"github.com/kafeifei/xdial-next/internal/engine"
 	"github.com/kafeifei/xdial-next/internal/resource"
 )
@@ -519,5 +520,24 @@ func TestExplainOffline(t *testing.T) {
 	}
 	if code, _, _ := execute("explain", "a b", "--config", path); code != cli.ExitUsage {
 		t.Errorf("a bad target: exit %d", code)
+	}
+}
+
+func TestDoctorContract(t *testing.T) {
+	checks := []daemon.Check{
+		{Name: "connection", Status: "ok", Summary: "已连接，场景 s"},
+		{Name: "split_dns", Status: "warn", Summary: "1 个域名有自己的解析器", Detail: []string{"corp.example → 10.0.0.53（utun4）"}, Hint: "断开那个 VPN"},
+		{Name: "groups", Status: "skip", Summary: "当前连接没有线路组"},
+	}
+	raw, err := json.Marshal(map[string]any{"schema": daemon.SchemaDoctor, "ok": true, "result": map[string]any{"checks": checks}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract(t, string(raw), "")
+	var out strings.Builder
+	result, _ := json.Marshal(map[string]any{"checks": checks})
+	printDoctor(&out, result)
+	if !strings.Contains(out.String(), "[注意] split_dns：1 个域名有自己的解析器\n    corp.example") || !strings.Contains(out.String(), "    → 断开那个 VPN") {
+		t.Errorf("text: %s", out.String())
 	}
 }
