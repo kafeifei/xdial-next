@@ -1051,14 +1051,27 @@ func TestEndpointTextIsScrubbed(t *testing.T) {
 	if strings.Contains(e.Error+e.AuthMessage, "hunter2") || e.AuthURL == "" {
 		t.Errorf("scrubbed status: %+v", e)
 	}
-	// A secret the engine's cut split, behind copies the scrubber shortens.
+	// The cases review found: a secret the engine's 64 KiB cut split,
+	// behind copies scrubbing shortens; a short secret inside a long one,
+	// whose placeholder is longer than it; a short text that is all secret.
 	cookie := strings.Repeat("c", 2048)
-	text := "login failed: " + strings.Repeat(cookie+" ", 32)
-	engineCut := strings.ToValidUTF8(text[:64<<10], "") + engine.TruncatedMark
-	split := map[string]engine.EndpointStatus{"corp": {Error: engineCut}}
-	scrubEndpoints(split, newScrubber(map[string]Secret{"corp": {Value: cookie}}))
-	if strings.Contains(split["corp"].Error, "cccc") {
-		t.Errorf("part of a split secret survived: %q", split["corp"].Error)
+	corp := "PRIVATE_PREFIX_" + strings.Repeat("X", 1000) + strings.Repeat("abcd", 258) + "Z"
+	for name, c := range map[string]struct {
+		text    string
+		secrets map[string]Secret
+		leak    string
+	}{
+		"split cookie": {strings.ToValidUTF8(("login failed: " + strings.Repeat(cookie+" ", 32))[:64<<10], ""),
+			map[string]Secret{"corp": {Value: cookie}}, "cccc"},
+		"nested secret": {strings.ToValidUTF8(("login failed: " + strings.Repeat(corp+" ", 32))[:64<<10], ""),
+			map[string]Secret{"corp": {Value: corp}, "pin": {Value: "abcd"}}, "PRIVATE"},
+		"all secret": {"PRIVATE_PREFIX_" + strings.Repeat("abcd", 16) + "…[engine-cut]",
+			map[string]Secret{"corp": {Value: "PRIVATE_PREFIX_" + strings.Repeat("abcd", 16) + "…[engine-cut]"}, "pin": {Value: "abcd"}}, "PRIVATE"},
+	} {
+		got := scrubText(c.text, newScrubber(c.secrets))
+		if strings.Contains(got, c.leak) || len(got) > maxEndpointText+64 {
+			t.Errorf("%s: %q", name, got)
+		}
 	}
 	// A secret straddling the cut is scrubbed before it is cut.
 	long := map[string]engine.EndpointStatus{"corp": {Error: strings.Repeat("x", maxEndpointText-5) + "hunter2-secret"}}
@@ -1094,5 +1107,24 @@ func TestLoginLinksGoBeforeScrubbing(t *testing.T) {
 	line := "Waiting for authentication: https://login.tailscale.com/a/abc123"
 	if got := scrub.scrub(withoutLoginLinks(line)); strings.Contains(got, "abc123") {
 		t.Errorf("log line: %s", got)
+	}
+}
+
+func TestSafeCutNeverSplitsASecret(t *testing.T) {
+	s := newScrubber(map[string]Secret{"a": {Value: "secret-value"}, "b": {Value: "中文密码"}})
+	text := strings.Repeat("x", 505) + "secret-value" + strings.Repeat("y", 100)
+	if cut := s.safeCut(text, 512); cut != 505 {
+		t.Errorf("cut at %d, want 505", cut)
+	}
+	text = strings.Repeat("x", 509) + "中文密码" + strings.Repeat("y", 100)
+	if cut := s.safeCut(text, 512); cut != 509 {
+		t.Errorf("cut at %d, want 509", cut)
+	}
+	text = strings.Repeat("x", 510) + "中" + strings.Repeat("y", 100)
+	if cut := s.safeCut(text, 512); cut != 510 {
+		t.Errorf("cut inside a character: %d", cut)
+	}
+	if cut := s.safeCut("short", 512); cut != 5 {
+		t.Errorf("short text cut at %d", cut)
 	}
 }

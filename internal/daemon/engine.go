@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -221,30 +220,22 @@ func scrubEndpoints(endpoints map[string]engine.EndpointStatus, scrub *scrubber)
 	}
 }
 
-// scrubText scrubs one text and cuts it to maxEndpointText bytes. A text
-// the engine cut short may end in part of a secret, which scrubbing does
-// not recognize and which replacing the secrets before it can move into
-// what is kept; its last bytes, as many as the longest secret takes, are
-// dropped after scrubbing.
+// scrubText keeps at most maxEndpointText bytes of a VPN server's text,
+// cut first on the original where no secret is split, then scrubbed:
+// every secret in what is kept is whole and replaced whole. Scrubbing
+// first and cutting after would not do, since replacing a secret changes
+// the length before the cut.
 func scrubText(s string, scrub *scrubber) string {
-	cut := strings.HasSuffix(s, engine.TruncatedMark)
-	s = scrub.scrub(strings.TrimSuffix(s, engine.TruncatedMark))
-	if cut {
-		s = s[:max(0, len(s)-scrub.longest)]
-		s = strings.ToValidUTF8(s, "") + "…"
+	cut := scrub.safeCut(s, maxEndpointText)
+	kept := scrub.scrub(s[:cut])
+	if cut < len(s) {
+		kept += "…"
 	}
-	return cutText(s)
+	return kept
 }
 
 // maxEndpointText bounds a VPN server's text in status and events.
 const maxEndpointText = 512
-
-func cutText(s string) string {
-	if len(s) <= maxEndpointText {
-		return s
-	}
-	return strings.ToValidUTF8(s[:maxEndpointText], "") + "…"
-}
 
 // maxStatusLine bounds one status line from the engine.
 const maxStatusLine = 1 << 20
