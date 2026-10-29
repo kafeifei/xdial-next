@@ -30,7 +30,7 @@ func CheckRuleSetSource(data []byte) ([]*Value, []cli.Problem) {
 	if err != nil {
 		return nil, []cli.Problem{{Code: cli.CodeConfigSyntax, Message: err.Error()}}
 	}
-	w := &walker{}
+	w := &walker{remote: true}
 	if root.Kind != KindObject {
 		return nil, []cli.Problem{{Code: cli.CodeConfigValue, Message: "规则集应该是一个 JSON 对象"}}
 	}
@@ -41,7 +41,7 @@ func CheckRuleSetSource(data []byte) ([]*Value, []cli.Problem) {
 	for _, f := range root.Fields {
 		s, ok := spec[f.Key]
 		if !ok {
-			w.problem(cli.CodeConfigUnknownKey, f.Key, "", "没有登记的键 %q", f.Key)
+			w.problem(cli.CodeConfigUnknownKey, unknownKey, "", "没有登记的键")
 			continue
 		}
 		w.field(f.Value, s, f.Key, root)
@@ -60,18 +60,10 @@ func CheckRuleSetSource(data []byte) ([]*Value, []cli.Problem) {
 		w.problems = append(w.problems, cli.Problem{Code: cli.CodeConfigMore, Message: fmt.Sprintf("还有 %d 处问题没有列出", w.dropped)})
 	}
 	if w.failed() {
-		for i, p := range w.problems {
-			path := p.Path
-			// The last segment of an unknown key's path is the key itself,
-			// whatever it looks like, even "domain[123]".
-			if p.Code == cli.CodeConfigUnknownKey {
-				if i := strings.LastIndex(path, "."); i >= 0 {
-					path = path[:i] + ".<未登记的键>"
-				} else {
-					path = "<未登记的键>"
-				}
-			}
-			w.problems[i].Path = trustedPath(path)
+		// Unknown keys never reach a path in remote mode; this keeps only
+		// what XDial itself names, in case anything else ever does.
+		for i := range w.problems {
+			w.problems[i].Path = trustedPath(w.problems[i].Path)
 		}
 		return nil, w.problems
 	}
@@ -84,7 +76,7 @@ func CheckRuleSetSource(data []byte) ([]*Value, []cli.Problem) {
 func trustedPath(path string) string {
 	var kept []string
 	for _, seg := range strings.Split(path, ".") {
-		if seg == "<未登记的键>" {
+		if seg == unknownKey {
 			kept = append(kept, seg)
 			break
 		}

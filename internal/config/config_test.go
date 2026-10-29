@@ -309,10 +309,20 @@ func TestDownloadViaThroughADetourIsAllowed(t *testing.T) {
 }
 
 func TestUnknownKeyLookingLikeAnIndexIsCut(t *testing.T) {
-	_, problems := CheckRuleSetSource([]byte(`{"version": 1, "rules": [{"domain": ["a"], "domain[123456789]": 1}]}`))
-	for _, p := range problems {
-		if strings.Contains(p.Path, "123456789") {
-			t.Errorf("path echoes a remote key: %q", p.Path)
+	for _, doc := range []string{
+		`{"version": 1, "rules": [{"domain": ["a"], "domain[123456789]": 1}]}`,
+		`{"version": 1, "rules": [{"domain": ["a"], "domain[123456789].x": 1}]}`,
+		`{"version": 1, "rules": [{"domain": ["a"]}], "rules[42].token": 1}`,
+	} {
+		_, problems := CheckRuleSetSource([]byte(doc))
+		if len(problems) == 0 {
+			t.Errorf("%s: accepted", doc)
+		}
+		for _, p := range problems {
+			if strings.Contains(p.Path, "123456789") || strings.Contains(p.Path, "42") || strings.Contains(p.Path, "token") ||
+				strings.Contains(p.Message, "123456789") || strings.Contains(p.Message, "token") {
+				t.Errorf("problem echoes a remote key: %+v", p)
+			}
 		}
 	}
 }

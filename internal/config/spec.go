@@ -99,6 +99,9 @@ type RefUse struct {
 }
 
 type walker struct {
+	// remote checks content from a remote: an unknown key is reported
+	// without its name, in the path or the message, 3.4.
+	remote     bool
 	problems   []cli.Problem
 	dropped    int // problems past maxProblems, reported as a count
 	regexInsts int // compiled size of every regular expression so far
@@ -146,6 +149,10 @@ func (w *walker) object(v *Value, fields map[string]*Spec, path string) {
 		fieldPath := joinKey(path, f.Key)
 		spec, ok := fields[f.Key]
 		if !ok {
+			if w.remote {
+				w.problem(cli.CodeConfigUnknownKey, joinKey(path, unknownKey), "", "没有登记的键")
+				continue
+			}
 			w.problem(cli.CodeConfigUnknownKey, fieldPath, unknownKeyHint(f.Key, fields), "没有登记的键 %q", f.Key)
 			continue
 		}
@@ -157,6 +164,9 @@ func (w *walker) object(v *Value, fields map[string]*Spec, path string) {
 		}
 	}
 }
+
+// unknownKey stands for a key named by a remote in a problem's path.
+const unknownKey = "<未登记的键>"
 
 func sortedKeys(fields map[string]*Spec) []string {
 	keys := make([]string, 0, len(fields))

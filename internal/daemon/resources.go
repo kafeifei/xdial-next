@@ -322,12 +322,14 @@ func (d *Daemon) checkUsable(source []byte) error {
 
 // collectRuleSets removes cached files the current configuration does not
 // use, once they have not been used for an hour: a configuration being
-// applied may use one that is not current yet. Callers hold d.res.
+// applied may use one that is not current yet. It decides and removes
+// under d.mu, which publishing a configuration also takes, so it never
+// acts on a configuration that has just been replaced; it is a handful of
+// small file operations. Callers hold d.res.
 func (d *Daemon) collectRuleSets() {
 	d.mu.Lock()
-	cfg := d.cfg
-	secrets := maps.Clone(d.secrets)
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+	cfg, secrets := d.cfg, d.secrets
 	if cfg == nil {
 		return
 	}
