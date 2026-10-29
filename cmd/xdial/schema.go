@@ -180,6 +180,15 @@ func outputSchemas() map[string]any {
 			e["required"] = []string{"line"}
 			return e
 		}()),
+		"xdial.explain/v1": envelope("xdial.explain/v1", object([]string{"scenario", "host", "line", "notes"}, map[string]any{
+			"scenario": str(), "host": str(), "port": map[string]any{"type": "integer"}, "addresses": strList(), "line": str(),
+			"rule": object([]string{"index", "within"}, map[string]any{
+				"index": map[string]any{"type": "integer"}, "rule_set": str(), "subscription": str(), "policy": str(),
+				"within": map[string]any{"type": "integer"}, "invert": map[string]any{"type": "boolean"},
+			}),
+			"dns":   object([]string{"server", "reason"}, map[string]any{"server": str(), "reason": str()}),
+			"notes": strList(),
+		})),
 		"xdial.group.select/v1": envelope("xdial.group.select/v1", object([]string{"group", "member", "applied"}, map[string]any{
 			"group": str(), "member": str(), "applied": map[string]any{"type": "boolean"},
 		})),

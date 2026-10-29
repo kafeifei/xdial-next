@@ -501,6 +501,16 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
   - 选择由 daemon 记在 `state.json` 的 `selections` 里，不写进配置（1.1）。连接中经引擎的 stdin 切换，现有连接不断；之后每次编译这个组，都把它编成组的 `default`。选的成员不在组里了（例如配置改了、订阅里没了），回到组自己的默认值。
 - **测速**（`xdial line test [<id>...]`）：经运行中的引擎，每条线路取一次 `https://www.gstatic.com/generate_204`，10 秒超时；写组的 id 就测它的每个成员，不写就测所有组。结果也记进组的延迟里。没有连接时不能测：测速要走和实际流量一样的线路。
 
+### 3.7 explain（M4）
+
+`xdial explain <域名|IP|URL> [--scenario <id>] [--config <文件>]`：说明目标在场景里命中哪条规则、走哪条线路、DNS 经哪个服务器解析。
+
+- **用 sing-box 自己的规则实现判断**：把场景编译一遍，按编译出的顺序逐条用 sing-box 的规则对象去匹配，不另写一份匹配逻辑。订阅规则说明是第几条、哪个策略。
+- **地址**：目标是域名、而且连着时，daemon 经系统解析它，也就是经 sing-box 的 DNS，和流量会拿到的地址一样，按地址的规则据此判断；没连着或离线时不解析，按地址的规则按不匹配算，结果里写明。
+- **DNS**：按 3.3 的 DNS 规则顺序，说明经物理网络的 DNS 还是经哪条线路的 DoH。
+- **说不了的**：AnyConnect 和 Tailscale 推送的网段和域名只有引擎知道，没有规则命中时提醒可能被它们接管；按进程判断的规则不知道是哪个进程；缓存里没有的远程内容按不匹配算。这些都写在 `notes` 里。
+- **离线**：`--config` 不经 daemon，对一份配置文件判断，远程规则集和订阅按不匹配算。
+
 ## 4. 存放与修改
 
 ### 4.1 配置
@@ -799,7 +809,7 @@ CLI 是 XDial 的核心界面，菜单栏 App 和 AI 都按这里的约定调用
   - 另有 `scenario`、`revision`、`since`、`last_error`、`engine_pid`。
   - `endpoints`：AnyConnect 和 Tailscale 线路各自的状态，见 3.5（M3）。
 - **M3 加的方法**：`tailscale.login`（`line`、`auth_key`）、`tailscale.logout`（`line`），见 3.5。
-- **M4 加的方法**：`group.select`（`group`、`member`）、`line.test`（`ids`），见 3.6；`status` 加 `groups`。
+- **M4 加的方法**：`group.select`（`group`、`member`）、`line.test`（`ids`），见 3.6；`explain`（`target`、`scenario`），见 3.7；`status` 加 `groups`。
 - **新增的错误码**（退出码按 5.3）：
 
   | 错误码 | 退出码 | 说明 |

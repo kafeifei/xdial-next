@@ -495,3 +495,29 @@ func TestDownloadChildrenAreDispatched(t *testing.T) {
 		t.Error("decode child accepted garbage")
 	}
 }
+
+func TestExplainOffline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.json")
+	doc := `{"version": 1,
+		"lines": [{"id": "hk", "type": "trojan", "server": "hk.example", "server_port": 443, "password": {"secret": "p"}}],
+		"rule_sets": [{"id": "work", "type": "inline", "rules": [{"domain_suffix": ["corp.example"]}]},
+		              {"id": "far", "type": "remote", "format": "source", "url": "https://rules.example/far.json"}],
+		"scenarios": [{"id": "s", "final": "direct", "rules": [{"rule_set": "far", "line": "hk"}, {"rule_set": "work", "line": "hk"}]}]}`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := execute("explain", "https://a.corp.example/x", "--config", path, "--json")
+	got := contract(t, stdout, stderr)
+	result, _ := got["result"].(map[string]any)
+	rule, _ := result["rule"].(map[string]any)
+	if code != 0 || result["line"] != "hk" || rule["index"] != float64(1) || len(result["notes"].([]any)) == 0 {
+		t.Errorf("explain: %d %v", code, got)
+	}
+	code, stdout, _ = execute("explain", "https://other.example", "--config", path)
+	if code != 0 || !strings.Contains(stdout, "走 final") {
+		t.Errorf("explain text: %d %s", code, stdout)
+	}
+	if code, _, _ := execute("explain", "a b", "--config", path); code != cli.ExitUsage {
+		t.Errorf("a bad target: exit %d", code)
+	}
+}

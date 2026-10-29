@@ -394,6 +394,15 @@ check m4-line-test "jq -e '.result.results.ss.delay_ms > 0 and .result.results.v
 "$xdial" connect --scenario s --json > /dev/null 2>&1
 kill "$tspid" 2> /dev/null
 
+# --- M4：explain（#17）-------------------------------------------------------
+# 连着场景 s：apple.com 命中远程规则集 apple（第 1 条）；1.0.1.1 在 geoip-cn 里（第 2 条）；
+# example.com 没有规则命中，走 final。离线对配置文件判断，远程规则集按不匹配算。
+e1="$("$xdial" explain https://www.apple.com --json 2>&1)"
+e2="$("$xdial" explain 1.0.1.1 --json 2>&1)"
+e3="$("$xdial" explain https://example.com --json 2>&1)"
+e4="$("$xdial" explain https://www.apple.com --config "$work/m3.jsonc" --json 2>&1)"
+check m4-explain "jq -e '.result.rule.rule_set == \"apple\" and .result.line == \"direct\" and .result.dns.server == \"physical\"' <<< '$e1' > /dev/null && jq -e '.result.rule.rule_set == \"cn-ip\"' <<< '$e2' > /dev/null && jq -e '.result.rule == null and .result.line == \"direct\"' <<< '$e3' > /dev/null && jq -e '.result.rule == null and (.result.notes | length) > 0' <<< '$e4' > /dev/null" "$(jq -c '.result | {rule, line, dns: .dns.server}' <<< "$e1") $(jq -c '.result.rule' <<< "$e2") $(jq -c '.result.rule' <<< "$e3") offline=$(jq -c '.result.rule' <<< "$e4")"
+
 # 连接中重装：先断开，换掉二进制，新 daemon 恢复连接。
 out="$(sudo "$xdial" daemon install --json 2>&1)"
 for _ in $(seq 1 40); do
