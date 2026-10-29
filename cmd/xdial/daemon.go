@@ -48,6 +48,9 @@ func daemonCommands() []*command {
 			Options: []option{jsonOption, {Name: "--purge", Summary: "同时删除配置、凭据和缓存"}}},
 		{Path: []string{"daemon", "run"}, Output: "xdial.daemon.run/v1", run: runDaemon,
 			Summary: "在前台运行 daemon，由 launchd 调用", Options: []option{jsonOption}},
+		{Path: []string{"daemon", "restart"}, Output: daemon.SchemaDaemonRestart, run: apiCommand("daemon.restart", nil),
+			Summary: "让 daemon 退出，由 launchd 从它的路径重新启动；App 升级后用它换上新的二进制，连接照常恢复（ARCHITECTURE.md 6.1）",
+			Options: []option{jsonOption}},
 		{Path: []string{"status"}, Output: daemon.SchemaStatus, run: apiCommand("status", nil),
 			Summary: "显示连接状态", Options: []option{jsonOption}},
 		{Path: []string{"connect"}, Output: daemon.SchemaStatus, run: runConnect,
@@ -295,12 +298,21 @@ func runDaemon(ctx *context_) int {
 	if err != nil {
 		return ctx.out.Fail(err)
 	}
-	d, err := daemon.New(daemon.Options{Layout: layout(), Executable: exe})
+	run, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	// A restart ends Run like a signal; launchd's KeepAlive starts it again.
+	run, restart := context.WithCancel(run)
+	defer restart()
+	d, err := daemon.New(daemon.Options{Layout: layout(), Executable: exe, Restart: restart})
 	if err != nil {
 		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "daemon 准备失败：%v", err))
 	}
-	run, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
+	// The App's launchd job names no log files: launchd would open them
+	// before the daemon has made their directory. So the daemon points its
+	// own stdout and stderr, where only panics write, at the log, 6.5.
+	if err := logTo(layout().DaemonLog()); err != nil {
+		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "打不开 daemon 的日志：%v", err))
+	}
 	if err := d.Run(run); err != nil {
 		return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "daemon 退出：%v", err))
 	}
@@ -375,6 +387,9 @@ func runDaemonInstall(ctx *context_) int {
 		if err := store.EnsureDir(dir.path, dir.perm); err != nil {
 			return ctx.out.Fail(cli.Errorf(cli.CodeInternal, "", "准备目录 %s 失败：%v", dir.path, err))
 		}
+	}
+	if program, managed := appManaged(l.ID); managed {
+		return ctx.out.Fail(cli.Errorf(cli.CodeDaemonAppManaged, "", "launchd 里的 %s 跑的是 App 包里的 %s", l.ID, program))
 	}
 	staged, err := stageBinary(exe, filepath.Dir(l.Bin()))
 	if err != nil {
@@ -509,6 +524,9 @@ func runDaemonUninstall(ctx *context_) int {
 		return ctx.out.Fail(err)
 	}
 	l := layout()
+	if program, managed := appManaged(l.ID); managed {
+		return ctx.out.Fail(cli.Errorf(cli.CodeDaemonAppManaged, "", "launchd 里的 %s 跑的是 App 包里的 %s", l.ID, program))
+	}
 	if err := bootout(l.ID); err != nil {
 		return ctx.out.Fail(err)
 	}
@@ -524,7 +542,9 @@ func runDaemonUninstall(ctx *context_) int {
 	if l.ID == paths.Release {
 		other.ID = paths.Debug
 	}
-	if _, err := os.Lstat(other.Plist()); errors.Is(err, os.ErrNotExist) {
+	// The other identity may be the App's: no plist of ours, but a launchd
+	// job all the same, 6.1.
+	if _, err := os.Lstat(other.Plist()); errors.Is(err, os.ErrNotExist) && !jobLoaded(other.ID) {
 		targets = append(targets, l.SharedDir())
 	}
 	if purge {
@@ -887,6 +907,50 @@ func bootout(id string) error {
 			return cli.Errorf(cli.CodeInternal, "", "旧的 daemon %s 内没有停下", bootoutTimeout)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	return nil
+}
+
+// jobLoaded reports whether launchd has a job for the daemon of id, however
+// it was installed.
+func jobLoaded(id string) bool {
+	return exec.Command("/bin/launchctl", "print", "system/"+id).Run() == nil
+}
+
+// appManaged reports whether launchd runs the daemon of id from inside an
+// app bundle: the App registered it with SMAppService, under the same label
+// the command line would use, 6.1.
+func appManaged(id string) (string, bool) {
+	out, err := exec.Command("/bin/launchctl", "print", "system/"+id).Output()
+	if err != nil {
+		return "", false
+	}
+	return bundleProgram(string(out))
+}
+
+// bundleProgram reads the program launchctl print shows and whether it lies
+// in an app bundle.
+func bundleProgram(printed string) (string, bool) {
+	for _, line := range strings.Split(printed, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " = ")
+		if ok && key == "program" {
+			return value, strings.Contains(value, ".app/Contents/")
+		}
+	}
+	return "", false
+}
+
+// logTo points stdout and stderr at path, appending.
+func logTo(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, fd := range []int{1, 2} {
+		if err := syscall.Dup2(int(f.Fd()), fd); err != nil {
+			return err
+		}
 	}
 	return nil
 }

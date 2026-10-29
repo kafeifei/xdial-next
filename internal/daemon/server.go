@@ -143,6 +143,8 @@ type reply struct {
 	schema string
 	result any
 	err    error
+	// after runs once the reply is written.
+	after func()
 }
 
 func (d *Daemon) dispatch(conn *net.UnixConn, req api.Request, uid uint32) bool {
@@ -164,7 +166,11 @@ func (d *Daemon) dispatch(conn *net.UnixConn, req api.Request, uid uint32) bool 
 	if err != nil {
 		return writeResponse(conn, failure(req.ID, err))
 	}
-	return writeResponse(conn, api.Response{ID: req.ID, Schema: r.schema, OK: true, Result: result})
+	written := writeResponse(conn, api.Response{ID: req.ID, Schema: r.schema, OK: true, Result: result})
+	if r.after != nil {
+		r.after()
+	}
+	return written
 }
 
 func failure(id int, err error) api.Response {

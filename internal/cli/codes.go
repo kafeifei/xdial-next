@@ -51,6 +51,7 @@ const (
 	CodeConfigMore           = "config.more"
 
 	CodeDaemonUnreachable = "daemon.unreachable"
+	CodeDaemonAppManaged  = "daemon.app_managed"
 	CodeAPIPermission     = "api.permission"
 	CodeAPIVersion        = "api.version"
 	CodeConfigConflict    = "config.conflict"
@@ -100,6 +101,7 @@ func init() {
 	register(Code{Name: CodeConfigMore, Problem: true, Summary: "问题太多，只列出了前面的，这一条给出没列出的数量"})
 
 	register(Code{Name: CodeDaemonUnreachable, Exit: ExitMissing, Summary: "daemon 没在运行，或者连不上 socket", Hint: "先运行 sudo xdial daemon install"})
+	register(Code{Name: CodeDaemonAppManaged, Exit: ExitConflict, Summary: "这个身份的 daemon 由 XDial App 注册和管理，命令行不能装或卸", Hint: "在 App 里升级或移除；要改用命令行管理，先在 App 里移除"})
 	register(Code{Name: CodeDaemonUntrusted, Exit: ExitMissing, Summary: "socket 上监听的进程不属于 root，不是安装的 daemon；请求没有发出", Hint: "运行 sudo xdial daemon install 重新安装"})
 	register(Code{Name: CodeDaemonBusy, Exit: ExitConflict, Summary: "daemon 的连接数已满", Hint: "关掉多余的 xdial logs --follow 后重试"})
 	register(Code{Name: CodeAPIPermission, Exit: ExitPermission, Summary: "调用方不是 root，也不是当前在屏幕前登录的用户", Hint: "在屏幕前登录的账户里运行，或者加 sudo"})

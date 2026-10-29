@@ -29,6 +29,7 @@ const (
 func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 	return map[string]func(json.RawMessage) reply{
 		"version":             d.version,
+		"daemon.restart":      d.daemonRestart,
 		"status":              d.statusMethod,
 		"config.export":       d.export,
 		"config.apply":        d.apply,
@@ -50,6 +51,20 @@ func (d *Daemon) methods() map[string]func(json.RawMessage) reply {
 		"subscription.update": d.subscriptionUpdate,
 		"subscription.show":   d.subscriptionShow,
 	}
+}
+
+// SchemaDaemonRestart is the result of daemon.restart.
+const SchemaDaemonRestart = "xdial.daemon.restart/v1"
+
+// daemonRestart ends this daemon once it has answered, so launchd starts
+// the binary at its path again: after the App is updated, the one in the
+// new bundle, 6.1. The connection asked for resumes, as after any restart.
+func (d *Daemon) daemonRestart(json.RawMessage) reply {
+	if d.opts.Restart == nil {
+		return reply{err: cli.Errorf(cli.CodeConfigConflict, "", "这个 daemon 不能重启")}
+	}
+	d.events.add("daemon_restart_requested", nil)
+	return reply{schema: SchemaDaemonRestart, result: map[string]any{"restarting": true}, after: d.opts.Restart}
 }
 
 func (d *Daemon) version(json.RawMessage) reply {

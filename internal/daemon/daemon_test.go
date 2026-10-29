@@ -1477,3 +1477,30 @@ func TestExplainPointsOutContentNewerThanTheEngine(t *testing.T) {
 		t.Errorf("after an update: %v", e)
 	}
 }
+
+func TestRestartEndsRunAfterAnsweringAndKeepsTheIntent(t *testing.T) {
+	h := start(t, nil)
+	h.connected()
+	h.d.opts.Restart = h.cancel
+	if r := h.ok("daemon.restart", nil); r["restarting"] != true {
+		t.Fatalf("restart: %v", r)
+	}
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not end")
+	}
+	var state State
+	if err := store.ReadJSON(h.layout.State(), &state); err != nil || !state.Connected {
+		t.Errorf("intent after the restart: %+v %v", state, err)
+	}
+	h.done <- nil
+}
+
+func TestRestartIsRefusedWithoutAWayToRestart(t *testing.T) {
+	h := start(t, nil)
+	h.fails("daemon.restart", nil, cli.CodeConfigConflict)
+}
