@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -208,10 +209,8 @@ func withoutLoginLinks(line string) string {
 	return loginLink.ReplaceAllString(line, "${1}<登录链接见 xdial status>")
 }
 
-// scrubEndpoints scrubs what a VPN server says, which reaches status and
-// the event log, as the engine's log is, 4.3, and then cuts it to
-// maxEndpointText bytes: cutting first could leave part of a secret the
-// scrubber no longer recognizes.
+// scrubEndpoints bounds and scrubs what a VPN server says, which reaches
+// status and the event log, as the engine's log is, 4.3.
 func scrubEndpoints(endpoints map[string]engine.EndpointStatus, scrub *scrubber) {
 	for id, e := range endpoints {
 		e.Error = scrubText(e.Error, scrub)
@@ -220,15 +219,20 @@ func scrubEndpoints(endpoints map[string]engine.EndpointStatus, scrub *scrubber)
 	}
 }
 
-// scrubText keeps at most maxEndpointText bytes of a VPN server's text,
-// cut first on the original where no secret is split, then scrubbed:
-// every secret in what is kept is whole and replaced whole. Scrubbing
-// first and cutting after would not do, since replacing a secret changes
-// the length before the cut.
+// scrubText keeps at most maxEndpointText bytes of a VPN server's text.
+// It cuts the original first, where no secret is split, then masks: every
+// secret in what is kept is whole and masked whole. Masking first and
+// cutting after would not do, since masking changes the length before the
+// cut. Masks can be longer than what they hide, so the masked text is cut
+// once more, which can only shorten a mask.
 func scrubText(s string, scrub *scrubber) string {
 	cut := scrub.safeCut(s, maxEndpointText)
 	kept := scrub.scrub(s[:cut])
-	if cut < len(s) {
+	long := len(kept) > maxEndpointText
+	if long {
+		kept = strings.ToValidUTF8(kept[:maxEndpointText], "")
+	}
+	if cut < len(s) || long {
 		kept += "…"
 	}
 	return kept

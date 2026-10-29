@@ -187,8 +187,9 @@ func tailscaleStatus(st *adapter.TailscaleEndpointStatus) EndpointStatus {
 
 // maxText bounds a VPN server's text in a status line, so one endpoint
 // cannot push every line past the daemon's limit. The daemon keeps only
-// the first 512 bytes, cut where no secret is split, so where this cut
-// falls never matters.
+// the first 512 bytes, cut where no secret is split. Secrets are at most
+// 8 KiB, under 48 KiB in any form the daemon masks, so one that starts in
+// those 512 bytes ends before this cut and is masked whole.
 const maxText = 64 << 10
 
 func bound(s string) string {

@@ -281,6 +281,7 @@ func TestConnectDisconnect(t *testing.T) {
 
 	h.fails("connect", map[string]any{"scenario": "s"}, cli.CodeSecretMissing)
 	h.ok("secret.set", map[string]any{"name": "hk", "value": "a-password"})
+	h.fails("secret.set", map[string]any{"name": "big", "value": strings.Repeat("x", MaxSecretLength+1)}, cli.CodeSecretFormat)
 	status := h.ok("connect", map[string]any{"scenario": "s"})
 	if status["state"] != "connected" || status["system_dns"] != true || status["engine_pid"].(float64) == 0 {
 		t.Fatalf("connect: %v", status)
@@ -1069,7 +1070,7 @@ func TestEndpointTextIsScrubbed(t *testing.T) {
 			map[string]Secret{"corp": {Value: "PRIVATE_PREFIX_" + strings.Repeat("abcd", 16) + "…[engine-cut]"}, "pin": {Value: "abcd"}}, "PRIVATE"},
 	} {
 		got := scrubText(c.text, newScrubber(c.secrets))
-		if strings.Contains(got, c.leak) || len(got) > maxEndpointText+64 {
+		if strings.Contains(got, c.leak) || len(got) > maxEndpointText+len("…") {
 			t.Errorf("%s: %q", name, got)
 		}
 	}
@@ -1107,6 +1108,42 @@ func TestLoginLinksGoBeforeScrubbing(t *testing.T) {
 	line := "Waiting for authentication: https://login.tailscale.com/a/abc123"
 	if got := scrub.scrub(withoutLoginLinks(line)); strings.Contains(got, "abc123") {
 		t.Errorf("log line: %s", got)
+	}
+}
+
+func TestScrubberMasksOverlaps(t *testing.T) {
+	for name, c := range map[string]struct {
+		secrets    map[string]Secret
+		text, want string
+	}{
+		"two secrets overlap":      {map[string]Secret{"a": {Value: "abcd"}, "b": {Value: "cdefgh"}}, "x abcdefgh y", "x <secret:a> y"},
+		"a secret overlaps itself": {map[string]Secret{"s": {Value: "ababa"}}, "x abababa y", "x <secret:s> y"},
+		"json escapes":             {map[string]Secret{"s": {Value: "a<b>\x01cd"}}, `msg "a\u003cb\u003e\u0001cd"`, `msg "<secret:s>"`},
+		"quoted":                   {map[string]Secret{"s": {Value: "a<b>\x01cd"}}, `msg "a<b>\x01cd"`, `msg "<secret:s>"`},
+	} {
+		if got := newScrubber(c.secrets).scrub(c.text); got != c.want {
+			t.Errorf("%s: %q, want %q", name, got, c.want)
+		}
+	}
+}
+
+func TestEndpointTextStaysBounded(t *testing.T) {
+	// The longest secret in its longest form, JSON escapes, starting early
+	// in text the engine cut at 64 KiB: it ends before that cut.
+	value := strings.Repeat("<", MaxSecretLength)
+	form := strings.Repeat(`\u003c`, MaxSecretLength)
+	text := ("err: " + form + " " + strings.Repeat("y", 64<<10))[:64<<10]
+	if got := scrubText(text, newScrubber(map[string]Secret{"s": {Value: value}})); got != "err: …" {
+		t.Errorf("long secret: %q", got)
+	}
+	// Masks longer than what they hide do not push it past the bound.
+	name := strings.Repeat("n", 63)
+	got := scrubText(strings.Repeat("abcd ", 100), newScrubber(map[string]Secret{name: {Value: "abcd"}}))
+	if len(got) > maxEndpointText+len("…") || strings.Contains(got, "abcd") || !strings.HasSuffix(got, "…") {
+		t.Errorf("masked text: %d bytes, %q", len(got), got)
+	}
+	if got := scrubText("short", newScrubber(nil)); got != "short" {
+		t.Errorf("short text: %q", got)
 	}
 }
 
