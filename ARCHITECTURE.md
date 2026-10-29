@@ -470,7 +470,7 @@ sing-box 在后台把 endpoint 连上：引擎就绪只说明配置跑起来了�
   - `type`：`openconnect` 或 `tailscale`；`state`：`connecting`、`connected`、`auth_required`、`failed`。程序判断看这两个，说明文字给人看。
   - AnyConnect：`error`、`auth_message`（服务器要求再输入什么）、`browser_auth`、`addresses`（分到的地址）、`dns`（下发的 DNS）、`since`、`default_route`。
   - Tailscale：`auth_url`（要登录时的链接）、`tailnet`、`dns_name`、`self`（本机在 tailnet 里的地址）、`exit_node`、`peers`、`online`。
-  - 登录链接只在 `status` 里，不进事件日志。服务器给的文字（`error`、`auth_message`）和引擎日志一样先脱敏，再截到 512 字节：先截会留下凭据的一部分，脱敏就认不出了。
+  - 登录链接只在 `status` 里，不进事件日志。服务器给的文字（`error`、`auth_message`）和引擎日志一样先脱敏，再截到 512 字节：先截会留下凭据的一部分，脱敏就认不出了。引擎那边只按 64 KiB 截，免得一条超长提示让每一行状态都超过上限；这远大于最后留下的 512 字节，被它截断的凭据不会出现在结果里。
   - 引擎写的状态行超过 1 MiB 的跳过这一行，之后的照常读。
 - **整个连接和 VPN 分开**：VPN 连不上不算连接失败。连接照常建立，场景里走这条线路的流量连不通，其余不受影响；`status` 和事件说明 VPN 的情况。
 - **AnyConnect 的认证**：

@@ -666,3 +666,12 @@ func TestPlainMembersDoNotCountAgainstTheBudget(t *testing.T) {
 		t.Errorf("20,200 members written by hand hit the subscription budget: %v", err)
 	}
 }
+
+func TestStatusTextIsBoundedButFarAboveWhatIsKept(t *testing.T) {
+	if got := bound(strings.Repeat("x", 2<<20)); len(got) != maxText {
+		t.Errorf("bounded to %d bytes", len(got))
+	}
+	if maxText <= 4096 {
+		t.Error("the engine's bound must stay far above what the daemon keeps")
+	}
+}
