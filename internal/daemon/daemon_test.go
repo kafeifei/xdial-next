@@ -1172,6 +1172,32 @@ func TestGroupSelectSwitchesAndPersists(t *testing.T) {
 	h.fails("group.select", map[string]any{"group": "pick", "member": "nope"}, cli.CodeConfigConflict)
 }
 
+func TestSubscriptionMembersCanBeSelectedAndTested(t *testing.T) {
+	h := start(t, nil)
+	const url = "https://sub.example/token"
+	h.ok("config.apply", map[string]any{"content": subDoc})
+	h.ok("secret.set", map[string]any{"name": "jp", "value": "a-password"})
+	h.ok("secret.set", map[string]any{"name": "air-url", "value": url})
+	h.seedSubscription("air", url, airCache)
+	h.ok("connect", map[string]any{"scenario": "s"})
+	h.waitFor("the group's status", func(s map[string]any) bool {
+		g, _ := s["groups"].(map[string]any)
+		return g != nil && g["proxy"] != nil
+	})
+	const member = "xdial:sub:air:香港 01"
+	h.ok("group.select", map[string]any{"group": "proxy", "member": "jp"})
+	if r := h.ok("group.select", map[string]any{"group": "proxy", "member": member}); r["applied"] != true {
+		t.Errorf("select a subscription member: %v", r)
+	}
+	if now := h.ok("status", nil)["groups"].(map[string]any)["proxy"].(map[string]any)["now"]; now != member {
+		t.Errorf("now: %v", now)
+	}
+	results := h.ok("line.test", map[string]any{"ids": []string{"proxy"}})["results"].(map[string]any)
+	if results[member] == nil || results["jp"] == nil {
+		t.Errorf("test a subscription member: %v", results)
+	}
+}
+
 func TestLineTestAnswersThroughTheEngine(t *testing.T) {
 	h := start(t, nil)
 	h.fails("line.test", map[string]any{"ids": []string{"a"}}, cli.CodeConfigConflict)
