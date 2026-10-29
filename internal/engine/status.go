@@ -23,12 +23,12 @@ type EndpointStatus struct {
 	State string `json:"state"`
 	Error string `json:"error,omitempty"`
 	// AnyConnect.
-	AuthMessage string     `json:"auth_message,omitempty"`
-	BrowserAuth bool       `json:"browser_auth,omitempty"`
-	Addresses   []string   `json:"addresses,omitempty"`
-	DNS         []string   `json:"dns,omitempty"`
-	DefaultRoute bool      `json:"default_route,omitempty"`
-	Since       *time.Time `json:"since,omitempty"`
+	AuthMessage  string     `json:"auth_message,omitempty"`
+	BrowserAuth  bool       `json:"browser_auth,omitempty"`
+	Addresses    []string   `json:"addresses,omitempty"`
+	DNS          []string   `json:"dns,omitempty"`
+	DefaultRoute bool       `json:"default_route,omitempty"`
+	Since        *time.Time `json:"since,omitempty"`
 	// Tailscale.
 	AuthURL  string   `json:"auth_url,omitempty"`
 	Tailnet  string   `json:"tailnet,omitempty"`
